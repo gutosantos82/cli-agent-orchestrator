@@ -2,12 +2,13 @@
 
 from datetime import datetime
 from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
 class Flow(BaseModel):
     """Flow model - represents a scheduled agent session."""
-    
+
     name: str = Field(..., description="Unique flow identifier")
     file_path: str = Field(..., description="Path to flow definition file")
     schedule: str = Field(..., description="Cron expression")

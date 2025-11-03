@@ -1,15 +1,16 @@
 """Integration tests for Q CLI provider with real Q CLI."""
 
-import pytest
-import shutil
-import time
 import json
+import shutil
 import subprocess
+import time
 from pathlib import Path
-from cli_agent_orchestrator.providers.q_cli import QCliProvider
-from cli_agent_orchestrator.models.terminal import TerminalStatus
-from cli_agent_orchestrator.clients.tmux import tmux_client
 
+import pytest
+
+from cli_agent_orchestrator.clients.tmux import tmux_client
+from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.q_cli import QCliProvider
 
 # Mark all tests in this module as integration and slow
 pytestmark = [pytest.mark.integration, pytest.mark.slow]
@@ -29,31 +30,28 @@ def ensure_test_agent(q_cli_available):
     agent_name = "agent-q-cli-integration-test"
     agent_dir = Path.home() / ".aws" / "amazonq" / "cli-agents"
     agent_file = agent_dir / f"{agent_name}.json"
-    
+
     # Check if agent already exists
     if agent_file.exists():
         return agent_name
-    
+
     # Create agent directory if it doesn't exist
     agent_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Create a minimal test agent configuration
     agent_config = {
         "name": agent_name,
         "description": "",
         "prompt": None,
-        "resources": [
-            "file://.amazonq/rules/**/*.md"
-        ],
+        "resources": ["file://.amazonq/rules/**/*.md"],
         "useLegacyMcpJson": True,
-        "model": None
+        "model": None,
     }
 
-    
     # Write agent configuration
-    with open(agent_file, 'w') as f:
+    with open(agent_file, "w") as f:
         json.dump(agent_config, f, indent=2)
-    
+
     print(f"\nCreated test agent '{agent_name}' at {agent_file}")
     return agent_name
 
@@ -108,9 +106,7 @@ class TestQCliProviderIntegration:
             # Cleanup
             tmux_client.kill_session(test_session_name)
 
-    def test_real_q_chat_simple_query(
-        self, ensure_test_agent, test_session_name, cleanup_session
-    ):
+    def test_real_q_chat_simple_query(self, ensure_test_agent, test_session_name, cleanup_session):
         """Test real Q CLI with a simple query."""
         # Create a test tmux session
         terminal_id = "test1234"
@@ -252,9 +248,7 @@ class TestQCliProviderIntegration:
 
         try:
             # Try with a different profile (may not exist, that's okay)
-            provider = QCliProvider(
-                terminal_id, test_session_name, window_name, "test-agent"
-            )
+            provider = QCliProvider(terminal_id, test_session_name, window_name, "test-agent")
 
             # Initialize - may fail if profile doesn't exist
             try:
@@ -305,15 +299,15 @@ class TestQCliProviderHandoffIntegration:
             statuses = []
             max_wait = 30
             elapsed = 0
-            
+
             while elapsed < max_wait:
                 status = provider.get_status()
                 statuses.append(status)
-                
+
                 # Break if we reach COMPLETED or ERROR
                 if status in [TerminalStatus.COMPLETED, TerminalStatus.ERROR]:
                     break
-                    
+
                 time.sleep(1)
                 elapsed += 1
 
@@ -324,7 +318,7 @@ class TestQCliProviderHandoffIntegration:
             if statuses[-1] == TerminalStatus.COMPLETED:
                 output = tmux_client.get_history(test_session_name, window_name)
                 message = provider.extract_last_message_from_script(output)
-                
+
                 # Verify message extraction worked
                 assert len(message) > 0
                 assert "\x1b[" not in message  # ANSI codes cleaned
@@ -357,7 +351,7 @@ class TestQCliProviderHandoffIntegration:
             # Wait for processing to start
             time.sleep(1)
             initial_status = provider.get_status()
-            
+
             # If already completed, we're done
             if initial_status == TerminalStatus.COMPLETED:
                 status = initial_status
@@ -370,8 +364,10 @@ class TestQCliProviderHandoffIntegration:
                     print(f"Status: {initial_status}")
                     print(f"Terminal output:\n{debug_output}")
                     print("=" * 50)
-                assert initial_status == TerminalStatus.PROCESSING, f"Expected PROCESSING but got {initial_status}"
-                
+                assert (
+                    initial_status == TerminalStatus.PROCESSING
+                ), f"Expected PROCESSING but got {initial_status}"
+
                 max_wait = 30
                 elapsed = 0
                 status_history = [initial_status]
@@ -383,7 +379,7 @@ class TestQCliProviderHandoffIntegration:
                         break
                     time.sleep(1)
                     elapsed += 1
-                
+
                 if status != TerminalStatus.COMPLETED:
                     # Debug: print terminal output on failure
                     debug_output = tmux_client.get_history(test_session_name, window_name)
@@ -392,21 +388,23 @@ class TestQCliProviderHandoffIntegration:
                     print(f"Status history: {status_history}")
                     print(f"Terminal output:\n{debug_output}")
                     print("=" * 50)
-                
-                assert status == TerminalStatus.COMPLETED, f"Expected COMPLETED but got {status} after {elapsed} seconds. Status history: {status_history}"
+
+                assert (
+                    status == TerminalStatus.COMPLETED
+                ), f"Expected COMPLETED but got {status} after {elapsed} seconds. Status history: {status_history}"
 
             # Get the output
             output = tmux_client.get_history(test_session_name, window_name)
-            
+
             # Extract message and verify indices weren't corrupted
             message = provider.extract_last_message_from_script(output)
-            
+
             # Verify message quality
             assert len(message) > 0
             assert "\x1b[" not in message  # All ANSI codes removed
             assert not message.startswith("[")  # No partial ANSI codes
             assert not message.endswith("\x1b")  # No trailing escape chars
-            
+
             # Message should be coherent (no index corruption)
             # A corrupted extraction would have fragments or missing parts
             assert len(message.split()) >= 3  # Should have multiple words
@@ -422,9 +420,7 @@ class TestQCliProviderIntegrationErrorHandling:
 
     def test_invalid_session_handling(self, q_cli_available):
         """Test handling of invalid session."""
-        provider = QCliProvider(
-            "test1234", "non-existent-session", "window-0", "developer"
-        )
+        provider = QCliProvider("test1234", "non-existent-session", "window-0", "developer")
 
         # Should raise an error or timeout when trying to initialize
         # with a non-existent session
@@ -433,9 +429,7 @@ class TestQCliProviderIntegrationErrorHandling:
 
     def test_get_status_with_nonexistent_session(self, q_cli_available):
         """Test get_status with non-existent session."""
-        provider = QCliProvider(
-            "test1234", "non-existent-session", "window-0", "developer"
-        )
+        provider = QCliProvider("test1234", "non-existent-session", "window-0", "developer")
 
         # Should handle gracefully (likely return ERROR status)
         # The exact behavior depends on tmux_client implementation

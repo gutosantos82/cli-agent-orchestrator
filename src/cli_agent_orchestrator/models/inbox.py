@@ -1,12 +1,14 @@
 """Inbox message models."""
 
-from enum import Enum
 from datetime import datetime
+from enum import Enum
+
 from pydantic import BaseModel, Field
 
 
 class MessageStatus(str, Enum):
     """Message status enumeration."""
+
     PENDING = "pending"
     DELIVERED = "delivered"
     FAILED = "failed"
@@ -14,6 +16,7 @@ class MessageStatus(str, Enum):
 
 class InboxMessage(BaseModel):
     """Inbox message model."""
+
     id: int = Field(..., description="Message ID")
     sender_id: str = Field(..., description="Sender terminal ID")
     receiver_id: str = Field(..., description="Receiver terminal ID")
