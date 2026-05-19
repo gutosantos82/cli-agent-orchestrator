@@ -141,16 +141,32 @@ class TmuxClient:
                 "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
             }
             # Only pass essential env vars to avoid tmux "command too long"
-            essential_keys = {"HOME", "PATH", "SHELL", "USER", "LANG", "TERM",
-                             "SSH_AUTH_SOCK", "DISPLAY", "XDG_RUNTIME_DIR",
-                             "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
-                             "DO_NOT_TRACK"}
+            essential_keys = {
+                "HOME",
+                "PATH",
+                "SHELL",
+                "USER",
+                "LANG",
+                "TERM",
+                "SSH_AUTH_SOCK",
+                "DISPLAY",
+                "XDG_RUNTIME_DIR",
+                "AWS_PROFILE",
+                "AWS_REGION",
+                "AWS_DEFAULT_REGION",
+                "DO_NOT_TRACK",
+            }
             environment = {
                 k: v
                 for k, v in os.environ.items()
-                if (k in essential_keys or k in allowed_vars
-                    or (not any(k.startswith(p) for p in blocked_prefixes)
-                        and k.startswith(("CAO_", "KIRO_", "MISE_"))))
+                if (
+                    k in essential_keys
+                    or k in allowed_vars
+                    or (
+                        not any(k.startswith(p) for p in blocked_prefixes)
+                        and k.startswith(("CAO_", "KIRO_", "MISE_"))
+                    )
+                )
                 and len(v) < 2048
             }
             environment["CAO_TERMINAL_ID"] = terminal_id
