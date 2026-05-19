@@ -131,6 +131,21 @@ class TestCreateWindow:
         with pytest.raises(ValueError, match="Window name is None"):
             tmux.create_window("ses", "w", "tid2", str(tmp_path))
 
+    def test_create_window_with_window_shell(self, tmux, tmp_path):
+        mock_window = MagicMock()
+        mock_window.name = "restored-window"
+        mock_session = MagicMock()
+        mock_session.new_window.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.create_window(
+            "ses", "restored-window", "tid2", str(tmp_path), window_shell="cat /tmp/x; exec bash -l"
+        )
+
+        assert result == "restored-window"
+        call_kwargs = mock_session.new_window.call_args[1]
+        assert call_kwargs["window_shell"] == "cat /tmp/x; exec bash -l"
+
 
 # ── send_keys ────────────────────────────────────────────────────────
 
@@ -292,6 +307,23 @@ class TestGetHistory:
         tmux.get_history("ses", "win", tail_lines=50)
 
         mock_pane.cmd.assert_called_once_with("capture-pane", "-e", "-p", "-S", "-50")
+
+    def test_get_history_full_history(self, tmux):
+        mock_pane = MagicMock()
+        mock_result = MagicMock()
+        mock_result.stdout = ["line1", "line2"]
+        mock_pane.cmd.return_value = mock_result
+        mock_window = MagicMock()
+        mock_window.panes = [mock_pane]
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_history("ses", "win", strip_escapes=True, full_history=True)
+
+        assert result == "line1\nline2"
+        # full_history uses "-S" "-" (no line count), strip_escapes omits "-e"
+        mock_pane.cmd.assert_called_once_with("capture-pane", "-p", "-S", "-")
 
 
 # ── list_sessions ────────────────────────────────────────────────────
@@ -548,3 +580,42 @@ class TestStopPipePane:
 
         with pytest.raises(ValueError, match="not found"):
             tmux.stop_pipe_pane("ses", "nonexistent")
+
+
+class TestGetPaneCurrentCommand:
+    def test_get_pane_current_command_success(self, tmux):
+        mock_session = MagicMock()
+        mock_window = MagicMock()
+        mock_pane = MagicMock()
+        mock_pane.cmd.return_value.stdout = ["bash"]
+        mock_window.active_pane = mock_pane
+        mock_session.windows.get.return_value = mock_window
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_pane_current_command("ses", "win")
+
+        assert result == "bash"
+        mock_pane.cmd.assert_called_once_with("display-message", "-p", "#{pane_current_command}")
+
+    def test_get_pane_current_command_session_not_found(self, tmux):
+        tmux.server.sessions.get.return_value = None
+
+        result = tmux.get_pane_current_command("nonexistent", "win")
+
+        assert result is None
+
+    def test_get_pane_current_command_window_not_found(self, tmux):
+        mock_session = MagicMock()
+        mock_session.windows.get.return_value = None
+        tmux.server.sessions.get.return_value = mock_session
+
+        result = tmux.get_pane_current_command("ses", "nonexistent")
+
+        assert result is None
+
+    def test_get_pane_current_command_exception_returns_none(self, tmux):
+        tmux.server.sessions.get.side_effect = Exception("tmux error")
+
+        result = tmux.get_pane_current_command("ses", "win")
+
+        assert result is None
