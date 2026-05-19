@@ -147,13 +147,12 @@ class TmuxClient:
                 "SHELL",
                 "USER",
                 "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
                 "TERM",
                 "SSH_AUTH_SOCK",
                 "DISPLAY",
                 "XDG_RUNTIME_DIR",
-                "AWS_PROFILE",
-                "AWS_REGION",
-                "AWS_DEFAULT_REGION",
                 "DO_NOT_TRACK",
             }
             environment = {
@@ -164,10 +163,10 @@ class TmuxClient:
                     or k in allowed_vars
                     or (
                         not any(k.startswith(p) for p in blocked_prefixes)
-                        and k.startswith(("CAO_", "KIRO_", "MISE_"))
+                        and k.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
+                        and len(v.encode("utf-8")) < 2048
                     )
                 )
-                and len(v) < 2048
             }
             environment["CAO_TERMINAL_ID"] = terminal_id
 
