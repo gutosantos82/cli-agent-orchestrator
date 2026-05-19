@@ -96,14 +96,14 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
 
   const allAgentTypes = useMemo(() => {
     const types = new Set<string>()
-    sessionData.forEach(s => s.terminals.forEach(t => { if (t.agent_profile) types.add(t.agent_profile) }))
+    sessionData.forEach(s => s.terminals.forEach(t => { types.add(t.agent_profile || 'default') }))
     return [...types].sort()
   }, [sessionData])
 
   const filteredSessions = useMemo(() => {
     const filtered = sessionData.filter(s =>
-      s.terminals.some(t => {
-        const matchAgent = !agentTypeFilter || t.agent_profile === agentTypeFilter
+      s.terminals.length === 0 || s.terminals.some(t => {
+        const matchAgent = !agentTypeFilter || (t.agent_profile || 'default') === agentTypeFilter
         const matchStatus = !statusFilter || (terminalStatuses[t.id] || 'UNKNOWN') === statusFilter
         return matchAgent && matchStatus
       })
@@ -138,7 +138,7 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
             }
           })
         )
-        setSessionData(prev => sessionDetails.length === 0 && prev.length > 0 ? prev : sessionDetails)
+        setSessionData(sessionDetails)
         // Auto-expand only newly seen sessions
         const newNames = sessionDetails.map(s => s.name).filter(n => !seenSessionsRef.current.has(n))
         newNames.forEach(n => seenSessionsRef.current.add(n))

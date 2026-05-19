@@ -44,7 +44,10 @@ export const useStore = create<Store>((set, get) => ({
       const prev = get()
       // Only skip empty responses when reconnecting (connected was false),
       // not after intentional deletions.
-      if (sessions.length === 0 && prev.sessions.length > 0 && !prev.connected) return
+      if (sessions.length === 0 && prev.sessions.length > 0 && !prev.connected) {
+        set({ connected: true })
+        return
+      }
       if (!prev.connected || !jsonEqual(prev.sessions, sessions)) {
         set({ sessions, connected: true })
       }
