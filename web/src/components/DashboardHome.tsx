@@ -5,7 +5,7 @@ import { Bot, Zap, Package, Monitor, Terminal as TermIcon, Trash2, Mail, FileTex
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
-import { StatusBadge } from './StatusBadge'
+import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
@@ -33,21 +33,17 @@ function fmtAbs(dateStr: string | null | undefined): string | null {
   return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
-const STATUS_META: Record<string, { label: string; dot: string; text: string; pulse?: boolean }> = {
-  PROCESSING: { label: 'Processing', dot: 'bg-amber-400', text: 'text-amber-400', pulse: true },
-  IDLE: { label: 'Idle', dot: 'bg-emerald-400', text: 'text-emerald-400' },
-  WAITING_USER_ANSWER: { label: 'Waiting', dot: 'bg-purple-400', text: 'text-purple-400' },
-  ERROR: { label: 'Error', dot: 'bg-red-400', text: 'text-red-400' },
-  COMPLETED: { label: 'Completed', dot: 'bg-blue-400', text: 'text-blue-400' },
-  UNKNOWN: { label: 'Unknown', dot: 'bg-gray-500', text: 'text-gray-500' },
-}
+const STATUS_META: Record<string, { label: string; dot: string; text: string; pulse?: boolean }> = Object.fromEntries(
+  Object.entries(STATUS_CONFIG).map(([k, v]) => [k, { label: v.label, dot: v.dotClass, text: v.textClass, pulse: v.pulse }])
+)
+STATUS_META['UNKNOWN'] = { label: 'Unknown', dot: 'bg-gray-500', text: 'text-gray-500' }
 
 const STATUS_ACTIVE_BG: Record<string, string> = {
-  PROCESSING: 'bg-amber-900/40 border-amber-500/50 text-amber-300',
+  PROCESSING: 'bg-blue-900/40 border-blue-500/50 text-blue-300',
   IDLE: 'bg-emerald-900/40 border-emerald-500/50 text-emerald-300',
-  WAITING_USER_ANSWER: 'bg-purple-900/40 border-purple-500/50 text-purple-300',
+  WAITING_USER_ANSWER: 'bg-amber-900/40 border-amber-500/50 text-amber-300',
   ERROR: 'bg-red-900/40 border-red-500/50 text-red-300',
-  COMPLETED: 'bg-blue-900/40 border-blue-500/50 text-blue-300',
+  COMPLETED: 'bg-purple-900/40 border-purple-500/50 text-purple-300',
   UNKNOWN: 'bg-gray-800/40 border-gray-500/50 text-gray-300',
 }
 
