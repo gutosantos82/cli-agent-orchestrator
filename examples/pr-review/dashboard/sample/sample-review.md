@@ -1,3 +1,10 @@
+---
+title: "fix(kiro): detect kiro 2.8.x TUI idle state"
+urgency: high
+importance: high
+verdict: "Request changes"
+summary: "Idle regex now matches the persistent status bar — risks premature COMPLETED mid-response. Needs tests + a CI line-length fix."
+---
 # PR Review: #325 — fix(kiro): detect kiro 2.8.x TUI idle state after MCP server init
 
 ## Summary
