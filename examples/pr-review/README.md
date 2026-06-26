@@ -187,6 +187,11 @@ a format reference.
   team runs the four angles as independent reviewers in parallel, so each gives the diff its
   full attention and they can't crowd each other out. The supervisor's job is fetch +
   synthesize + gate.
+- **Isolated checkout per PR.** The supervisor checks the PR out into its own git worktree
+  under `/tmp/pr-review/<n>-<sha>/` and passes that path to the reviewers, so they read the
+  PR's *actual* tree — not this session's checkout, which may be on a different branch.
+  Without this, reviewers report false "this function/file doesn't exist" findings. The
+  supervisor removes the worktree when done.
 - **Diff is fetched once** by the supervisor and passed in messages — reviewers stay off
   GitHub, which keeps them simple and avoids four redundant `gh` calls.
 - **Message delivery**: the supervisor finishes its turn after dispatching so the inbox can

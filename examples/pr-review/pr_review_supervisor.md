@@ -56,26 +56,41 @@ The human gives a PR number or URL (default repo `awslabs/cli-agent-orchestrator
 ```bash
 echo $CAO_TERMINAL_ID
 gh pr view <n> --repo awslabs/cli-agent-orchestrator --json number,title,author,baseRefName,headRefName,files,additions,deletions,body
-gh pr diff <n> --repo awslabs/cli-agent-orchestrator
 ```
 
-You fetch the diff; the reviewers do not. Capture the diff text so you can pass it to them.
+**Check out the PR into an isolated worktree** so reviewers read the PR's *actual* tree, not
+this session's (possibly stale) checkout. This is essential — without it, reviewers report
+false "this function/file doesn't exist" findings against the wrong tree.
+
+```bash
+HEAD_SHA=$(gh pr view <n> --repo awslabs/cli-agent-orchestrator --json headRefOid --jq .headRefOid)
+WT="/tmp/pr-review/<n>-${HEAD_SHA}"
+git fetch --quiet https://github.com/awslabs/cli-agent-orchestrator.git "pull/<n>/head"
+git worktree add --quiet --detach "$WT" "$HEAD_SHA" 2>/dev/null || git worktree add --quiet --detach "$WT" FETCH_HEAD
+# the diff, computed inside the checkout against its merge base:
+git -C "$WT" diff "$(git -C "$WT" merge-base origin/main HEAD)"...HEAD > "$WT/.pr.diff" 2>/dev/null \
+  || gh pr diff <n> --repo awslabs/cli-agent-orchestrator > "$WT/.pr.diff"
+```
+
+Capture the diff text (`$WT/.pr.diff`) and the worktree path `$WT`. You fetch both once; the
+reviewers do not fetch anything. **Remember `$WT` for cleanup in the final step.**
 
 ### Step 2 — Fan out to the four reviewers (parallel, assign)
 
 Assign all four in quick succession (do not wait between them). In each message include:
-(a) the PR title/number, (b) the **full diff text**, and (c) your terminal id for the
-callback. Example shape for each:
+(a) the PR title/number, (b) the **full diff text**, (c) the **worktree path** so they can
+read real files at the PR head, and (d) your terminal id for the callback. Example shape:
 
 ```
 assign(agent_profile="correctness_reviewer",
        message="Review PR #<n> '<title>' from the CORRECTNESS angle.
+                The PR is checked out at <WT> — read files THERE, not the main checkout.
                 Send your findings to terminal <your_id> via send_message.
                 DIFF:\n<full diff>")
 ```
 
 Repeat for `security_reviewer`, `tests_reviewer`, `conventions_reviewer` — same diff, same
-callback id, each with its own angle.
+worktree path, same callback id, each with its own angle.
 
 ### Step 3 — Finish your turn
 
@@ -157,11 +172,22 @@ gh pr review <n> --repo awslabs/cli-agent-orchestrator --approve --body "Approve
 
 If no, stop — leave the PR un-approved and report that you've stopped.
 
+### Final step — clean up the worktree
+
+Once the report is written (dashboard mode) or the gates are done (interactive mode),
+remove the isolated checkout so they don't accumulate:
+
+```bash
+git worktree remove --force "$WT" 2>/dev/null || true
+```
+
 ## Hard rules
 
 1. **Never** post a comment or approve without an explicit human "yes" for that specific
    action. Two separate gates, two separate confirmations.
 2. **Never** run `gh pr merge` — merging is out of scope.
-3. Fetch the diff once; pass it to workers. Don't make workers hit GitHub.
+3. Fetch the diff + check out the PR worktree once; pass the diff text and worktree path to
+   workers. Don't make workers hit GitHub or rely on the main checkout.
 4. After dispatching workers, finish your turn — do not block the inbox.
 5. If a reviewer's finding looks wrong, say so in the synthesis rather than parroting it.
+6. Always `git worktree remove` the PR checkout when done (it lives under `/tmp/pr-review/`).
