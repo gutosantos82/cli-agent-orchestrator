@@ -1,0 +1,26 @@
+{
+  "skill_name": "cao-pr-review",
+  "evals": [
+    {
+      "id": 0,
+      "name": "cursor-provider",
+      "prompt": "Review CAO PR #296 on the awslabs/cli-agent-orchestrator repo (the Cursor CLI provider). Give me a review.",
+      "expected_output": "A severity-grouped review that checks the new provider against the CAO provider contract (enum, manager, launch allowlist, tests, fixtures, docs, README, CHANGELOG), terminal status-detection order, tmux/subprocess injection, and test coverage with correct pytest markers.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "name": "deps-bump",
+      "prompt": "Can you look over pull request #303 in awslabs/cli-agent-orchestrator and tell me if it's good to merge?",
+      "expected_output": "Notices it is a cryptography dependency bump; checks pyproject.toml + uv.lock are both updated, CHANGELOG, conventional commit style, and frames it through the Trivy/dependency-review CI gate. Should not invent code bugs that don't exist.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "cli-autodetect",
+      "prompt": "review https://github.com/awslabs/cli-agent-orchestrator/pull/309 for me",
+      "expected_output": "Severity-grouped review focused on correctness (CLI auto-detect logic, server backend reconcile), error paths, and whether tests were added/updated. Anchored to file:line.",
+      "files": []
+    }
+  ]
+}
