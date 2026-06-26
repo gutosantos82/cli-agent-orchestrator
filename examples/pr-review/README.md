@@ -110,9 +110,26 @@ For reviewing many PRs and acting on them from a browser, add two more pieces:
   head commit it last reviewed each at (`pr-review-data/state.json`), and hands off only
   **new or changed** PRs to the supervisor in *dashboard mode*. Re-reviews a PR automatically
   when the author pushes new commits (the head SHA changes). Never posts to GitHub itself.
-- **`dashboard/server.py`** — a small local FastAPI app that renders every review report and
-  exposes live **Approve / Comment / Request-changes** buttons. It is the human gate for the
-  managed flow.
+- **`dashboard/server.py`** — a small local FastAPI app. The main screen is a **cards grid**
+  for triage: one card per PR with flag pills (urgency, importance, size, days waiting,
+  author + their merged-PR count, CI). Click a card to **drill down** into the full review
+  with live **Approve / Comment / Request-changes** buttons (comment box pre-filled with the
+  report). It is the human gate for the managed flow. Cards sort by urgency, then by
+  longest-waiting.
+
+### Triage metadata — where each flag comes from
+
+| Flag | Source | How |
+|---|---|---|
+| size, additions/deletions, files | manager | from `gh pr list` counts |
+| days waiting | manager | now − `createdAt` |
+| author + merged-PR count (CAO involvement) | manager | `gh pr list --author --state merged` count |
+| CI | manager | `statusCheckRollup` |
+| labels, draft | manager | from `gh` |
+| **urgency, importance, summary, verdict** | supervisor | judged by the review team, written as YAML frontmatter atop the report |
+
+Deterministic facts go in `meta/<pr>-<sha>.json` (manager, single writer); judged fields ride
+in the review's frontmatter (supervisor, single writer). The dashboard merges them by PR.
 
 ### How it fits together
 
@@ -120,12 +137,14 @@ For reviewing many PRs and acting on them from a browser, add two more pieces:
 pr_review_manager                       ← you launch on demand
   gh pr list → open PRs
   compare each head SHA to state.json
-  new/changed → handoff → pr_review_supervisor (dashboard mode)
-                            └─ 4 reviewers (assign) → report
-  writes  pr-review-data/reviews/<pr>-<sha>.md  +  state.json
+  new/changed:
+    → write meta/<pr>-<sha>.json   (size, days, author rep, CI, labels)
+    → handoff → pr_review_supervisor (dashboard mode)
+                  └─ 4 reviewers (assign) → report w/ urgency/importance frontmatter
+  writes  pr-review-data/{meta,reviews}/<pr>-<sha>.*  +  state.json
         ↓
 dashboard/server.py (localhost)         ← you keep open in a browser
-  renders each review · [Approve] [Comment] [Request changes]
+  cards grid (triage flags) · click → drill-down review · [Approve][Comment][Request]
   button → runs gh immediately → shows result
 ```
 
@@ -140,12 +159,12 @@ cao launch --agents pr_review_manager --provider claude_code --yolo
 #   in its terminal:  Review all open PRs.
 
 # 3. open the dashboard — START IN DRY-RUN (default): buttons only PRINT the gh command
-uv run --no-project --with fastapi --with uvicorn --with markdown \
+uv run --no-project --with fastapi --with uvicorn --with markdown --with pyyaml \
     examples/pr-review/dashboard/server.py
 #   → http://localhost:8787   (reads ./pr-review-data, repo-root)
 
 # 4. when you trust it, run for real:
-uv run --no-project --with fastapi --with uvicorn --with markdown \
+uv run --no-project --with fastapi --with uvicorn --with markdown --with pyyaml \
     examples/pr-review/dashboard/server.py --execute
 ```
 

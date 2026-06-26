@@ -46,10 +46,12 @@ dashboard looks.
 
 ```bash
 gh pr list --repo awslabs/cli-agent-orchestrator --state open \
-  --json number,title,headRefOid --limit 50
+  --json number,title,headRefOid,author,additions,deletions,changedFiles,createdAt,labels,isDraft,statusCheckRollup \
+  --limit 50
 ```
 
-`headRefOid` is the current head commit SHA — this is how you detect changes.
+`headRefOid` is the current head commit SHA — this is how you detect changes. The other
+fields feed the metadata you write in Step 3a.
 
 ### Step 2 — Read state and compute the work list
 
@@ -63,9 +65,37 @@ Read `pr-review-data/state.json` (create `{}` if missing). For each open PR, com
 Report the work list to yourself: e.g. "3 open PRs; #327 changed, #330 new, #325 unchanged
 → reviewing 2."
 
-### Step 3 — Hand off each PR needing review (one at a time)
+### Step 3a — Write the metadata file (deterministic facts)
 
-For each PR in the work list, call `handoff` to the supervisor in **dashboard mode**:
+For each PR needing review, write `pr-review-data/meta/<n>-<headRefOid>.json` with the
+facts you can compute without reading the diff. The dashboard renders these as flag pills:
+
+```json
+{
+  "title": "<PR title>",
+  "size": "<XS|S|M|L|XL>",
+  "additions": <int>, "deletions": <int>, "files": <changedFiles>,
+  "days_waiting": <whole days since createdAt>,
+  "author": "<login>",
+  "author_merged_prs": <int>,
+  "ci": "<passing|failing|pending|none>",
+  "labels": ["bug", ...],
+  "draft": <true|false>
+}
+```
+
+How to derive the judged-by-rule fields:
+- **size** from `additions + deletions`: XS <10, S <50, M <250, L <800, XL ≥800.
+- **days_waiting**: whole days between `createdAt` and now (`date -u +%s` math is fine).
+- **author_merged_prs** (their CAO involvement / reputation): count their merged PRs —
+  `gh pr list --repo awslabs/cli-agent-orchestrator --state merged --author <login> --json number --jq 'length'`.
+  This is one extra `gh` call per distinct author; cache per author within a run.
+- **ci** from `statusCheckRollup`: passing if all SUCCESS, failing if any FAILURE/ERROR,
+  pending if any in progress, none if empty.
+
+### Step 3b — Hand off each PR for the deep review (one at a time)
+
+Then call `handoff` to the supervisor in **dashboard mode**:
 
 ```
 handoff(agent_profile="pr_review_supervisor",
@@ -74,7 +104,7 @@ handoff(agent_profile="pr_review_supervisor",
 ```
 
 `handoff` blocks until that review's report file is written, then you move to the next PR.
-Use the full `headRefOid` in the filename so the dashboard can detect staleness.
+Use the full `headRefOid` in both filenames so the dashboard pairs them and detects staleness.
 
 ### Step 4 — Update state
 

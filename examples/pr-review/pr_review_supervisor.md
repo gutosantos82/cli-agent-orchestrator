@@ -112,9 +112,27 @@ Approve / Approve with nits / Request changes — one line
 Classify each finding as **introduced** by this PR vs. **pre-existing**; never block on
 pre-existing issues.
 
-> **Dashboard mode stops here.** Write the report markdown to the file path given in the
-> task message (e.g. `pr-review-data/reviews/<n>-<sha>.md` — use the PR's head SHA), then
-> end your turn with a one-line confirmation. Do not do Steps 5–6.
+> **Dashboard mode stops here.** Write the report to the file path given in the task
+> message (e.g. `pr-review-data/reviews/<n>-<sha>.md` — use the PR's head SHA). Prepend a
+> YAML frontmatter block carrying the triage fields the dashboard renders, then the report
+> markdown below it:
+>
+> ```
+> ---
+> title: "<PR title>"
+> urgency: <high|medium|low>      # how soon a human should look: security/breakage/blocking-others → high
+> importance: <high|medium|low>   # blast radius: core src (providers/, services/) → high; docs/tests-only → low
+> verdict: "<Approve|Approve with nits|Request changes>"
+> summary: "<one sentence — the headline a triager reads on the card>"
+> ---
+>
+> # PR Review: #<n> — <title>
+> ... (the full report from Step 4) ...
+> ```
+>
+> Base `urgency`/`importance` on what the four reviewers found (a blocking security finding
+> → high urgency; a docs-only change → low importance). Then end your turn with a one-line
+> confirmation. Do not do Steps 5–6.
 
 ### Step 5 — HUMAN GATE 1: present the report, wait
 
