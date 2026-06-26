@@ -148,7 +148,30 @@ dashboard/server.py (localhost)         ← you keep open in a browser
   button → runs gh immediately → shows result
 ```
 
-### Setup (managed flow)
+### Driver: one session per PR (recommended for batches)
+
+`run_reviews.sh` launches an **isolated CAO session per PR** instead of one manager doing
+sequential blocking handoffs. Each PR's review runs in its own session (`cao-prr-<n>`), so
+they run concurrently and a slow/hung review on one PR can't block the others.
+
+```bash
+examples/pr-review/run_reviews.sh --limit 10 --max-parallel 3
+```
+
+It discovers open non-draft PRs, skips any already reviewed at their current head SHA
+(idempotent — safe to re-run), and for each: `cao launch` an idle supervisor session, then
+`cao session send --async` the review task. Reports land in `pr-review-data/reviews/` and the
+dashboard renders them. Reclaim sessions when done:
+
+```bash
+for s in $(tmux ls -F '#{session_name}' | grep '^cao-prr-'); do cao shutdown --session "$s"; done
+```
+
+> The single `pr_review_manager` agent (below) is an alternative that keeps a running tally
+> in `state.json` and re-reviews on SHA change, but it serializes reviews through one session.
+> For reviewing many PRs at once, prefer the driver script.
+
+### Setup (managed flow — single manager)
 
 ```bash
 # 1. server + skill + profiles (as above), plus the manager:
