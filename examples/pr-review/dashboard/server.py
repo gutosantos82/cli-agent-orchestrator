@@ -60,34 +60,43 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 def list_prs() -> list[dict]:
     """One merged entry per PR: review report + frontmatter + manager metadata."""
     state = load_state()
-    metas = {}
+    # collect metadata (manager) and reviews (supervisor) by PR; either may be absent.
+    metas, reviews = {}, {}
     meta_dir = data() / "meta"
     if meta_dir.exists():
         for mf in meta_dir.glob("*.json"):
-            pr = mf.stem.partition("-")[0]
+            pr, _, sha = mf.stem.partition("-")
             if pr.isdigit():
                 try:
-                    metas[pr] = json.loads(mf.read_text())
+                    metas[pr] = (sha, json.loads(mf.read_text()))
                 except json.JSONDecodeError:
                     pass
-
-    out = {}
     for f in sorted((data() / "reviews").glob("*.md")):
         pr, _, sha = f.stem.partition("-")
-        if not pr.isdigit():
-            continue
-        fm, body = parse_frontmatter(f.read_text())
+        if pr.isdigit():
+            reviews[pr] = (sha, *parse_frontmatter(f.read_text()))  # (sha, frontmatter, body)
+
+    out = []
+    for pr in set(metas) | set(reviews):
+        meta_sha, meta = metas.get(pr, ("", {}))
+        rev = reviews.get(pr)
+        if rev:
+            rev_sha, fm, body = rev
+        else:
+            rev_sha, fm, body = "", {}, ""
+        sha = rev_sha or meta_sha          # prefer the reviewed SHA when present
+        has_review = bool(rev)
         st = state.get(pr, {})
-        meta = metas.get(pr, {})
-        out[pr] = {
+        out.append({
             "pr": pr,
             "sha": sha,
-            # judged fields (from review frontmatter)
+            "has_review": has_review,
+            # judged fields (from review frontmatter; blank until the review lands)
             "title": fm.get("title") or meta.get("title") or f"PR #{pr}",
             "urgency": str(fm.get("urgency", "")).lower(),
             "importance": str(fm.get("importance", "")).lower(),
             "verdict": fm.get("verdict", ""),
-            "summary": fm.get("summary", ""),
+            "summary": fm.get("summary", "") or ("Review pending…" if not has_review else ""),
             # deterministic fields (from manager metadata)
             "size": meta.get("size", ""),
             "additions": meta.get("additions"),
@@ -100,16 +109,19 @@ def list_prs() -> list[dict]:
             "labels": meta.get("labels", []),
             "draft": meta.get("draft", False),
             # review body + action state
-            "html": md.markdown(body, extensions=["fenced_code", "tables"]),
+            "html": md.markdown(body, extensions=["fenced_code", "tables"]) if body
+                    else "<p><em>Deep review pending — metadata only so far.</em></p>",
             "raw": body,
             "acted": st.get("acted"),
             "acted_sha": st.get("acted_sha"),
-            "stale": bool(st.get("acted_sha") and st.get("acted_sha") != sha),
-        }
-    # sort: urgency (high→low), then longest-waiting first
+            "stale": bool(st.get("acted_sha") and sha and st.get("acted_sha") != sha),
+        })
+    # sort: reviewed-first, then urgency (high→low), then longest-waiting
     return sorted(
-        out.values(),
-        key=lambda r: (URGENCY_RANK.get(r["urgency"], 3), -(r["days_waiting"] or 0)),
+        out,
+        key=lambda r: (0 if r["has_review"] else 1,
+                       URGENCY_RANK.get(r["urgency"], 3),
+                       -(r["days_waiting"] or 0)),
     )
 
 
