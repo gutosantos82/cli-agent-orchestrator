@@ -211,18 +211,24 @@ def render_page(prs: list[dict]) -> str:
             flags.append(pill("draft", "#9a6700"))
         for lb in r["labels"]:
             flags.append(pill(lb, "#6e7781"))
-        badge = ""
+        # review-status badge: is the LLM review done, or only metadata so far?
+        if r["has_review"]:
+            review_badge = '<span class="badge reviewed">✓ reviewed</span>'
+        else:
+            review_badge = '<span class="badge pending">⏳ review pending</span>'
+        # action badge: what the human has done (approved/commented/requested)
+        acted_badge = ""
         if r["acted"]:
             cls = "stale" if r["stale"] else "done"
             extra = " · stale (PR changed)" if r["stale"] else ""
-            badge = f'<span class="badge {cls}">{r["acted"]}{extra}</span>'
+            acted_badge = f'<span class="badge {cls}">{r["acted"]}{extra}</span>'
         cards.append(f"""
         <article class="card" data-pr="{r['pr']}" data-sha="{r['sha']}"
                  data-raw="{html.escape(json.dumps(r['raw']))}"
                  data-html="{html.escape(json.dumps(r['html']))}"
                  data-title="{html.escape(r['title'])}" data-verdict="{html.escape(r['verdict'])}"
                  onclick="openDetail(this)">
-          <div class="card-top"><span class="num">#{r['pr']}</span>{badge}</div>
+          <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{acted_badge}</span></div>
           <h3>{html.escape(r['title'])}</h3>
           <p class="summary">{html.escape(r['summary'] or r['verdict'] or '')}</p>
           <div class="flags">{''.join(flags)}</div>
@@ -246,8 +252,11 @@ def render_page(prs: list[dict]) -> str:
   .summary {{ font-size:13px; color:#57606a; margin:0 0 10px; max-height:3em; overflow:hidden; }}
   .flags {{ display:flex; flex-wrap:wrap; gap:5px; }}
   .pill {{ color:#fff; font-size:11px; padding:2px 8px; border-radius:10px; white-space:nowrap; }}
+  .badges {{ display:flex; gap:4px; }}
   .badge {{ font-size:11px; padding:2px 8px; border-radius:10px; }}
   .badge.done {{ background:#dafbe1; color:#1a7f37; }} .badge.stale {{ background:#fff1e5; color:#9a6700; }}
+  .badge.reviewed {{ background:#ddf4ff; color:#0969da; }}
+  .badge.pending {{ background:#f6f8fa; color:#656d76; border:1px solid #d0d7de; }}
   .empty {{ color:#656d76; text-align:center; padding:40px; }}
   /* detail overlay */
   .overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:10; }}
