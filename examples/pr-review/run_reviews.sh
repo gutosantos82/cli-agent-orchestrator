@@ -47,23 +47,84 @@ reap_finished() {
   done
 }
 
+# size bucket from total churn
+size_bucket() {
+  local n="$1"
+  if   [[ "$n" -lt 10  ]]; then echo XS
+  elif [[ "$n" -lt 50  ]]; then echo S
+  elif [[ "$n" -lt 250 ]]; then echo M
+  elif [[ "$n" -lt 800 ]]; then echo L
+  else echo XL; fi
+}
+
+declare -A AUTHOR_MERGED   # login -> merged-PR count (cached per run)
+author_merged_prs() {
+  local login="$1"
+  [[ -n "${AUTHOR_MERGED[$login]:-}" ]] && { echo "${AUTHOR_MERGED[$login]}"; return; }
+  local c
+  c="$(gh pr list --repo "$REPO" --state merged --author "$login" --json number --jq 'length' 2>/dev/null || echo 0)"
+  AUTHOR_MERGED[$login]="$c"; echo "$c"
+}
+
+# Write the deterministic metadata file the dashboard renders as flag pills.
+# Pulled straight from the PR JSON we already fetched — no diff read needed.
+write_meta() {
+  local pr="$1" sha="$2" json="$3"
+  local title add del files created login labels ci rollup merged days
+  title="$(jq -r '.title' <<<"$json")"
+  add="$(jq -r '.additions' <<<"$json")"; del="$(jq -r '.deletions' <<<"$json")"
+  files="$(jq -r '.changedFiles' <<<"$json")"
+  created="$(jq -r '.createdAt' <<<"$json")"
+  login="$(jq -r '.author.login' <<<"$json")"
+  labels="$(jq -c '[.labels[].name]' <<<"$json")"
+  # CI from statusCheckRollup conclusions
+  rollup="$(jq -r '[.statusCheckRollup[]?.conclusion // .statusCheckRollup[]?.state] | @tsv' <<<"$json" 2>/dev/null || echo "")"
+  if   [[ -z "$rollup" ]]; then ci=none
+  elif grep -qiE 'FAILURE|ERROR|TIMED_OUT|CANCELLED' <<<"$rollup"; then ci=failing
+  elif grep -qiE 'PENDING|IN_PROGRESS|QUEUED|EXPECTED' <<<"$rollup"; then ci=pending
+  else ci=passing; fi
+  merged="$(author_merged_prs "$login")"
+  days="$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))"
+  jq -n \
+    --arg title "$title" --arg size "$(size_bucket $((add+del)))" \
+    --argjson additions "$add" --argjson deletions "$del" --argjson files "$files" \
+    --argjson days_waiting "$days" --arg author "$login" --argjson author_merged_prs "$merged" \
+    --arg ci "$ci" --argjson labels "$labels" \
+    '{title:$title,size:$size,additions:$additions,deletions:$deletions,files:$files,
+      days_waiting:$days_waiting,author:$author,author_merged_prs:$author_merged_prs,
+      ci:$ci,labels:$labels,draft:false}' \
+    > "$DATA_DIR/meta/${pr}-${sha}.json"
+}
+
 echo "Discovering open PRs on $REPO …"
-# non-draft PRs, newest first, capped at LIMIT
-mapfile -t PRS < <(gh pr list --repo "$REPO" --state open \
-  --json number,isDraft,headRefOid \
-  --jq '[.[] | select(.isDraft|not)] | .[:'"$LIMIT"'][] | "\(.number) \(.headRefOid)"')
+# non-draft PRs, newest first, capped at LIMIT. Fetch the full per-PR JSON so we can write
+# metadata without extra calls; emit one compact JSON object per line.
+mapfile -t PR_JSON < <(gh pr list --repo "$REPO" --state open \
+  --json number,isDraft,headRefOid,title,additions,deletions,changedFiles,createdAt,author,labels,statusCheckRollup \
+  --jq '[.[] | select(.isDraft|not)] | .[:'"$LIMIT"'][] | @json')
+PRS=()
+for j in "${PR_JSON[@]}"; do
+  PRS+=("$(jq -r '"\(.number) \(.headRefOid)"' <<<"$j")")
+done
 
 echo "Will review ${#PRS[@]} PRs (limit $LIMIT, up to $MAX_PARALLEL at a time):"
 printf '  #%s\n' "${PRS[@]%% *}"
 
 launched=0
-for entry in "${PRS[@]}"; do
+for i in "${!PRS[@]}"; do
+  entry="${PRS[$i]}"
   pr="${entry%% *}"
   sha="${entry##* }"
+  pr_json="${PR_JSON[$i]}"
 
-  # skip if already reviewed at this exact SHA (idempotent re-runs / resume)
+  # write/refresh the metadata file so the dashboard has triage flags even before the
+  # deep review lands (and for PRs whose review is skipped as already-current).
+  write_meta "$pr" "$sha" "$pr_json" 2>/dev/null \
+    || echo "    (metadata write for #$pr failed — dashboard flags will be partial)"
+
+  # skip the deep review if already reviewed at this exact SHA (idempotent re-runs)
   if [[ -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]]; then
-    echo "  #$pr already reviewed at $sha — skipping"
+    echo "  #$pr already reviewed at $sha — skipping (metadata refreshed)"
     continue
   fi
 

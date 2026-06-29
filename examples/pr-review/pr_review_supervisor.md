@@ -95,12 +95,23 @@ worktree path, same callback id, each with its own angle.
 ### Step 3 — Finish your turn
 
 State: "Dispatched 4 reviewers for PR #<n>; awaiting findings." Then stop. Do not run
-commands. The four findings will arrive in your inbox.
+commands. Findings will arrive in your inbox as each reviewer reports.
+
+**Do not wait forever for a slow reviewer — this is the #1 cause of stalls.** Each time you
+wake with new findings, take stock:
+
+- If **all four** have reported → synthesize now (Step 4).
+- If **three** have reported and you have woken at least twice still missing the same one →
+  **proceed to Step 4 with the three you have.** Note the missing angle explicitly in the
+  report (e.g. "_Conventions review did not return; not covered._"). A complete report from
+  three angles beats an indefinite wait.
+- Never end a turn idle with findings already in hand and no further action queued — that
+  parks the session. If you have ≥3 findings and nothing else is pending, synthesize.
 
 ### Step 4 — Synthesize ONE report
 
-When all four findings have arrived, merge them into a single report using this structure
-(deduplicate overlapping findings; keep each reviewer's angle tag):
+Merge the findings you have into a single report using this structure (deduplicate
+overlapping findings; keep each reviewer's angle tag):
 
 ```
 # PR Review: #<n> — <title>
