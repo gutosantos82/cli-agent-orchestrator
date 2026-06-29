@@ -34,6 +34,19 @@ done
 mkdir -p "$DATA_DIR/reviews" "$DATA_DIR/meta"
 [[ -f "$DATA_DIR/state.json" ]] || echo '{}' > "$DATA_DIR/state.json"
 
+# Reap finished review sessions: a session cao-prr-<n> whose report file for the SHA it
+# was launched on now exists has done its job — shut it down so it frees a parallelism slot.
+# (Without this, idle-but-completed sessions hold slots and stall the queue.)
+declare -A LAUNCH_SHA   # pr -> sha it was launched to review
+reap_finished() {
+  for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-'); do
+    local pr="${s#cao-prr-}"
+    local sha="${LAUNCH_SHA[$pr]:-}"
+    [[ -n "$sha" && -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]] || continue
+    cao shutdown --session "$s" >/dev/null 2>&1 && echo "  ✓ #$pr reviewed — reclaimed $s"
+  done
+}
+
 echo "Discovering open PRs on $REPO …"
 # non-draft PRs, newest first, capped at LIMIT
 mapfile -t PRS < <(gh pr list --repo "$REPO" --state open \
@@ -54,8 +67,8 @@ for entry in "${PRS[@]}"; do
     continue
   fi
 
-  # throttle: wait while MAX_PARALLEL review sessions (prr-*) are already running
-  while [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -ge "$MAX_PARALLEL" ]]; do
+  # throttle: reap finished sessions, then wait while MAX_PARALLEL are still running
+  while reap_finished; [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -ge "$MAX_PARALLEL" ]]; do
     sleep 15
   done
 
@@ -70,6 +83,7 @@ for entry in "${PRS[@]}"; do
   if cao launch --agents pr_review_supervisor --provider claude_code --yolo \
        --session-name "prr-${pr}" >/dev/null 2>&1; then
     sleep 12   # let the supervisor finish booting before sending the task
+    LAUNCH_SHA[$pr]="$sha"
     cao session send "cao-prr-${pr}" "$msg" --async >/dev/null 2>&1 \
       || echo "    (send for #$pr failed — check 'cao session status cao-prr-${pr}')"
   else
@@ -79,6 +93,17 @@ for entry in "${PRS[@]}"; do
   sleep 4   # small stagger between PRs
 done
 
-echo "Launched $launched review session(s). Each PR has its own session (prr-<n>)."
-echo "Watch the dashboard; reports land as each finishes. Sessions: tmux ls | grep cao-prr-"
-echo "When done, reclaim sessions: for s in \$(tmux ls -F '#{session_name}' | grep '^cao-prr-'); do cao shutdown --session \"\$s\"; done"
+echo "Launched $launched review session(s). Waiting for in-flight reviews to finish…"
+# keep reaping until all launched sessions have produced their report (or we give up waiting)
+for _ in $(seq 1 80); do
+  reap_finished
+  [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -eq 0 ]] && break
+  sleep 30
+done
+remaining="$(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-' || true)"
+if [[ -n "$remaining" ]]; then
+  echo "Still running (no report yet) — may be stalled; inspect with: tmux attach -t <name>"
+  echo "$remaining" | sed 's/^/  /'
+else
+  echo "All reviews complete. Open the dashboard to triage."
+fi
