@@ -37,6 +37,13 @@ Consult the `cao-pr-review` skill's checklist; apply its **conventions** and **C
 - **Commit/PR hygiene**: Conventional Commits (`feat:`, `fix:`, `docs:`, `build(deps):`),
   one focused change, no large incidental reformatting.
 - **Structure**: code under the right `src/cli_agent_orchestrator/` package; tests mirror it.
+- **Hardcoded values that should be configurable**: roles, paths, timeouts, or poll counts
+  baked into code that users would reasonably want to set. Example on this repo: hard-coded
+  `data_analyst` / `analysis_supervisor` / `report_generator` roles — "users should be able
+  to define their roles." Suggest a config key or parameter.
+- **Committed generated artifacts**: generated files that shouldn't be tracked
+  (`coverage*.json`, build output, caches). Flag them and suggest removal + a `.gitignore`
+  entry.
 - **Provider/plugin file checklist**: if `providers/` is touched, check the diff against the
   full provider checklist (enum, manager branch, launch allowlist, tests, fixtures, docs,
   README, CHANGELOG).

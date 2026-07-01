@@ -45,16 +45,22 @@ CAO-specific checks below.
 
 ### 3. Run the CAO-specific pass
 
-Read `references/cao-review-checklist.md` and apply it to the diff. The four dimensions
+Read `references/cao-review-checklist.md` and apply it to the diff. The five dimensions
 the user cares about most:
 
 1. **CAO conventions** — inclusive language, commit/PR hygiene, project structure, the
-   provider and plugin contracts.
-2. **Correctness** — terminal status-detection logic, async/race conditions, error paths.
-3. **Security** — credential handling, command injection through tmux/subprocess, and
+   provider and plugin contracts, hardcoded-should-be-config, committed generated files.
+2. **Correctness** — terminal status-detection logic, async/race conditions, async hygiene
+   (blocking I/O on the event loop, un-timed network calls), read ops with hidden
+   mutations, error paths.
+3. **Security** — credential handling, command injection through tmux/subprocess, raw
+   env/command overrides, GitHub Actions token permissions, file encoding/permissions, and
    `--yolo` / `--dangerously-skip-permissions` safety.
 4. **Tests & coverage** — does the change ship tests, follow pytest markers, and not
    regress the suite?
+5. **Consistency & drift** — doc/comment↔code drift, PR-description↔implementation
+   mismatch, cross-provider interface consistency, dead/unused code, out-of-scope changes.
+   This is the highest-volume category of real feedback on the CAO repo.
 
 When a change touches `src/cli_agent_orchestrator/providers/`, the provider contract in
 the existing `cao-provider` skill is the source of truth — read

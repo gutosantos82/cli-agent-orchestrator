@@ -7,7 +7,7 @@
 # approach, which serialized everything into one session.
 #
 # The supervisor in each session: checks the PR out into an isolated git worktree,
-# fans out to the four angle reviewers, synthesizes one report with triage frontmatter,
+# fans out to the five angle reviewers, synthesizes one report with triage frontmatter,
 # and writes it to pr-review-data/reviews/<pr>-<sha>.md. The dashboard renders them.
 #
 # Usage:
@@ -157,7 +157,7 @@ for i in "${!PRS[@]}"; do
   #  2. `cao session send --async` delivers the review task and returns immediately,
   #     so the driver can move on (subject to the MAX_PARALLEL throttle).
   # The supervisor runs in dashboard mode: checks out the PR in an isolated worktree,
-  # fans out to the four reviewers, writes the report, then goes idle.
+  # fans out to the five reviewers, writes the report, then goes idle.
   msg="Review PR #$pr. MODE: dashboard, write report to ${DATA_DIR}/reviews/${pr}-${sha}.md"
   if cao launch --agents pr_review_supervisor --provider claude_code --yolo \
        --session-name "prr-${pr}" >/dev/null 2>&1; then
