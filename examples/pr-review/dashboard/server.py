@@ -145,6 +145,7 @@ def list_prs() -> list[dict]:
             "raw": body,
             "acted": st.get("acted"),
             "acted_sha": st.get("acted_sha"),
+            "acted_at": st.get("acted_at"),
             "stale": bool(st.get("acted_sha") and sha and st.get("acted_sha") != sha),
         })
     # sort: reviewed-first, then urgency (high→low), then longest-waiting
@@ -169,10 +170,15 @@ def run_gh(args: list[str]) -> dict:
 
 
 def record_action(pr: str, sha: str, action: str) -> None:
+    import datetime
     f = data() / "state.json"
     state = load_state()
     entry = state.get(pr, {})
-    entry.update({"acted": action, "acted_sha": sha})
+    entry.update({
+        "acted": action,
+        "acted_sha": sha,
+        "acted_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+    })
     state[pr] = entry
     f.write_text(json.dumps(state, indent=2))
 
@@ -251,17 +257,24 @@ def render_page(prs: list[dict]) -> str:
             review_badge = '<span class="badge reviewed">✓ reviewed</span>'
         else:
             review_badge = '<span class="badge pending">⏳ review pending</span>'
-        # action badge: what the human has done (approved/commented/requested)
+        # action badge: what the human did + WHEN (approved/commented/requested @ date)
         acted_badge = ""
         if r["acted"]:
             cls = "stale" if r["stale"] else "done"
             extra = " · stale (PR changed)" if r["stale"] else ""
-            acted_badge = f'<span class="badge {cls}">{r["acted"]}{extra}</span>'
+            when_short, when_full = "", ""
+            if r["acted_at"]:
+                when_full = r["acted_at"]                       # full ISO for the tooltip
+                when_short = f" · {r['acted_at'][5:10]}"        # MM-DD in the badge
+            acted_badge = (f'<span class="badge {cls}" title="{html.escape(when_full)}">'
+                           f'{r["acted"]}{when_short}{extra}</span>')
         cards.append(f"""
         <article class="card" data-pr="{r['pr']}" data-sha="{r['sha']}"
                  data-raw="{html.escape(json.dumps(r['raw']))}"
                  data-html="{html.escape(json.dumps(r['html']))}"
                  data-title="{html.escape(r['title'])}" data-verdict="{html.escape(r['verdict'])}"
+                 data-acted="{html.escape(json.dumps(r['acted'] or ''))}"
+                 data-acted-at="{html.escape(json.dumps(r['acted_at'] or ''))}"
                  onclick="openDetail(this)">
           <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{acted_badge}</span></div>
           <h3>{html.escape(r['title'])}</h3>
@@ -315,6 +328,8 @@ def render_page(prs: list[dict]) -> str:
   .comment {{ background:#fff; }}
   .result {{ margin-top:8px; font-size:13px; white-space:pre-wrap; font-family:monospace; }}
   .result.ok {{ color:#1a7f37; }} .result.err {{ color:#cf222e; }}
+  .acted-line {{ padding:8px 24px 0; font-size:13px; color:#1a7f37; }}
+  .acted-line:empty {{ display:none; }}
 </style></head><body>
 <div class="topbar"><h1>CAO PR Triage · {STATE['repo']} · {len(prs)} open</h1><span class="mode {mode_cls}">{mode}</span></div>
 <main><div class="grid">{grid}</div></main>
@@ -328,6 +343,7 @@ def render_page(prs: list[dict]) -> str:
         <button class="close" onclick="closeDetail()">×</button>
       </span>
     </header>
+    <div id="d-acted" class="acted-line"></div>
     <div class="review" id="d-review"></div>
     <div class="actions">
       <textarea id="d-body"></textarea>
@@ -344,12 +360,19 @@ def render_page(prs: list[dict]) -> str:
 <script>
 const REPO = {json.dumps(STATE['repo'])};
 let CUR = null;
+function fmtActed(acted, at) {{
+  if (!acted) return '';
+  let when = at ? ' on ' + new Date(at).toLocaleString() : '';
+  const verb = {{approved:'Approved', commented:'Commented', requested:'Requested changes'}}[acted] || acted;
+  return '✓ ' + verb + when;
+}}
 function openDetail(card) {{
   CUR = {{ pr: card.dataset.pr, sha: card.dataset.sha }};
   document.getElementById('d-title').textContent = '#'+card.dataset.pr+' · '+card.dataset.title;
   document.getElementById('d-link').href = 'https://github.com/'+REPO+'/pull/'+card.dataset.pr;
   document.getElementById('d-review').innerHTML = JSON.parse(card.dataset.html);
   document.getElementById('d-body').value = JSON.parse(card.dataset.raw);
+  document.getElementById('d-acted').textContent = fmtActed(JSON.parse(card.dataset.acted||'""'), JSON.parse(card.dataset.actedAt||'""'));
   document.getElementById('d-result').textContent = '';
   document.getElementById('overlay').classList.add('open');
 }}
@@ -366,6 +389,11 @@ async function act(action) {{
     const d = await r.json();
     result.className = 'result ' + (d.ok ? 'ok' : 'err');
     result.textContent = d.output;
+    if (d.ok) {{
+      // reflect the action + timestamp immediately, without a page reload
+      const rec = {{approve:'approved', comment:'commented', request:'requested'}}[action] || action;
+      document.getElementById('d-acted').textContent = fmtActed(rec, new Date().toISOString());
+    }}
   }} catch(e) {{ result.className='result err'; result.textContent=String(e); }}
 }}
 </script></body></html>"""
