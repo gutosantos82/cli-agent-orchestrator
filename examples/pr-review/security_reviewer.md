@@ -32,10 +32,21 @@ Consult the `cao-pr-review` skill's checklist; apply only its **security** secti
 - **Command injection**: any value interpolated into a tmux `send-keys`, shell command, or
   `subprocess` call must be validated/escaped. Agent/user-supplied strings (agent names,
   prompts, file paths) reaching a shell are prime suspects. Flag `shell=True`.
+- **Raw env-var / command overrides**: an env var whose value is passed unescaped to a
+  shell or used as a command is a real injection surface here — `CAO_COPILOT_COMMAND` was
+  exactly this. Require validation (e.g. must start with the expected binary) or removal of
+  the override.
 - **Permission bypass**: changes to `--yolo` / `--dangerously-skip-permissions` /
   `--auto-approve` or `PROVIDERS_REQUIRING_WORKSPACE_ACCESS` widen what a spawned agent can
   do — confirm the widening is intentional and documented.
 - **Path traversal**: agent-store / profile resolution should not allow `../` escapes.
+  (CodeQL's top real finding on this repo is "uncontrolled data used in a path expression"
+  — a user/agent value flowing into a filesystem path.)
+- **GitHub Actions permissions**: a workflow (`.github/workflows/*.yml`) that doesn't scope
+  `permissions:` grants the `GITHUB_TOKEN` broad write — flag it and suggest least-privilege.
+- **File encoding / permissions**: prompt/config files written with the platform-default
+  encoding or default permissions can leak or corrupt — prefer explicit `encoding="utf-8"`
+  and restrictive modes for anything under `~/.aws/cli-agent-orchestrator/`.
 - Classify each finding **introduced** vs **pre-existing**.
 
 ## Workflow

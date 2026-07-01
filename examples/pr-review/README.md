@@ -1,15 +1,15 @@
 # PR Review Team
 
-A CAO multi-agent team that reviews a pull request on the CAO repo from four angles in
+A CAO multi-agent team that reviews a pull request on the CAO repo from five angles in
 parallel, synthesizes one report, and drives it to a **human-gated** comment + approval.
 
-This is the team companion to the `cao-pr-review` skill: the four reviewers each load that
+This is the team companion to the `cao-pr-review` skill: the five reviewers each load that
 skill and apply one slice of its checklist.
 
 There are **two ways to use it**:
 
 1. **Direct, one PR** — launch `pr_review_supervisor`, ask it to review a PR; it runs the
-   four-angle review and gates with two in-terminal `yes/no` prompts (comment, then approve).
+   five-angle review and gates with two in-terminal `yes/no` prompts (comment, then approve).
 2. **Managed queue + dashboard** — launch `pr_review_manager`; it discovers open PRs,
    reviews the new/changed ones (handing each to the supervisor in *dashboard mode*, which
    writes a report file instead of gating), and you act on all of them from a web dashboard
@@ -28,10 +28,12 @@ graph TD
     S -->|assign + diff| SEC[["🤖 security_reviewer"]]
     S -->|assign + diff| T[["🤖 tests_reviewer"]]
     S -->|assign + diff| CV[["🤖 conventions_reviewer"]]
+    S -->|assign + diff| CN[["🤖 consistency_reviewer"]]
     C -->|send_message| S
     SEC -->|send_message| S
     T -->|send_message| S
     CV -->|send_message| S
+    CN -->|send_message| S
     S -->|"report → HUMAN GATE 1"| H
     H -->|"yes → gh pr comment"| S
     S -->|"HUMAN GATE 2"| H
@@ -44,12 +46,13 @@ graph TD
 | `correctness_reviewer` | reviewer | Logic, edge cases, async/races, provider status detection |
 | `security_reviewer` | reviewer | Credentials, tmux/subprocess injection, `--yolo` surface, traversal |
 | `tests_reviewer` | reviewer | Tests present? markers, mocked `tmux_client`, coverage gaps |
-| `conventions_reviewer` | reviewer | Inclusive language, CHANGELOG, `pyproject↔uv.lock`, provider checklist, CI gates |
+| `conventions_reviewer` | reviewer | Inclusive language, CHANGELOG, `pyproject↔uv.lock`, provider checklist, CI gates, hardcoded-should-be-config, committed generated files |
+| `consistency_reviewer` | reviewer | Doc/comment↔code drift, PR-description↔impl mismatch, cross-provider inconsistency, dead code, out-of-scope changes |
 
 ## Pipeline
 
 1. Supervisor fetches the PR diff **once** (`gh pr diff`).
-2. Assigns the diff to all four reviewers in parallel (`assign`); each reviews its angle.
+2. Assigns the diff to all five reviewers in parallel (`assign`); each reviews its angle.
 3. Reviewers send findings back (`send_message`); supervisor merges into one
    severity-grouped report, classifying findings as introduced vs. pre-existing.
 4. **Human gate 1** — supervisor presents the report and asks before posting it as a PR
@@ -71,12 +74,13 @@ cao-server
 # 2. Install the skill the reviewers depend on (folder name must equal the skill name)
 cao skills add skills/cao-pr-review
 
-# 3. Install the five agent profiles
+# 3. Install the six agent profiles (supervisor + five reviewers)
 cao install examples/pr-review/pr_review_supervisor.md
 cao install examples/pr-review/correctness_reviewer.md
 cao install examples/pr-review/security_reviewer.md
 cao install examples/pr-review/tests_reviewer.md
 cao install examples/pr-review/conventions_reviewer.md
+cao install examples/pr-review/consistency_reviewer.md
 
 # 4. Launch the supervisor (claude_code — where the skill lives)
 cao launch --agents pr_review_supervisor --provider claude_code
@@ -99,7 +103,7 @@ or with an explicit repo / URL:
 Review https://github.com/awslabs/cli-agent-orchestrator/pull/309
 ```
 
-The supervisor fans out, collects the four angles, and presents the merged report — then
+The supervisor fans out, collects the five angles, and presents the merged report — then
 pauses for your go-ahead on the comment, and again on the approval.
 
 ## Managed queue + dashboard
@@ -140,7 +144,7 @@ pr_review_manager                       ← you launch on demand
   new/changed:
     → write meta/<pr>-<sha>.json   (size, days, author rep, CI, labels)
     → handoff → pr_review_supervisor (dashboard mode)
-                  └─ 4 reviewers (assign) → report w/ urgency/importance frontmatter
+                  └─ 5 reviewers (assign) → report w/ urgency/importance frontmatter
   writes  pr-review-data/{meta,reviews}/<pr>-<sha>.*  +  state.json
         ↓
 dashboard/server.py (localhost)         ← you keep open in a browser
@@ -207,7 +211,7 @@ a format reference.
 ## Notes
 
 - **Why a team, not the skill alone?** The skill gives one agent the full checklist; the
-  team runs the four angles as independent reviewers in parallel, so each gives the diff its
+  team runs the five angles as independent reviewers in parallel, so each gives the diff its
   full attention and they can't crowd each other out. The supervisor's job is fetch +
   synthesize + gate.
 - **Isolated checkout per PR.** The supervisor checks the PR out into its own git worktree
@@ -216,7 +220,7 @@ a format reference.
   Without this, reviewers report false "this function/file doesn't exist" findings. The
   supervisor removes the worktree when done.
 - **Diff is fetched once** by the supervisor and passed in messages — reviewers stay off
-  GitHub, which keeps them simple and avoids four redundant `gh` calls.
+  GitHub, which keeps them simple and avoids five redundant `gh` calls.
 - **Message delivery**: the supervisor finishes its turn after dispatching so the inbox can
   deliver findings — it must not `sleep`/`echo`-loop to wait (see the supervisor profile).
 - **MCP server**: the profiles use `command: cao-mcp-server` (the locally-installed binary).

@@ -31,6 +31,13 @@ Consult the `cao-pr-review` skill's checklist; apply only its **correctness** se
 - Edge cases: empty input, Unicode, very long input, multiple/none matches.
 - Async: unawaited coroutines, blocking calls on the event loop, shared mutable state
   without a lock (per-directory lock conflicts are a known CAO failure mode).
+- **Async hygiene** (frequent real bug on this repo): synchronous I/O on the event loop —
+  a sync file write, DB call, or `subprocess.run` inside an `async def` or asyncio loop
+  (should use `asyncio.to_thread`); and network calls with **no timeout**
+  (`requests.get(...)` without `timeout=` stalls the whole loop if the peer hangs).
+- **Read op with hidden mutation**: a function named like a read (`get_*`, `list_*`,
+  `check_*`) that deletes or writes as a side effect. Example on this repo: `get_session()`
+  deleting DB records. Flag it — the mutation should be renamed or split out.
 - Error paths: timeouts, subprocess failures, missing files — handled, not swallowed.
 - **Provider changes** (`providers/*.py`): status-detection order
   (WAITING_USER_ANSWER → COMPLETED → IDLE → PROCESSING → ERROR), stale-buffer / alt-screen
