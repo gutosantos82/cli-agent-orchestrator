@@ -48,6 +48,13 @@ graph TD
 | `tests_reviewer` | reviewer | Tests present? markers, mocked `tmux_client`, coverage gaps |
 | `conventions_reviewer` | reviewer | Inclusive language, CHANGELOG, `pyproject↔uv.lock`, provider checklist, CI gates, hardcoded-should-be-config, committed generated files |
 | `consistency_reviewer` | reviewer | Doc/comment↔code drift, PR-description↔impl mismatch, cross-provider inconsistency, dead code, out-of-scope changes |
+| `verifier` | developer | **Dynamic** — runs the PR's tests, writes & runs meaningful example cases, exercises the change. Code PRs only. The one reviewer with `execute_bash`. |
+
+> The 5 static reviewers read the diff; the `verifier` **runs** it. It's dispatched only for
+> PRs touching `src/**` (skipped for docs/deps), runs in parallel, and is never blocked on
+> at synthesis (its evidence is a bonus, not a gate). On this host it reuses the main `.venv`
+> — it can't build dependency changes (numpy/GCC), and reports honestly when the env limits
+> what it could run.
 
 ## Pipeline
 
