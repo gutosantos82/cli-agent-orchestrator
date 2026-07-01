@@ -292,6 +292,9 @@ def render_page(prs: list[dict]) -> str:
   .panel {{ position:absolute; right:0; top:0; bottom:0; width:min(760px,92vw); background:#fff; overflow:auto; box-shadow:-4px 0 20px rgba(0,0,0,.2); }}
   .panel header {{ position:sticky; top:0; background:#f6f8fa; border-bottom:1px solid #d0d7de; padding:14px 20px; display:flex; justify-content:space-between; align-items:center; }}
   .panel header h2 {{ font-size:15px; margin:0; }}
+  .hdr-right {{ display:flex; align-items:center; gap:14px; white-space:nowrap; }}
+  .gh-link {{ font-size:13px; color:#0969da; text-decoration:none; }}
+  .gh-link:hover {{ text-decoration:underline; }}
   .close {{ cursor:pointer; border:none; background:none; font-size:22px; line-height:1; color:#656d76; }}
   .review {{ padding:8px 24px; }}
   .review pre {{ background:#f6f8fa; padding:10px; border-radius:6px; overflow:auto; }}
@@ -311,7 +314,13 @@ def render_page(prs: list[dict]) -> str:
 
 <div class="overlay" id="overlay" onclick="if(event.target===this)closeDetail()">
   <div class="panel">
-    <header><h2 id="d-title"></h2><button class="close" onclick="closeDetail()">×</button></header>
+    <header>
+      <h2 id="d-title"></h2>
+      <span class="hdr-right">
+        <a id="d-link" href="#" target="_blank" rel="noopener" class="gh-link">View on GitHub ↗</a>
+        <button class="close" onclick="closeDetail()">×</button>
+      </span>
+    </header>
     <div class="review" id="d-review"></div>
     <div class="actions">
       <textarea id="d-body"></textarea>
@@ -326,10 +335,12 @@ def render_page(prs: list[dict]) -> str:
 </div>
 
 <script>
+const REPO = {json.dumps(STATE['repo'])};
 let CUR = null;
 function openDetail(card) {{
   CUR = {{ pr: card.dataset.pr, sha: card.dataset.sha }};
   document.getElementById('d-title').textContent = '#'+card.dataset.pr+' · '+card.dataset.title;
+  document.getElementById('d-link').href = 'https://github.com/'+REPO+'/pull/'+card.dataset.pr;
   document.getElementById('d-review').innerHTML = JSON.parse(card.dataset.html);
   document.getElementById('d-body').value = JSON.parse(card.dataset.raw);
   document.getElementById('d-result').textContent = '';
