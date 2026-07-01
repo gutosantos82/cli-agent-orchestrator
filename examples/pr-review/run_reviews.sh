@@ -120,14 +120,32 @@ write_meta() {
   else ci=passing; fi
   merged="$(author_merged_prs "$login")"
   days="$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))"
+  # Activity: comment + review counts and last-updated. `gh pr list` doesn't populate these
+  # reliably, so fetch per-PR (one cheap call). Flag activity that happened AFTER we reviewed
+  # this SHA — a signal the author responded / discussion moved since the review.
+  local act comments reviews updated new_activity
+  act="$(gh pr view "$pr" --repo "$REPO" --json comments,reviews,updatedAt 2>/dev/null || echo '{}')"
+  comments="$(jq -r '(.comments|length) // 0' <<<"$act" 2>/dev/null || echo 0)"
+  reviews="$(jq -r '(.reviews|length) // 0' <<<"$act" 2>/dev/null || echo 0)"
+  updated="$(jq -r '.updatedAt // ""' <<<"$act" 2>/dev/null || echo "")"
+  new_activity=false
+  if [[ -f "$DATA_DIR/reviews/${pr}-${sha}.md" && -n "$updated" ]]; then
+    local rev_epoch upd_epoch
+    rev_epoch="$(date -u -r "$DATA_DIR/reviews/${pr}-${sha}.md" +%s 2>/dev/null || echo 0)"
+    upd_epoch="$(date -u -d "$updated" +%s 2>/dev/null || echo 0)"
+    (( upd_epoch > rev_epoch )) && new_activity=true
+  fi
   jq -n \
     --arg title "$title" --arg size "$(size_bucket $((add+del)))" \
     --argjson additions "$add" --argjson deletions "$del" --argjson files "$files" \
     --argjson days_waiting "$days" --arg author "$login" --argjson author_merged_prs "$merged" \
     --arg ci "$ci" --argjson labels "$labels" \
+    --argjson comments "${comments:-0}" --argjson reviews "${reviews:-0}" \
+    --argjson new_activity "$new_activity" \
     '{title:$title,size:$size,additions:$additions,deletions:$deletions,files:$files,
       days_waiting:$days_waiting,author:$author,author_merged_prs:$author_merged_prs,
-      ci:$ci,labels:$labels,draft:false}' \
+      ci:$ci,labels:$labels,comments:$comments,reviews:$reviews,new_activity:$new_activity,
+      draft:false}' \
     > "$DATA_DIR/meta/${pr}-${sha}.json"
 }
 
