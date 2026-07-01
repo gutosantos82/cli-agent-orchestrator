@@ -20,6 +20,7 @@ REPO="awslabs/cli-agent-orchestrator"
 LIMIT=10
 MAX_PARALLEL=3
 DATA_DIR="pr-review-data"
+REFRESH_META_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -27,6 +28,7 @@ while [[ $# -gt 0 ]]; do
     --max-parallel) MAX_PARALLEL="$2"; shift 2 ;;
     --repo) REPO="$2"; shift 2 ;;
     --data-dir) DATA_DIR="$2"; shift 2 ;;
+    --refresh-meta) REFRESH_META_ONLY=1; shift ;;  # rewrite metadata for all open PRs, no reviews
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -99,13 +101,29 @@ write_meta() {
 echo "Discovering open PRs on $REPO …"
 # non-draft PRs, newest first, capped at LIMIT. Fetch the full per-PR JSON so we can write
 # metadata without extra calls; emit one compact JSON object per line.
+# In refresh-meta mode, cover ALL open PRs (ignore LIMIT); otherwise cap at LIMIT.
+disc_limit=$LIMIT
+[[ "$REFRESH_META_ONLY" -eq 1 ]] && disc_limit=1000
 mapfile -t PR_JSON < <(gh pr list --repo "$REPO" --state open \
   --json number,isDraft,headRefOid,title,additions,deletions,changedFiles,createdAt,author,labels,statusCheckRollup \
-  --jq '[.[] | select(.isDraft|not)] | .[:'"$LIMIT"'][] | @json')
+  --jq '[.[] | select(.isDraft|not)] | .[:'"$disc_limit"'][] | @json')
 PRS=()
 for j in "${PR_JSON[@]}"; do
   PRS+=("$(jq -r '"\(.number) \(.headRefOid)"' <<<"$j")")
 done
+
+# --refresh-meta: rewrite metadata for every open PR and exit (no reviews). Cheap way to
+# correct stale CI/labels/size flags on the dashboard without spending review agents.
+if [[ "$REFRESH_META_ONLY" -eq 1 ]]; then
+  echo "Refreshing metadata for ${#PRS[@]} open PRs (no reviews)…"
+  for i in "${!PRS[@]}"; do
+    pr="${PRS[$i]%% *}"; sha="${PRS[$i]##* }"
+    write_meta "$pr" "$sha" "${PR_JSON[$i]}" 2>/dev/null \
+      && echo "  ✓ #$pr" || echo "  ✗ #$pr (metadata write failed)"
+  done
+  echo "Metadata refreshed. Reload the dashboard."
+  exit 0
+fi
 
 echo "Will review ${#PRS[@]} PRs (limit $LIMIT, up to $MAX_PARALLEL at a time):"
 printf '  #%s\n' "${PRS[@]%% *}"
