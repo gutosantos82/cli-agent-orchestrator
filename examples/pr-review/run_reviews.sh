@@ -120,32 +120,50 @@ write_meta() {
   else ci=passing; fi
   merged="$(author_merged_prs "$login")"
   days="$(( ( $(date -u +%s) - $(date -u -d "$created" +%s) ) / 86400 ))"
-  # Activity: comment + review counts and last-updated. `gh pr list` doesn't populate these
-  # reliably, so fetch per-PR (one cheap call). Flag activity that happened AFTER we reviewed
-  # this SHA — a signal the author responded / discussion moved since the review.
-  local act comments reviews updated new_activity
-  act="$(gh pr view "$pr" --repo "$REPO" --json comments,reviews,updatedAt 2>/dev/null || echo '{}')"
+
+  # --- Two distinct "since review" signals (only meaningful once a report exists) ---
+  #   code_changed  : the PR head moved since we reviewed → needs RE-REVIEW (🔁)
+  #   human_activity: a NON-BOT comment/review landed after our review → worth RE-READING (💬)
+  # Bot accounts (codecov, dependabot, github-actions, copilot) are excluded so their
+  # automated comments don't masquerade as human engagement.
+  local act comments reviews code_changed human_activity rev_epoch
+  act="$(gh pr view "$pr" --repo "$REPO" --json comments,reviews 2>/dev/null || echo '{}')"
   comments="$(jq -r '(.comments|length) // 0' <<<"$act" 2>/dev/null || echo 0)"
   reviews="$(jq -r '(.reviews|length) // 0' <<<"$act" 2>/dev/null || echo 0)"
-  updated="$(jq -r '.updatedAt // ""' <<<"$act" 2>/dev/null || echo "")"
-  new_activity=false
-  if [[ -f "$DATA_DIR/reviews/${pr}-${sha}.md" && -n "$updated" ]]; then
-    local rev_epoch upd_epoch
-    rev_epoch="$(date -u -r "$DATA_DIR/reviews/${pr}-${sha}.md" +%s 2>/dev/null || echo 0)"
-    upd_epoch="$(date -u -d "$updated" +%s 2>/dev/null || echo 0)"
-    (( upd_epoch > rev_epoch )) && new_activity=true
+  code_changed=false; human_activity=false
+
+  # code_changed: a review exists at an OLDER sha but NOT at the current head sha.
+  if [[ ! -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]] && ls "$DATA_DIR/reviews/${pr}-"*.md >/dev/null 2>&1; then
+    code_changed=true
   fi
+
+  # human_activity: newest non-bot comment/review timestamp is after our review-file mtime.
+  if [[ -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]]; then
+    rev_epoch="$(date -u -r "$DATA_DIR/reviews/${pr}-${sha}.md" +%s 2>/dev/null || echo 0)"
+    local latest_human
+    latest_human="$(jq -r '
+      def is_bot($l): ($l|ascii_downcase) | test("bot|codecov|dependabot|github-actions|copilot");
+      [ (.comments[]?, .reviews[]?)
+        | (.author.login // "") as $l
+        | select($l != "" and (is_bot($l)|not))
+        | (.createdAt // .submittedAt // empty) ] | max // ""' <<<"$act" 2>/dev/null || echo "")"
+    if [[ -n "$latest_human" ]]; then
+      local h_epoch; h_epoch="$(date -u -d "$latest_human" +%s 2>/dev/null || echo 0)"
+      (( h_epoch > rev_epoch )) && human_activity=true
+    fi
+  fi
+
   jq -n \
     --arg title "$title" --arg size "$(size_bucket $((add+del)))" \
     --argjson additions "$add" --argjson deletions "$del" --argjson files "$files" \
     --argjson days_waiting "$days" --arg author "$login" --argjson author_merged_prs "$merged" \
     --arg ci "$ci" --argjson labels "$labels" \
     --argjson comments "${comments:-0}" --argjson reviews "${reviews:-0}" \
-    --argjson new_activity "$new_activity" \
+    --argjson code_changed "$code_changed" --argjson human_activity "$human_activity" \
     '{title:$title,size:$size,additions:$additions,deletions:$deletions,files:$files,
       days_waiting:$days_waiting,author:$author,author_merged_prs:$author_merged_prs,
-      ci:$ci,labels:$labels,comments:$comments,reviews:$reviews,new_activity:$new_activity,
-      draft:false}' \
+      ci:$ci,labels:$labels,comments:$comments,reviews:$reviews,
+      code_changed:$code_changed,human_activity:$human_activity,draft:false}' \
     > "$DATA_DIR/meta/${pr}-${sha}.json"
 }
 
