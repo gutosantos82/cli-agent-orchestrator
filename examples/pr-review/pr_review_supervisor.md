@@ -75,6 +75,22 @@ git -C "$WT" diff "$(git -C "$WT" merge-base origin/main HEAD)"...HEAD > "$WT/.p
 Capture the diff text (`$WT/.pr.diff`) and the worktree path `$WT`. You fetch both once; the
 reviewers do not fetch anything. **Remember `$WT` for cleanup in the final step.**
 
+**Also fetch existing human feedback on the PR** — so at synthesis you can avoid repeating
+what a maintainer has already said. Pull comments + reviews, keeping only *human* authors
+(exclude bots — logins matching `bot|codecov|dependabot|github-actions|copilot` — and
+exclude your own dashboard user, `$(gh api user --jq .login 2>/dev/null)`):
+
+```bash
+gh pr view <n> --repo awslabs/cli-agent-orchestrator --json comments,reviews \
+  --jq '[ (.comments[]?, .reviews[]?)
+          | {who:(.author.login//""), at:(.createdAt//.submittedAt), body:.body}
+          | select(.who|test("bot|codecov|dependabot|github-actions|copilot")|not) ]'
+```
+
+Keep this list of prior human comments — you'll compare your findings against it in Step 4.
+(Bot reviewers like Copilot/CodeQL are intentionally NOT excluded from *restating* — only
+human maintainer feedback is deduplicated, since repeating a human's point adds no value.)
+
 ### Step 2 — Fan out to the five reviewers (parallel, assign)
 
 Assign all five in quick succession (do not wait between them). In each message include:
@@ -125,8 +141,19 @@ a parked session.
 
 ### Step 4 — Synthesize ONE report
 
-Merge the findings you have into a single report using this structure (deduplicate
-overlapping findings; keep each reviewer's angle tag):
+First merge the five reviewers' findings and dedupe overlaps among them (keep each
+reviewer's angle tag).
+
+**Then dedupe against the prior human feedback you fetched in Step 1.** For each of your
+findings, check whether a maintainer already raised the same point (same file/behavior, same
+concern — not just the same file). If so, **do not restate it in Blocking/Important/Nits.**
+Instead move it to a `## Prior feedback` section as a one-liner that credits the human and
+says you concur, e.g. `↩︎ persisted-output breaks q_cli/kiro_cli — already raised by
+@haofeif (P2); we concur, not restating.` This keeps the posted comment focused on what's
+**new**, so it adds signal instead of repeating a maintainer. (Only dedupe against *humans*;
+if only a bot like Copilot/CodeQL raised it, keep your finding — restating a bot is fine.)
+
+Use this structure (omit a section if empty):
 
 ```
 # PR Review: #<n> — <title>
@@ -135,7 +162,7 @@ overlapping findings; keep each reviewer's angle tag):
 <2-3 sentences: what the PR does, overall assessment, merge recommendation>
 
 ## Blocking (must fix before merge)
-- **[security] file:line** — finding + why + fix
+- **[security] file:line** — finding + why + fix          # 🆕 not previously raised
 
 ## Important (should fix)
 - **[correctness] file:line** — ...
@@ -144,12 +171,20 @@ overlapping findings; keep each reviewer's angle tag):
 ## Nits (optional)
 - **[conventions] file:line** — ...
 
+## Prior feedback (already raised — not restating)
+- ↩︎ <one-liner> — already raised by @<maintainer>; we concur.
+
 ## Tests
 <coverage assessment from the tests reviewer>
 
 ## Verdict
 Approve / Approve with nits / Request changes — one line
 ```
+
+Everything under Blocking/Important/Nits should be **net-new** relative to existing human
+comments; anything that overlaps goes under Prior feedback. If a maintainer already raised a
+finding you'd have blocked on, still reflect it in the Verdict reasoning (the PR isn't
+mergeable), but credit them rather than re-deriving it.
 
 Classify each finding as **introduced** by this PR vs. **pre-existing**; never block on
 pre-existing issues.
