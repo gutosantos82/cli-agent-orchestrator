@@ -193,9 +193,11 @@ Use this structure (omit a section if empty):
 <coverage assessment from the tests reviewer>
 
 ## Verification
-<from the verifier, if it ran: tests run + pass/fail, the example cases it wrote and their
-results, whether the feature behaved as the PR claims, and any env limits it hit. If the
-verifier was skipped (non-code PR) or didn't return, say so in one line.>
+<from the verifier, if it ran: baseline test pass/fail, and a per-claim list —
+✓ VERIFIED / ✗ REFUTED / ⁇ NOT VERIFIED (with the reason + manual command) — each citing the
+probe it ran. A ✗ REFUTED claim (the PR doesn't do what it says) is a strong signal: weigh it
+toward Request changes. If the verifier was skipped (non-code PR) or didn't return, say so in
+one line.>
 
 ## Verdict
 Approve / Approve with nits / Request changes — one line
