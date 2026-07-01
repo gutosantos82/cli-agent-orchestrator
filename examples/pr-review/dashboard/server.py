@@ -138,7 +138,8 @@ def list_prs() -> list[dict]:
             "draft": meta.get("draft", False),
             "comments": meta.get("comments"),
             "reviews_count": meta.get("reviews"),
-            "new_activity": meta.get("new_activity", False),
+            "code_changed": meta.get("code_changed", False),
+            "human_activity": meta.get("human_activity", False),
             # review body + action state
             "html": md.markdown(body, extensions=["fenced_code", "tables"]) if body
                     else "<p><em>Deep review pending — metadata only so far.</em></p>",
@@ -246,8 +247,10 @@ def render_page(prs: list[dict]) -> str:
             flags.append(pill(f"CI {r['ci']}", ci_color))
         if r["comments"]:
             flags.append(pill(f"💬 {r['comments']}", "#57606a"))
-        if r["new_activity"]:
-            flags.append(pill("● activity since review", "#8250df"))
+        if r["code_changed"]:
+            flags.append(pill("🔁 code changed — re-review", "#cf222e"))
+        if r["human_activity"]:
+            flags.append(pill("💬 discussion since review", "#8250df"))
         if r["draft"]:
             flags.append(pill("draft", "#9a6700"))
         for lb in r["labels"]:
