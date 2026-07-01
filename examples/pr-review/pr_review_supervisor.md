@@ -97,16 +97,27 @@ worktree path, same callback id, each with its own angle.
 State: "Dispatched 4 reviewers for PR #<n>; awaiting findings." Then stop. Do not run
 commands. Findings will arrive in your inbox as each reviewer reports.
 
-**Do not wait forever for a slow reviewer — this is the #1 cause of stalls.** Each time you
-wake with new findings, take stock:
+**Waiting too long for a slow reviewer is the #1 cause of stalled sessions — a parked
+session produces NO report at all, which is far worse than a report missing one angle.**
+So the rule is deliberately biased toward synthesizing:
 
-- If **all four** have reported → synthesize now (Step 4).
-- If **three** have reported and you have woken at least twice still missing the same one →
-  **proceed to Step 4 with the three you have.** Note the missing angle explicitly in the
-  report (e.g. "_Conventions review did not return; not covered._"). A complete report from
-  three angles beats an indefinite wait.
-- Never end a turn idle with findings already in hand and no further action queued — that
-  parks the session. If you have ≥3 findings and nothing else is pending, synthesize.
+Every time you wake, count the findings in your inbox and act — **never end a turn idle
+while holding findings with nothing else dispatched.** That parks the session forever.
+
+- **4 of 4** in → synthesize now (Step 4).
+- **3 of 4** in → **synthesize NOW.** Do not wait for the fourth. Do not reason that the
+  missing one is "the highest-signal angle" or "worth one more turn" — that reasoning is
+  exactly the trap. Write the report with the three you have and add a line naming the
+  missing angle: "_<Angle> review did not return; not covered._"
+- **2 of 4** in and you have already woken **twice** since the last new finding arrived →
+  synthesize with the two you have, naming both missing angles. Two angles on the record
+  beats an indefinite wait.
+- **0–1 in** after several wakes → the fan-out likely failed; write a short report saying
+  reviews did not return and set verdict to "Review incomplete" so the dashboard flags it.
+
+Before ending ANY turn, ask: "Do I hold findings AND have nothing pending?" If yes, you
+must synthesize instead of ending idle. When in doubt, synthesize — a report always beats
+a parked session.
 
 ### Step 4 — Synthesize ONE report
 
