@@ -278,6 +278,13 @@ def render_page(prs: list[dict]) -> str:
                  data-title="{html.escape(r['title'])}" data-verdict="{html.escape(r['verdict'])}"
                  data-acted="{html.escape(json.dumps(r['acted'] or ''))}"
                  data-acted-at="{html.escape(json.dumps(r['acted_at'] or ''))}"
+                 data-f-urgency="{r['urgency'] or 'none'}"
+                 data-f-ci="{r['ci'] or 'none'}"
+                 data-f-verdict="{('request' if 'request' in (r['verdict'] or '').lower() else 'approve' if 'approve' in (r['verdict'] or '').lower() else 'none')}"
+                 data-f-status="{'reviewed' if r['has_review'] else 'pending'}"
+                 data-f-acted="{'acted' if r['acted'] else 'unacted'}"
+                 data-f-attention="{'code' if r['code_changed'] else 'discussion' if r['human_activity'] else 'none'}"
+                 data-f-text="{html.escape((str(r['pr']) + ' ' + (r['title'] or '') + ' ' + (r['author'] or '')).lower())}"
                  onclick="openDetail(this)">
           <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{acted_badge}</span></div>
           <h3>{html.escape(r['title'])}</h3>
@@ -294,7 +301,15 @@ def render_page(prs: list[dict]) -> str:
   .mode {{ font-size:12px; padding:3px 10px; border-radius:12px; }}
   .mode.dry {{ background:#9a6700; }} .mode.exec {{ background:#cf222e; }}
   main {{ max-width:1100px; margin:20px auto; padding:0 16px; }}
+  .filterbar {{ position:sticky; top:45px; z-index:4; background:#eaeef2; border-bottom:1px solid #d0d7de;
+    padding:8px 20px; display:flex; flex-wrap:wrap; gap:10px; align-items:center; }}
+  .filterbar select, .filterbar input {{ font:13px inherit; padding:4px 8px; border:1px solid #d0d7de; border-radius:6px; background:#fff; }}
+  .filterbar input.search {{ min-width:200px; }}
+  .filterbar label {{ font-size:12px; color:#57606a; }}
+  #f-count {{ margin-left:auto; font-size:12px; color:#57606a; }}
+  #f-reset {{ cursor:pointer; border:1px solid #d0d7de; border-radius:6px; padding:4px 10px; background:#fff; font:13px inherit; }}
   .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:14px; }}
+  .card.hidden {{ display:none; }}
   .card {{ background:#fff; border:1px solid #d0d7de; border-radius:8px; padding:14px; cursor:pointer; transition:box-shadow .15s,border-color .15s; }}
   .card:hover {{ box-shadow:0 3px 12px rgba(0,0,0,.1); border-color:#0969da; }}
   .card-top {{ display:flex; justify-content:space-between; align-items:center; }}
@@ -335,6 +350,17 @@ def render_page(prs: list[dict]) -> str:
   .acted-line:empty {{ display:none; }}
 </style></head><body>
 <div class="topbar"><h1>CAO PR Triage · {STATE['repo']} · {len(prs)} open</h1><span class="mode {mode_cls}">{mode}</span></div>
+<div class="filterbar">
+  <input class="search" id="f-text" type="search" placeholder="search # / title / author…" oninput="applyFilters()">
+  <select id="f-urgency" onchange="applyFilters()"><option value="">urgency: any</option><option>high</option><option>medium</option><option>low</option></select>
+  <select id="f-ci" onchange="applyFilters()"><option value="">CI: any</option><option>passing</option><option>failing</option><option>pending</option><option value="none">none</option></select>
+  <select id="f-verdict" onchange="applyFilters()"><option value="">verdict: any</option><option value="request">request changes</option><option value="approve">approve</option></select>
+  <select id="f-status" onchange="applyFilters()"><option value="">review: any</option><option value="reviewed">reviewed</option><option value="pending">pending</option></select>
+  <select id="f-acted" onchange="applyFilters()"><option value="">action: any</option><option value="unacted">not acted</option><option value="acted">acted</option></select>
+  <select id="f-attention" onchange="applyFilters()"><option value="">attention: any</option><option value="code">🔁 code changed</option><option value="discussion">💬 discussion</option></select>
+  <button id="f-reset" onclick="resetFilters()">reset</button>
+  <span id="f-count"></span>
+</div>
 <main><div class="grid">{grid}</div></main>
 
 <div class="overlay" id="overlay" onclick="if(event.target===this)closeDetail()">
@@ -381,6 +407,33 @@ function openDetail(card) {{
 }}
 function closeDetail() {{ document.getElementById('overlay').classList.remove('open'); CUR=null; }}
 document.addEventListener('keydown', e => {{ if(e.key==='Escape') closeDetail(); }});
+
+// --- client-side filtering (all data is in the card dataset; no server round-trip) ---
+const FILTERS = [
+  ['f-urgency','fUrgency'], ['f-ci','fCi'], ['f-verdict','fVerdict'],
+  ['f-status','fStatus'], ['f-acted','fActed'], ['f-attention','fAttention'],
+];
+function applyFilters() {{
+  const text = document.getElementById('f-text').value.trim().toLowerCase();
+  const sel = {{}};
+  FILTERS.forEach(([id,ds]) => sel[ds] = document.getElementById(id).value);
+  let shown = 0;
+  document.querySelectorAll('.card').forEach(card => {{
+    let ok = true;
+    for (const [id,ds] of FILTERS) {{ if (sel[ds] && card.dataset[ds] !== sel[ds]) {{ ok = false; break; }} }}
+    if (ok && text && !(card.dataset.fText||'').includes(text)) ok = false;
+    card.classList.toggle('hidden', !ok);
+    if (ok) shown++;
+  }});
+  const total = document.querySelectorAll('.card').length;
+  document.getElementById('f-count').textContent = shown + ' / ' + total + ' shown';
+}}
+function resetFilters() {{
+  document.getElementById('f-text').value = '';
+  FILTERS.forEach(([id]) => document.getElementById(id).value = '');
+  applyFilters();
+}}
+document.addEventListener('DOMContentLoaded', applyFilters);
 async function act(action) {{
   const result = document.getElementById('d-result');
   const body = document.getElementById('d-body').value;
