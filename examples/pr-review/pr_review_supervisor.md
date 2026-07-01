@@ -112,10 +112,19 @@ angle. (The `consistency_reviewer` covers doc/comment↔code drift, PR-descripti
 mismatch, cross-provider inconsistency, dead code, out-of-scope changes, and committed
 generated files — this is the highest-volume category of real feedback on the CAO repo.)
 
+**Also assign the `verifier` — but ONLY for code PRs.** The verifier actually runs the
+tests and exercises the change (it's the one reviewer with `execute_bash`). Dispatch it when
+the diff touches real logic (`src/cli_agent_orchestrator/**`, i.e. `providers/`, `services/`,
+`api/`, `cli/`, `mcp_server/`, `utils/`, `models/`). **Skip it** for docs-only (`docs/`,
+`*.md`), dependabot / dependency-only bumps, and config-only PRs — running tests adds little
+there and the verifier can't build dependency changes on this host anyway. When you skip it,
+note "verifier skipped (no code changes)" so the count is unambiguous. Same message shape,
+same diff/worktree/callback.
+
 ### Step 3 — Finish your turn
 
-State: "Dispatched 5 reviewers for PR #<n>; awaiting findings." Then stop. Do not run
-commands. Findings will arrive in your inbox as each reviewer reports.
+State: "Dispatched N reviewers for PR #<n> (5 static + verifier if code PR); awaiting
+findings." Then stop. Do not run commands. Findings arrive in your inbox as each reports.
 
 **Waiting too long for a slow reviewer is the #1 cause of stalled sessions — a parked
 session produces NO report at all, which is far worse than a report missing one angle.**
@@ -124,16 +133,22 @@ So the rule is deliberately biased toward synthesizing:
 Every time you wake, count the findings in your inbox and act — **never end a turn idle
 while holding findings with nothing else dispatched.** That parks the session forever.
 
-- **5 of 5** in → synthesize now (Step 4).
-- **4 of 5** in → **synthesize NOW.** Do not wait for the fifth. Do not reason that the
+Let **N** = the number you dispatched (5 static, or 6 when you also sent the verifier):
+
+- **All N** in → synthesize now (Step 4).
+- **N-1 of N** in → **synthesize NOW.** Do not wait for the last one. Do not reason that the
   missing one is "the highest-signal angle" or "worth one more turn" — that reasoning is
-  exactly the trap. Write the report with the four you have and add a line naming the
-  missing angle: "_<Angle> review did not return; not covered._"
-- **3 of 5** in and you have already woken **twice** since the last new finding arrived →
-  synthesize with the three you have, naming the missing angles. Three angles on the record
-  beats an indefinite wait.
-- **0–2 in** after several wakes → the fan-out likely failed; write a short report saying
+  exactly the trap. Write the report with what you have and add a line naming the missing
+  angle: "_<Angle> review did not return; not covered._"
+- **N-2 of N** in and you have already woken **twice** since the last new finding arrived →
+  synthesize with what you have, naming the missing angles. Most angles on the record beats
+  an indefinite wait.
+- **≤ N-3 in** after several wakes → the fan-out likely failed; write a short report saying
   reviews did not return and set verdict to "Review incomplete" so the dashboard flags it.
+
+The **verifier is never the one you block on** — if the static angles are in but the
+verifier hasn't returned, synthesize and note "_dynamic verification did not return._" Its
+evidence is a bonus, not a gate.
 
 Before ending ANY turn, ask: "Do I hold findings AND have nothing pending?" If yes, you
 must synthesize instead of ending idle. When in doubt, synthesize — a report always beats
@@ -176,6 +191,11 @@ Use this structure (omit a section if empty):
 
 ## Tests
 <coverage assessment from the tests reviewer>
+
+## Verification
+<from the verifier, if it ran: tests run + pass/fail, the example cases it wrote and their
+results, whether the feature behaved as the PR claims, and any env limits it hit. If the
+verifier was skipped (non-code PR) or didn't return, say so in one line.>
 
 ## Verdict
 Approve / Approve with nits / Request changes — one line
