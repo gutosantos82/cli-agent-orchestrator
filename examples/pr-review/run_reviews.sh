@@ -39,13 +39,46 @@ mkdir -p "$DATA_DIR/reviews" "$DATA_DIR/meta"
 # Reap finished review sessions: a session cao-prr-<n> whose report file for the SHA it
 # was launched on now exists has done its job — shut it down so it frees a parallelism slot.
 # (Without this, idle-but-completed sessions hold slots and stall the queue.)
-declare -A LAUNCH_SHA   # pr -> sha it was launched to review
+declare -A LAUNCH_SHA    # pr  -> sha it was launched to review
+declare -A IDLE_SINCE    # pr  -> epoch when we first saw it idle w/o a report (0 = not idle)
+declare -A NUDGES        # pr  -> how many watchdog nudges sent so far
+WATCHDOG_SECS=420        # must be idle+reportless this long before we nudge
+MAX_NUDGES=2             # give up (leave for manual/next run) after this many nudges
+
 reap_finished() {
   for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-'); do
     local pr="${s#cao-prr-}"
     local sha="${LAUNCH_SHA[$pr]:-}"
     [[ -n "$sha" && -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]] || continue
     cao shutdown --session "$s" >/dev/null 2>&1 && echo "  ✓ #$pr reviewed — reclaimed $s"
+  done
+}
+
+# Watchdog for the race-stall: a supervisor can go idle after its final reviewer's message
+# arrives without ever synthesizing (the message lands as the turn ends, so no turn fires to
+# act on it — it parks holding all findings). We detect a session that has been idle (no tmux
+# window activity) AND reportless for WATCHDOG_SECS, then prod it via `cao session send` to
+# synthesize with whatever it holds. Call this periodically from the wait loops.
+watchdog_nudge() {
+  local now; now="$(date +%s)"
+  for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-'); do
+    local pr="${s#cao-prr-}"
+    local sha="${LAUNCH_SHA[$pr]:-}"
+    [[ -n "$sha" ]] || continue
+    if [[ -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]]; then IDLE_SINCE[$pr]=0; continue; fi
+    # tmux activity flag: 1 => produced output since last check (actively working)
+    local active; active="$(tmux list-windows -t "$s" -F '#{window_activity_flag}' 2>/dev/null | tr -d '\n')"
+    if [[ "$active" == *1* ]]; then IDLE_SINCE[$pr]=0; continue; fi   # busy — reset idle timer
+    local since="${IDLE_SINCE[$pr]:-0}"
+    if [[ "$since" -eq 0 ]]; then IDLE_SINCE[$pr]="$now"; continue; fi
+    (( now - since < WATCHDOG_SECS )) && continue                    # idle, but not long enough yet
+    local n="${NUDGES[$pr]:-0}"
+    [[ "$n" -ge "$MAX_NUDGES" ]] && continue
+    NUDGES[$pr]=$((n+1)); IDLE_SINCE[$pr]="$now"                      # reset timer after nudging
+    echo "  ⏰ watchdog: #$pr idle ${WATCHDOG_SECS}s w/o report — nudge $((n+1))/$MAX_NUDGES"
+    cao session send "$s" \
+      "Check your inbox now. If you hold findings from any reviewers, synthesize the report immediately with what you have (name any missing angle) and write it to ${DATA_DIR}/reviews/${pr}-${sha}.md with the YAML frontmatter (title, urgency, importance, verdict, summary), then remove the worktree. Do not wait for more reviewers." \
+      --async >/dev/null 2>&1 || true
   done
 }
 
@@ -146,8 +179,8 @@ for i in "${!PRS[@]}"; do
     continue
   fi
 
-  # throttle: reap finished sessions, then wait while MAX_PARALLEL are still running
-  while reap_finished; [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -ge "$MAX_PARALLEL" ]]; do
+  # throttle: reap finished sessions + nudge any stalled ones, then wait while full
+  while reap_finished; watchdog_nudge; [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -ge "$MAX_PARALLEL" ]]; do
     sleep 15
   done
 
@@ -173,9 +206,10 @@ for i in "${!PRS[@]}"; do
 done
 
 echo "Launched $launched review session(s). Waiting for in-flight reviews to finish…"
-# keep reaping until all launched sessions have produced their report (or we give up waiting)
+# keep reaping + nudging stalled sessions until all produce a report (or we give up)
 for _ in $(seq 1 80); do
   reap_finished
+  watchdog_nudge
   [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -eq 0 ]] && break
   sleep 30
 done

@@ -57,9 +57,35 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     return {}, text
 
 
+_OPEN_CACHE = {"prs": None, "at": 0.0}
+
+
+def open_pr_numbers() -> set[str] | None:
+    """Live set of open PR numbers (cached 60s). None if gh is unavailable — in which case
+    we don't filter (fail open). Used to drop cards for PRs that have merged/closed."""
+    import time
+    now = time.time()
+    if _OPEN_CACHE["prs"] is not None and now - _OPEN_CACHE["at"] < 60:
+        return _OPEN_CACHE["prs"]
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "list", "--repo", STATE["repo"], "--state", "open",
+             "--limit", "200", "--json", "number", "--jq", ".[].number"],
+            capture_output=True, text=True, timeout=15)
+        if out.returncode != 0:
+            return _OPEN_CACHE["prs"]  # keep last good (or None)
+        prs = {ln.strip() for ln in out.stdout.splitlines() if ln.strip()}
+        _OPEN_CACHE.update(prs=prs, at=now)
+        return prs
+    except Exception:  # noqa: BLE001
+        return _OPEN_CACHE["prs"]
+
+
 def list_prs() -> list[dict]:
-    """One merged entry per PR: review report + frontmatter + manager metadata."""
+    """One merged entry per PR: review report + frontmatter + manager metadata.
+    Only PRs currently open on the repo are shown (closed/merged cards are pruned)."""
     state = load_state()
+    open_prs = open_pr_numbers()  # None => gh unavailable, show everything (fail open)
     # collect metadata (manager) and reviews (supervisor) by PR; either may be absent.
     metas, reviews = {}, {}
     meta_dir = data() / "meta"
@@ -78,6 +104,8 @@ def list_prs() -> list[dict]:
 
     out = []
     for pr in set(metas) | set(reviews):
+        if open_prs is not None and pr not in open_prs:
+            continue  # PR merged/closed — prune its stale card
         meta_sha, meta = metas.get(pr, ("", {}))
         rev = reviews.get(pr)
         if rev:
