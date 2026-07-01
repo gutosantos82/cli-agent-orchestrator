@@ -52,9 +52,9 @@ graph TD
 
 > The 5 static reviewers read the diff; the `verifier` **runs** it. It's dispatched only for
 > PRs touching `src/**` (skipped for docs/deps), runs in parallel, and is never blocked on
-> at synthesis (its evidence is a bonus, not a gate). On this host it reuses the main `.venv`
-> — it can't build dependency changes (numpy/GCC), and reports honestly when the env limits
-> what it could run.
+> at synthesis (its evidence is a bonus, not a gate). It runs tests + examples **inside
+> Docker** (`ghcr.io/astral-sh/uv` image) — which builds the full CAO dep set cleanly, where
+> the host's old GCC can't. Falls back to static reasoning only if Docker is unavailable.
 
 ## Pipeline
 

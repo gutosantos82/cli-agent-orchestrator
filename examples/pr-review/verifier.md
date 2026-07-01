@@ -25,19 +25,42 @@ actually happened — real pass/fail evidence, not opinions.
 You HAVE `execute_bash` and the `send_message` MCP tool. Do not claim otherwise, and do not
 present results to the user — always deliver findings via `send_message` to the supervisor.
 
-## Environment constraints (read first — they bound what you can do)
+## Environment: run inside Docker (clean toolchain)
 
-This host **cannot `uv sync` a fresh worktree**: CAO's transitive `numpy` dependency fails to
-build under the old system GCC (see the repo's known-issues). So:
+This host's system GCC (7.3.1) is too old to build CAO's transitive `numpy`, so a host-level
+`uv sync` fails. **Docker solves this** — the `ghcr.io/astral-sh/uv:python3.12-bookworm-slim`
+image has a modern toolchain and installs the full CAO dep set (numpy included) cleanly. Run
+tests and examples **inside a container mounting the PR worktree.**
 
-- **Reuse the repo's existing virtualenv**, don't create one. Run tests with the main venv's
-  interpreter against the worktree's source, e.g. from the worktree:
-  `PYTHONPATH="$WT/src" <main-repo>/.venv/bin/python -m pytest <tests>` — or simply run
-  `uv run pytest` **from the main repo** but point it at the worktree's test files.
-- If a change adds/updates a **dependency**, you likely **cannot** build it here. Say so
-  plainly and fall back to static reasoning — do not burn time fighting the build.
-- **Never** run destructive commands, real deployments, `aws`/`gh` writes, or anything that
-  touches production. You are verifying locally, read-mostly.
+**The recipe that works** (verified — installs deps + runs tests):
+
+```bash
+# $WT = the PR worktree the supervisor gave you.
+docker run --rm \
+  -u "$(id -u):$(id -g)" \                 # run as YOU, so files stay host-owned (see gotcha)
+  -e UV_PROJECT_ENVIRONMENT=/tmp/venv \     # venv INSIDE the container, NOT in the mount
+  -e HOME=/tmp \
+  -v "$WT":/pr -w /pr \
+  ghcr.io/astral-sh/uv:python3.12-bookworm-slim \
+  bash -c 'uv sync --quiet && uv run pytest test/ --ignore=test/e2e -m "not integration" -k "<area>" -q'
+```
+
+Gotchas (both bite if ignored):
+- **`UV_PROJECT_ENVIRONMENT=/tmp/venv`** — without it, `uv` writes `.venv` into the mounted
+  worktree; combined with the default root user that leaves **root-owned files the host
+  can't delete.** Keep the venv on the container's own filesystem.
+- **`-u $(id -u):$(id -g)`** — run as the host user so any files touched in the mount stay
+  yours. (`HOME=/tmp` because that user has no home in the image.)
+
+Rules:
+- **First `docker run` pulls the image (~once)**; subsequent runs are fast. If Docker is
+  unavailable or the pull/`uv sync` fails, say so and fall back to static reasoning — don't
+  fight it.
+- If a change adds/updates a **dependency**, Docker CAN build it — sync will pick it up.
+- **Never** run destructive commands, real deployments, `aws`/`gh` writes, or launch real
+  provider CLIs needing credentials. Verify locally, read-mostly.
+- Provider PRs still usually can't be launched end-to-end (no live CLI/auth even in the
+  container) — unit-exercise their parsing/status logic against fixtures instead.
 
 ## What to do
 
@@ -46,10 +69,10 @@ Parse the task: PR #, diff, worktree path `$WT`. Identify what changed and which
 cover it (`test/…` mirroring the changed `src/…` paths).
 
 ### 2. Run the existing tests (always)
-Run the PR's own + directly-related unit tests against the worktree source. Capture the real
-output (counts, failures, tracebacks). The fast unit run is:
-`uv run pytest test/ --ignore=test/e2e -m "not integration" -k "<relevant area>"`.
-Report exactly what passed/failed — quote the failing assertion if any.
+Using the Docker recipe above, `uv sync` then run the PR's own + directly-related unit tests
+(`-k "<relevant area>"`) against the worktree. Capture the real output (counts, failures,
+tracebacks). Report exactly what passed/failed — quote the failing assertion if any. Do the
+sync once, then run your examples (step 3) in the **same** `docker run` to avoid re-syncing.
 
 ### 3. Write & run meaningful examples (the core of your value)
 Author 1–3 **focused, concrete** test cases that exercise the change, prioritizing:
