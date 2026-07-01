@@ -36,6 +36,10 @@ done
 mkdir -p "$DATA_DIR/reviews" "$DATA_DIR/meta"
 [[ -f "$DATA_DIR/state.json" ]] || echo '{}' > "$DATA_DIR/state.json"
 
+# The dashboard user's own GitHub login — excluded from "discussion since review" so your
+# own comments don't flag as activity worth re-reading (you already know what you said).
+ME="$(gh api user --jq .login 2>/dev/null || echo "")"
+
 # Reap finished review sessions: a session cao-prr-<n> whose report file for the SHA it
 # was launched on now exists has done its job — shut it down so it frees a parallelism slot.
 # (Without this, idle-but-completed sessions hold slots and stall the queue.)
@@ -140,12 +144,13 @@ write_meta() {
   # human_activity: newest non-bot comment/review timestamp is after our review-file mtime.
   if [[ -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]]; then
     rev_epoch="$(date -u -r "$DATA_DIR/reviews/${pr}-${sha}.md" +%s 2>/dev/null || echo 0)"
+    # "others" = not a bot AND not the dashboard user (your own comments don't count).
     local latest_human
-    latest_human="$(jq -r '
+    latest_human="$(jq -r --arg me "$ME" '
       def is_bot($l): ($l|ascii_downcase) | test("bot|codecov|dependabot|github-actions|copilot");
       [ (.comments[]?, .reviews[]?)
         | (.author.login // "") as $l
-        | select($l != "" and (is_bot($l)|not))
+        | select($l != "" and $l != $me and (is_bot($l)|not))
         | (.createdAt // .submittedAt // empty) ] | max // ""' <<<"$act" 2>/dev/null || echo "")"
     if [[ -n "$latest_human" ]]; then
       local h_epoch; h_epoch="$(date -u -d "$latest_human" +%s 2>/dev/null || echo 0)"
