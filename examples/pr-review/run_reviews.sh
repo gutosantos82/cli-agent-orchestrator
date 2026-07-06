@@ -46,6 +46,7 @@ ME="$(gh api user --jq .login 2>/dev/null || echo "")"
 declare -A LAUNCH_SHA    # pr  -> sha it was launched to review
 declare -A IDLE_SINCE    # pr  -> epoch when we first saw it idle w/o a report (0 = not idle)
 declare -A NUDGES        # pr  -> how many watchdog nudges sent so far
+declare -A PANE_FP       # pr  -> last content fingerprint of the supervisor pane
 WATCHDOG_SECS=420        # must be idle+reportless this long before we nudge
 MAX_NUDGES=2             # give up (leave for manual/next run) after this many nudges
 
@@ -60,9 +61,16 @@ reap_finished() {
 
 # Watchdog for the race-stall: a supervisor can go idle after its final reviewer's message
 # arrives without ever synthesizing (the message lands as the turn ends, so no turn fires to
-# act on it — it parks holding all findings). We detect a session that has been idle (no tmux
-# window activity) AND reportless for WATCHDOG_SECS, then prod it via `cao session send` to
-# synthesize with whatever it holds. Call this periodically from the wait loops.
+# act on it — it parks holding all findings). We detect a session that has made no progress
+# AND is reportless for WATCHDOG_SECS, then prod it via `cao session send` to synthesize with
+# whatever it holds. Call this periodically from the wait loops.
+#
+# Progress is measured by fingerprinting the supervisor pane's content between checks, NOT by
+# tmux's window_activity_flag: that flag only clears when a human *views* the window, so a
+# parked supervisor kept reading as "active" and never got nudged (the original bug). We strip
+# the volatile chrome first — the status bar's ticking "Midway:" timer, the box rules, and the
+# prompt line — which change on their own even when the agent is idle. A live agent still moves
+# the fingerprint (new transcript lines, or a ticking spinner); a parked one is static.
 watchdog_nudge() {
   local now; now="$(date +%s)"
   for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-'); do
@@ -70,9 +78,12 @@ watchdog_nudge() {
     local sha="${LAUNCH_SHA[$pr]:-}"
     [[ -n "$sha" ]] || continue
     if [[ -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]]; then IDLE_SINCE[$pr]=0; continue; fi
-    # tmux activity flag: 1 => produced output since last check (actively working)
-    local active; active="$(tmux list-windows -t "$s" -F '#{window_activity_flag}' 2>/dev/null | tr -d '\n')"
-    if [[ "$active" == *1* ]]; then IDLE_SINCE[$pr]=0; continue; fi   # busy — reset idle timer
+    # Fingerprint the supervisor pane (window 0), ignoring self-ticking chrome.
+    local fp; fp="$(tmux capture-pane -t "${s}:0" -p 2>/dev/null \
+      | grep -vaE 'Midway:|bypass permissions|───|❯' | md5sum | cut -d' ' -f1)"
+    if [[ "$fp" != "${PANE_FP[$pr]:-}" ]]; then                     # content moved — still working
+      PANE_FP[$pr]="$fp"; IDLE_SINCE[$pr]=0; continue
+    fi
     local since="${IDLE_SINCE[$pr]:-0}"
     if [[ "$since" -eq 0 ]]; then IDLE_SINCE[$pr]="$now"; continue; fi
     (( now - since < WATCHDOG_SECS )) && continue                    # idle, but not long enough yet
