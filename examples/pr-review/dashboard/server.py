@@ -87,20 +87,38 @@ def list_prs() -> list[dict]:
     state = load_state()
     open_prs = open_pr_numbers()  # None => gh unavailable, show everything (fail open)
     # collect metadata (manager) and reviews (supervisor) by PR; either may be absent.
+    # Collect metadata (manager) and reviews (supervisor) per PR, keeping the NEWEST
+    # file by mtime. Files are named "<pr>-<sha>.<ext>" and a PR accrues one file per
+    # SHA across successive runs, so lexicographic filename order is meaningless — the
+    # freshest review is the most recently written file, not the one with the largest
+    # SHA hex. (Bug: `sorted(glob())[last]` pinned cards to a stale review whenever an
+    # older SHA sorted after the current head, e.g. c3e5222 after 19fe981.)
     metas, reviews = {}, {}
+    meta_mtime, review_mtime = {}, {}
     meta_dir = data() / "meta"
     if meta_dir.exists():
         for mf in meta_dir.glob("*.json"):
             pr, _, sha = mf.stem.partition("-")
-            if pr.isdigit():
-                try:
-                    metas[pr] = (sha, json.loads(mf.read_text()))
-                except json.JSONDecodeError:
-                    pass
-    for f in sorted((data() / "reviews").glob("*.md")):
+            if not pr.isdigit():
+                continue
+            mtime = mf.stat().st_mtime
+            if pr in meta_mtime and meta_mtime[pr] >= mtime:
+                continue
+            try:
+                parsed = json.loads(mf.read_text())
+            except json.JSONDecodeError:
+                continue
+            metas[pr] = (sha, parsed)
+            meta_mtime[pr] = mtime
+    for f in (data() / "reviews").glob("*.md"):
         pr, _, sha = f.stem.partition("-")
-        if pr.isdigit():
-            reviews[pr] = (sha, *parse_frontmatter(f.read_text()))  # (sha, frontmatter, body)
+        if not pr.isdigit():
+            continue
+        mtime = f.stat().st_mtime
+        if pr in review_mtime and review_mtime[pr] >= mtime:
+            continue
+        reviews[pr] = (sha, *parse_frontmatter(f.read_text()))  # (sha, frontmatter, body)
+        review_mtime[pr] = mtime
 
     out = []
     for pr in set(metas) | set(reviews):
