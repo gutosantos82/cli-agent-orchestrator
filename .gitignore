@@ -60,3 +60,6 @@ aidlc-docs
 
 # Separate git repos (not part of this project)
 cao-flows/
+
+# PR-review dashboard runtime output (reviews, metadata, state, archives)
+pr-review-data/
