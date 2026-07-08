@@ -244,7 +244,7 @@ for i in "${!PRS[@]}"; do
   # The supervisor runs in dashboard mode: checks out the PR in an isolated worktree,
   # fans out to the five reviewers, writes the report, then goes idle.
   msg="Review PR #$pr. MODE: dashboard, write report to ${DATA_DIR}/reviews/${pr}-${sha}.md"
-  if cao launch --agents pr_review_supervisor --provider claude_code --yolo \
+  if cao launch --agents pr_review_supervisor --provider claude_code --yolo --headless \
        --session-name "prr-${pr}" >/dev/null 2>&1; then
     sleep 12   # let the supervisor finish booting before sending the task
     LAUNCH_SHA[$pr]="$sha"
