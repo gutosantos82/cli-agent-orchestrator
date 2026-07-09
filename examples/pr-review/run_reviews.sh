@@ -40,6 +40,42 @@ mkdir -p "$DATA_DIR/reviews" "$DATA_DIR/meta"
 # own comments don't flag as activity worth re-reading (you already know what you said).
 ME="$(gh api user --jq .login 2>/dev/null || echo "")"
 
+# Fetch the repo's open GitHub code-scanning alerts into a single repo-level summary
+# (pr-review-data/security.json) that the dashboard renders as a banner. Code scanning
+# here only analyzes the default branch, so alerts are repo-global (not per-PR); we
+# surface totals + severity breakdown + the worst offenders, with a link to the
+# Security tab. Best-effort: needs the security_events scope; on failure we write an
+# empty summary so the dashboard degrades gracefully.
+write_security_summary() {
+  local out="$DATA_DIR/security.json"
+  local url="https://github.com/${REPO}/security/code-scanning"
+  local alerts
+  if ! alerts="$(gh api "repos/${REPO}/code-scanning/alerts?state=open&per_page=100" 2>/dev/null)"; then
+    jq -n --arg url "$url" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{generated_at:$t, url:$url, available:false, total_open:0, by_severity:{}, top_alerts:[]}' > "$out"
+    echo "  ⚠ code-scanning alerts unavailable (need security_events scope?) — wrote empty security.json"
+    return
+  fi
+  jq --arg url "$url" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+    def sev: (.rule.security_severity_level // .rule.severity // "unknown");
+    {
+      generated_at: $t,
+      url: $url,
+      available: true,
+      total_open: length,
+      by_severity: (group_by(sev) | map({key: (.[0]|sev), value: length}) | from_entries),
+      top_alerts: ( sort_by(
+                      ({critical:0,high:1,medium:2,low:3,warning:4,note:5,unknown:6}[(.|sev)] // 9)
+                    )
+                    | .[:8]
+                    | map({number, severity: (.|sev), rule: .rule.id,
+                           path: .most_recent_instance.location.path,
+                           line: .most_recent_instance.location.start_line,
+                           url: .html_url}) )
+    }' <<<"$alerts" > "$out"
+  echo "  🔒 security summary: $(jq -r '.total_open' "$out") open code-scanning alert(s) → security.json"
+}
+
 # Reap finished review sessions: a session cao-prr-<n> whose report file for the SHA it
 # was launched on now exists has done its job — shut it down so it frees a parallelism slot.
 # (Without this, idle-but-completed sessions hold slots and stall the queue.)
@@ -206,12 +242,14 @@ if [[ "$REFRESH_META_ONLY" -eq 1 ]]; then
     write_meta "$pr" "$sha" "${PR_JSON[$i]}" 2>/dev/null \
       && echo "  ✓ #$pr" || echo "  ✗ #$pr (metadata write failed)"
   done
+  write_security_summary
   echo "Metadata refreshed. Reload the dashboard."
   exit 0
 fi
 
 echo "Will review ${#PRS[@]} PRs (limit $LIMIT, up to $MAX_PARALLEL at a time):"
 printf '  #%s\n' "${PRS[@]%% *}"
+write_security_summary
 
 launched=0
 for i in "${!PRS[@]}"; do

@@ -44,6 +44,17 @@ def load_state() -> dict:
     return json.loads(f.read_text()) if f.exists() else {}
 
 
+def load_security() -> dict:
+    """Load the repo-level code-scanning summary written by run_reviews.sh (security.json)."""
+    f = data() / "security.json"
+    if not f.exists():
+        return {}
+    try:
+        return json.loads(f.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def parse_frontmatter(text: str) -> tuple[dict, str]:
     """Split a leading `---\\n…\\n---` YAML block from the markdown body."""
     if text.startswith("---"):
@@ -245,6 +256,47 @@ def pill(text: str, color: str) -> str:
 def render_page(prs: list[dict]) -> str:
     mode = "EXECUTE — actions hit GitHub" if STATE["execute"] else "DRY-RUN — actions are simulated"
     mode_cls = "exec" if STATE["execute"] else "dry"
+    # Repo-level code-scanning summary banner (from security.json).
+    sec = load_security()
+    sec_banner = ""
+    if sec:
+        if not sec.get("available", False):
+            sec_banner = ('<div class="secbar unavail">🔒 Code scanning: unavailable '
+                          f'(needs security_events scope) · <a href="{html.escape(sec.get("url",""))}" '
+                          'target="_blank" rel="noopener">Security tab ↗</a></div>')
+        else:
+            total = sec.get("total_open", 0)
+            sev_order = ["critical", "high", "medium", "low", "warning", "note"]
+            sev_color = {"critical": "#cf222e", "high": "#cf222e", "medium": "#9a6700",
+                         "low": "#1a7f37", "warning": "#9a6700", "note": "#57606a"}
+            by_sev = sec.get("by_severity", {}) or {}
+            sev_pills = "".join(
+                f'<span class="pill" style="background:{sev_color.get(s, "#57606a")}">{s} {by_sev[s]}</span>'
+                for s in sev_order if by_sev.get(s)
+            )
+            # any severity keys not in the known order
+            sev_pills += "".join(
+                f'<span class="pill" style="background:#57606a">{html.escape(str(s))} {n}</span>'
+                for s, n in by_sev.items() if s not in sev_order and n
+            )
+            tops = "".join(
+                f'<li><a href="{html.escape(a.get("url",""))}" target="_blank" rel="noopener">'
+                f'#{a.get("number")}</a> <b>{html.escape(str(a.get("severity","")))}</b> '
+                f'{html.escape(str(a.get("rule","")))} '
+                f'<span class="secpath">{html.escape(str(a.get("path","")))}:{a.get("line","")}</span></li>'
+                for a in sec.get("top_alerts", [])
+            )
+            cls = "ok" if total == 0 else "alert"
+            headline = ("✅ Code scanning: 0 open alerts" if total == 0
+                        else f"🔒 Code scanning: {total} open alert(s)")
+            details = (f'<details><summary>top {min(total, 8)}</summary><ul class="seclist">{tops}</ul></details>'
+                       if total else "")
+            sec_banner = (
+                f'<div class="secbar {cls}">'
+                f'<span class="sechead">{headline}</span> {sev_pills} '
+                f'<a href="{html.escape(sec.get("url",""))}" target="_blank" rel="noopener">Security tab ↗</a>'
+                f'{details}</div>'
+            )
     cards = []
     for r in prs:
         flags = []
@@ -366,8 +418,21 @@ def render_page(prs: list[dict]) -> str:
   .result.ok {{ color:#1a7f37; }} .result.err {{ color:#cf222e; }}
   .acted-line {{ padding:8px 24px 0; font-size:13px; color:#1a7f37; }}
   .acted-line:empty {{ display:none; }}
+  .secbar {{ padding:8px 20px; font-size:13px; border-bottom:1px solid #d0d7de; display:flex; flex-wrap:wrap; align-items:center; gap:8px; }}
+  .secbar.alert {{ background:#fff1f0; color:#82071e; }}
+  .secbar.ok {{ background:#eaffea; color:#0a5f1a; }}
+  .secbar.unavail {{ background:#fff8e1; color:#7a5b00; }}
+  .secbar .sechead {{ font-weight:600; }}
+  .secbar .pill {{ color:#fff; padding:1px 8px; border-radius:10px; font-size:11px; }}
+  .secbar a {{ color:inherit; text-decoration:underline; }}
+  .secbar details {{ flex-basis:100%; margin-top:4px; }}
+  .secbar summary {{ cursor:pointer; font-size:12px; }}
+  .secbar .seclist {{ margin:6px 0 0; padding-left:18px; }}
+  .secbar .seclist li {{ margin:2px 0; }}
+  .secbar .secpath {{ color:#57606a; font-family:ui-monospace,monospace; font-size:11px; }}
 </style></head><body>
 <div class="topbar"><h1>CAO PR Triage · {STATE['repo']} · {len(prs)} open</h1><span class="mode {mode_cls}">{mode}</span></div>
+{sec_banner}
 <div class="filterbar">
   <input class="search" id="f-text" type="search" placeholder="search # / title / author…" oninput="applyFilters()">
   <select id="f-urgency" onchange="applyFilters()"><option value="">urgency: any</option><option>high</option><option>medium</option><option>low</option></select>
