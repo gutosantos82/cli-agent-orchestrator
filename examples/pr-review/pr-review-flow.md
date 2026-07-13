@@ -1,6 +1,6 @@
 ---
 name: pr-review
-schedule: "0 9,13,17 * * mon-fri"   # 09:00, 13:00, 17:00 on weekdays (named DOW avoids APScheduler's 0=Mon off-by-one)
+schedule: "0 23,3,7 * * *"   # 09:00/13:00/17:00 AEST (UTC+10) = 23:00/03:00/07:00 UTC. Daily: weekend fires are cheap no-ops. NOTE: cron is UTC; if you observe AEDT (UTC+11, ~Oct–Apr) shift these -1h.
 agent_profile: pr_review_manager
 provider: kiro_cli
 script: ./pr-review-gate.sh
