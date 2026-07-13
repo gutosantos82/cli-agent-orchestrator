@@ -76,21 +76,15 @@ if ! mkdir "$LOCKDIR" 2>/dev/null; then
   emit
 fi
 
-# --- Clean stale review sessions, then fire the driver DETACHED --------------
+# --- Clean stale review sessions, then fire the detached runner --------------
+# pr-review-run.sh does: notify start -> run driver -> notify outcomes -> release lock.
 for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-' || true); do
   cao shutdown --session "$s" >/dev/null 2>&1 || true
   tmux kill-session -t "$s" 2>/dev/null || true
 done
 
-log "firing driver: ${CAO_PRR_DRIVER_CMD:-run_reviews.sh --limit $LIMIT} (detached) — log: $DRIVER_LOG"
-DRIVER_CMD="${CAO_PRR_DRIVER_CMD:-examples/pr-review/run_reviews.sh --limit '$LIMIT' --repo '$REPO'}"
-setsid nohup bash -c "
-  cd '$REPO_ROOT'
-  echo \"=== driver run started \$(date -u +%FT%TZ) ===\"
-  $DRIVER_CMD
-  echo \"=== driver run finished \$(date -u +%FT%TZ) ===\"
-  rm -rf '$REPO_ROOT/$LOCKDIR'
-" >> "$DRIVER_LOG" 2>&1 &
+log "firing driver for:$([ -n "$needed" ] && echo " $needed") (detached) — log: $DRIVER_LOG"
+setsid nohup "$SCRIPT_DIR/pr-review-run.sh" $needed >> "$DRIVER_LOG" 2>&1 &
 disown 2>/dev/null || true
 
 emit
