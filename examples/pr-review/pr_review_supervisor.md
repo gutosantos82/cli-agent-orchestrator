@@ -230,6 +230,8 @@ severity unless they break a user-facing contract.
 > urgency: <high|medium|low>      # how soon a human should look: security/breakage/blocking-others → high
 > importance: <high|medium|low>   # blast radius: core src (providers/, services/) → high; docs/tests-only → low
 > verdict: "<Approve|Approve with nits|Request changes>"
+> needs_human: <true|false>       # true = an APPROVE here should be human-read before it's posted
+> needs_human_reason: "<short why, only when needs_human: true>"
 > summary: "<one sentence — the headline a triager reads on the card>"
 > ---
 >
@@ -238,7 +240,13 @@ severity unless they break a user-facing contract.
 > ```
 >
 > Base `urgency`/`importance` on what the five reviewers found (a blocking security finding
-> → high urgency; a docs-only change → low importance). Then end your turn with a one-line
+> → high urgency; a docs-only change → low importance). Set **`needs_human: true`** when the
+> verdict is `Approve`/`Approve with nits` AND any of: the diff touches sensitive paths
+> (`providers/` status-detection, auth/credentials/security, the tool-permission/`--yolo`
+> surface, release/CI — `.github/`, `pyproject.toml`, `uv.lock`, or core `constants.py`/
+> `server.py`); the reviewers materially disagreed; or the diff is large. Otherwise
+> `needs_human: false` (a `Request changes`/comment is low blast-radius and rarely needs it).
+> Then end your turn with a one-line
 > confirmation. Do not do Steps 5–6.
 
 ### Step 5 — HUMAN GATE 1: present the report, wait

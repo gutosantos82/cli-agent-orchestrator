@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Publish CAO pr-review verdicts to GitHub with an APPROVE guard.
+#
+# Why: `Request changes` / comments are low blast-radius (feedback the author can
+# weigh). An `approve` is you vouching, under your name, that a PR on a PUBLIC repo
+# is merge-ready — and it counts toward reviewDecision=APPROVED. So this script will
+# REFUSE to auto-approve a PR whose diff touches sensitive paths or is large, unless
+# you explicitly ack it (having actually read it). request-changes/comments post freely.
+#
+# Verdict comes from each report's frontmatter (verdict: Approve|Approve with nits|
+# Request changes|<comment>). You still pass the explicit PR list — this never scans
+# and posts on its own (preserves the human-confirmation rule).
+#
+# Usage:
+#   publish_reviews.sh [--repo R] [--dry-run] [--ack "PR..."] \
+#                      [--max-lines N] [--max-files N] PR [PR...]
+#
+#   --dry-run   print the action per PR, post nothing
+#   --ack "N M" PRs you have read and consciously allow to auto-approve despite the guard
+#   --max-lines additions+deletions above which an approve is gated (default 400)
+#   --max-files changed files above which an approve is gated (default 15)
+#
+# Env overrides: CAO_PRR_SENSITIVE_RE (extended regex over changed file paths).
+set -uo pipefail
+
+REPO="awslabs/cli-agent-orchestrator"
+DRY_RUN=0
+ACK_LIST=" "
+MAX_LINES="${CAO_PRR_MAX_LINES:-400}"
+MAX_FILES="${CAO_PRR_MAX_FILES:-15}"
+
+# Paths that make an approve "needs-human". Tuned for this repo: provider status
+# detection, auth/credentials/security, tool-permission surface, and release/CI.
+SENSITIVE_RE="${CAO_PRR_SENSITIVE_RE:-src/cli_agent_orchestrator/providers/|auth|cred|secret|token|oauth|security|midway|permission|allowed_?tools|yolo|(^|/)\.github/|pyproject\.toml|uv\.lock|RELEASING|constants\.py|mcp_server/server\.py}"
+
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)      REPO="$2"; shift 2 ;;
+    --dry-run)   DRY_RUN=1; shift ;;
+    --ack)       ACK_LIST=" $2 "; shift 2 ;;
+    --max-lines) MAX_LINES="$2"; shift 2 ;;
+    --max-files) MAX_FILES="$2"; shift 2 ;;
+    -* ) echo "unknown option: $1" >&2; exit 2 ;;
+    * )  args+=("$1"); shift ;;
+  esac
+done
+[[ ${#args[@]} -gt 0 ]] || { echo "usage: publish_reviews.sh [opts] PR [PR...]" >&2; exit 2; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
+DATA_DIR="pr-review-data"
+[[ -f "$DATA_DIR/state.json" ]] || echo '{}' > "$DATA_DIR/state.json"
+
+strip_fm(){ awk 'BEGIN{c=0} /^---[[:space:]]*$/{c++;next} c>=2{print}' "$1"; }
+verdict_of(){ awk -F': ' '/^verdict:/{gsub(/"/,"",$2); print $2; exit}' "$1"; }
+
+acted_any=0
+for pr in "${args[@]}"; do
+  head="$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)"
+  f="$DATA_DIR/reviews/${pr}-${head}.md"
+  if [[ -z "$head" ]]; then echo "#$pr SKIP: could not resolve head"; continue; fi
+  # Stale-head guard: only ever post a report that matches the CURRENT head.
+  if [[ ! -f "$f" ]]; then
+    echo "#$pr SKIP: no report at current head ${head:0:7} — re-review before posting"; continue
+  fi
+
+  verdict="$(verdict_of "$f")"
+  case "$verdict" in
+    *"Request changes"*) action=request-changes; act=requested ;;
+    *Approve*)           action=approve;         act=approved  ;;
+    *)                   action=comment;         act=commented ;;
+  esac
+
+  # --- APPROVE guard -------------------------------------------------------
+  if [[ "$action" == approve ]]; then
+    files="$(gh pr view "$pr" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null)"
+    read -r adds dels nfiles < <(gh pr view "$pr" --repo "$REPO" \
+      --json additions,deletions,changedFiles --jq '"\(.additions) \(.deletions) \(.changedFiles)"' 2>/dev/null)
+    lines=$(( ${adds:-0} + ${dels:-0} ))
+    hit="$(echo "$files" | grep -Ei "$SENSITIVE_RE" | head -5 | paste -sd, - 2>/dev/null || true)"
+    reason=""
+    [[ -n "$hit" ]] && reason="sensitive paths: $hit"
+    if (( lines > MAX_LINES )) || (( ${nfiles:-0} > MAX_FILES )); then
+      reason="${reason:+$reason; }large diff (${lines} lines, ${nfiles:-?} files)"
+    fi
+    if [[ -n "$reason" ]] && [[ "$ACK_LIST" != *" $pr "* ]]; then
+      echo "#$pr HOLD: approve gated — $reason"
+      echo "        Read the diff, then re-run with: --ack \"$pr\"  (or downgrade to a comment)"
+      continue
+    fi
+    [[ "$ACK_LIST" == *" $pr "* ]] && echo "#$pr approve ACKed by operator"
+  fi
+
+  # --- Post ---------------------------------------------------------------
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "#$pr [dry-run] would $action at ${head:0:7} (verdict: ${verdict:-none})"
+    continue
+  fi
+
+  strip_fm "$f" > "/tmp/rev_${pr}.md"
+  if [[ "$action" == comment ]]; then
+    posted=$(gh pr comment "$pr" --repo "$REPO" --body-file "/tmp/rev_${pr}.md" && echo ok || echo fail)
+  else
+    posted=$(gh pr review "$pr" --repo "$REPO" "--$action" --body-file "/tmp/rev_${pr}.md" && echo ok || echo fail)
+  fi
+  if [[ "$posted" == ok ]]; then
+    echo "#$pr -> POSTED ($act) at ${head:0:7}"
+    jq --arg p "$pr" --arg a "$act" --arg s "$head" --arg t "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
+       '.[$p]=((.[$p]//{})+{acted:$a,acted_sha:$s,acted_at:$t})' \
+       "$DATA_DIR/state.json" > /tmp/st.json && mv /tmp/st.json "$DATA_DIR/state.json"
+    acted_any=1
+  else
+    echo "#$pr -> FAILED to post"
+  fi
+done
+
+# Verify what actually landed on GitHub
+if [[ "$DRY_RUN" -eq 0 && "$acted_any" -eq 1 ]]; then
+  me="$(gh api user --jq .login 2>/dev/null)"
+  echo "--- verify (latest review state by $me) ---"
+  for pr in "${args[@]}"; do
+    gh api "repos/$REPO/pulls/$pr/reviews" \
+      --jq '[.[]|select(.user.login=="'"$me"'")]|last|"#'"$pr"' -> \(.state)"' 2>/dev/null || true
+  done
+fi
