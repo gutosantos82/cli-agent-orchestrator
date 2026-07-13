@@ -1,5 +1,6 @@
 ---
 name: consistency_reviewer
+model: claude-opus-4.8
 description: Reviews a CAO pull request diff from the CONSISTENCY & DRIFT angle — doc/comment↔code drift, PR-description↔implementation mismatches, cross-provider interface consistency, dead/unused code, out-of-scope changes, and committed generated artifacts. Sends findings back to the supervisor via send_message.
 role: reviewer
 skills: [cao-pr-review]

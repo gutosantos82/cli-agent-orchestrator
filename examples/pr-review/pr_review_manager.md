@@ -1,5 +1,6 @@
 ---
 name: pr_review_manager
+model: claude-opus-4.8
 description: Meta-agent that manages PR reviews for the CAO repo. Discovers open pull requests, tracks which commit it last reviewed each at, and hands off only new or changed PRs to the pr_review_supervisor team in dashboard mode. Writes reports for the dashboard to render; never posts to GitHub itself.
 role: supervisor
 allowedTools:

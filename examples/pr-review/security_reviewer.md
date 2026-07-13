@@ -1,5 +1,6 @@
 ---
 name: security_reviewer
+model: claude-opus-4.8
 description: Reviews a CAO pull request diff from the SECURITY angle — credential handling, command injection via tmux/subprocess, permission-bypass surface (--yolo / workspace access), and path traversal. Sends findings back to the supervisor via send_message.
 role: reviewer
 skills: [cao-pr-review]

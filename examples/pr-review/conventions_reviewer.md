@@ -1,5 +1,6 @@
 ---
 name: conventions_reviewer
+model: claude-opus-4.8
 description: Reviews a CAO pull request diff from the CONVENTIONS angle — inclusive language, Conventional Commits, CHANGELOG, pyproject/uv.lock sync, project structure, the provider/plugin file checklist, and CI-gate expectations. Sends findings back to the supervisor via send_message.
 role: reviewer
 skills: [cao-pr-review]

@@ -1,5 +1,6 @@
 ---
 name: correctness_reviewer
+model: claude-opus-4.8
 description: Reviews a CAO pull request diff from the CORRECTNESS angle — logic errors, edge cases, async/race conditions, error paths, and (for provider changes) terminal status-detection logic. Sends findings back to the supervisor via send_message.
 role: reviewer
 skills: [cao-pr-review]

@@ -1,5 +1,6 @@
 ---
 name: verifier
+model: claude-opus-4.8
 description: Dynamically verifies a CAO pull request by running its tests in the PR worktree and exercising the changed behavior with concrete examples — as opposed to the static reviewers that only read the diff. Runs tests, writes and runs meaningful example cases against the change, attempts to exercise the feature end-to-end, and reports pass/fail evidence back to the supervisor via send_message.
 role: developer
 allowedTools:

@@ -1,5 +1,6 @@
 ---
 name: tests_reviewer
+model: claude-opus-4.8
 description: Reviews a CAO pull request diff from the TESTS angle — whether new behavior ships with tests, correct pytest markers, mocked tmux_client, fixtures, and coverage of the changed lines. Sends findings back to the supervisor via send_message.
 role: reviewer
 skills: [cao-pr-review]
