@@ -43,14 +43,36 @@ fi
 echo "=== driver run finished $(date -u +%FT%TZ) ==="
 
 # --- build the outcomes summary from the just-reviewed PRs' reports ----------
+# Extract a frontmatter scalar by key, handling inline values ("x" / x) AND
+# YAML block scalars (>, >-, |, |-) whose text sits on following indented lines.
+fm_scalar() {  # $1=file  $2=key
+  awk -v key="$2" '
+    /^---[[:space:]]*$/ { fm++; if (fm==1){infm=1; next} else if (fm==2){exit} }
+    infm && !inblock {
+      if ($0 ~ "^" key ":[[:space:]]*") {
+        rest=$0; sub("^" key ":[[:space:]]*","",rest)
+        if (rest ~ /^[|>][+-]?[[:space:]]*$/) { inblock=1; next }   # block scalar
+        gsub(/^["'"'"']|["'"'"']$/,"",rest); print rest; exit       # inline: strip quotes
+      }
+      next
+    }
+    inblock {
+      if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*:/) { print val; exit }      # next top-level key
+      line=$0; sub(/^[[:space:]]+/,"",line)
+      val=(val=="" ? line : val " " line)
+    }
+    END { if (inblock) print val }
+  ' "$1"
+}
+
 summary="✅ CAO PR-review complete — $(date -u +%FT%TZ)"
 for pr in $needed; do
   head="$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)"
   f="$DATA_DIR/reviews/${pr}-${head}.md"
   if [ -f "$f" ]; then
-    v="$(awk -F': ' '/^verdict:/{gsub(/"/,"",$2);print $2;exit}' "$f")"
-    nh="$(awk -F': ' '/^needs_human:/{gsub(/[ "]/,"",$2);print $2;exit}' "$f")"
-    s="$(awk -F': ' '/^summary:/{gsub(/"/,"",$2);print $2;exit}' "$f")"
+    v="$(fm_scalar "$f" verdict)"
+    nh="$(fm_scalar "$f" needs_human)"
+    s="$(fm_scalar "$f" summary)"
     flag=""; [ "$nh" = "true" ] && flag=" ⚠️needs-human"
     summary="$summary
 
