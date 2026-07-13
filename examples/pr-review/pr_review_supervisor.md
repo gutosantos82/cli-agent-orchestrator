@@ -248,6 +248,13 @@ severity unless they break a user-facing contract.
 > `needs_human: false` (a `Request changes`/comment is low blast-radius and rarely needs it).
 > Then end your turn with a one-line
 > confirmation. Do not do Steps 5–6.
+>
+> **Operator-only notes (kept out of GitHub):** you MAY add a final section headed exactly
+> `## Notes for the human publisher` for guidance meant only for the person deciding whether to
+> publish (why `needs_human`, publish/merge caveats, stale-head warnings). The publish step
+> (`publish_reviews.sh`) **strips this section before posting**, so it never reaches the public
+> PR comment — but it stays in the report file and the dashboard. Keep all public-facing review
+> content ABOVE this heading; put nothing public inside it.
 
 ### Step 5 — HUMAN GATE 1: present the report, wait
 

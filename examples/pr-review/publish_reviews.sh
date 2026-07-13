@@ -54,6 +54,17 @@ DATA_DIR="pr-review-data"
 [[ -f "$DATA_DIR/state.json" ]] || echo '{}' > "$DATA_DIR/state.json"
 
 strip_fm(){ awk 'BEGIN{c=0} /^---[[:space:]]*$/{c++;next} c>=2{print}' "$1"; }
+# Drop internal, human-only sections so they never reach the public PR comment.
+# Removes any level-2 (## ) section whose heading looks like operator guidance,
+# from that heading up to the next level-2 heading or EOF (### subheadings inside
+# it are NOT treated as boundaries). Kept in the report itself (dashboard shows it).
+strip_human_notes(){ awk '
+  /^##[[:space:]]/{
+    if (tolower($0) ~ /notes? for the human|human publisher|publisher note|do not post|internal[ -]only|reviewer note/) { skip=1; next }
+    skip=0
+  }
+  !skip { print }
+'; }
 verdict_of(){ awk -F': ' '/^verdict:/{gsub(/"/,"",$2); print $2; exit}' "$1"; }
 
 acted_any=0
@@ -99,7 +110,7 @@ for pr in "${args[@]}"; do
     continue
   fi
 
-  strip_fm "$f" > "/tmp/rev_${pr}.md"
+  strip_fm "$f" | strip_human_notes > "/tmp/rev_${pr}.md"
   if [[ "$action" == comment ]]; then
     posted=$(gh pr comment "$pr" --repo "$REPO" --body-file "/tmp/rev_${pr}.md" && echo ok || echo fail)
   else
