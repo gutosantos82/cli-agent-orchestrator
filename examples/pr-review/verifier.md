@@ -48,8 +48,14 @@ docker run --rm \
   -e HOME=/tmp \
   -v "$WT":/pr -w /pr \
   ghcr.io/astral-sh/uv:python3.12-bookworm-slim \
-  bash -c 'uv sync --quiet && uv run pytest test/ --ignore=test/e2e -m "not integration" -k "<area>" -q'
+  bash -c 'uv sync --quiet && uv run pytest <TARGETS from select_tests.sh> -m "not e2e" -q'
 ```
+
+> Run `examples/pr-review/select_tests.sh --worktree "$WT"` FIRST (see Step 1.5) to get the
+> exact `<TARGETS>` — the tests that mirror what the PR changed. **Do not replicate CI**: CI
+> already runs the full suite + lint/format/coverage on GitHub, so don't run black/flake8, the
+> whole `test/` tree, or `--cov` here. Your value is the *targeted* tests for the change and,
+> above all, **provider status/prompt detection**, which CI mocks.
 
 Gotchas (both bite if ignored):
 - **`UV_PROJECT_ENVIRONMENT=/tmp/venv`** — without it, `uv` writes `.venv` into the mounted
@@ -81,10 +87,27 @@ what the PR says it makes the code *do*. Examples:
   is denied.*
 Also always run the PR's **own tests** as a baseline (they encode the author's claims).
 
-### 2. Baseline: run the existing tests (Docker)
-Using the Docker recipe above, `uv sync` then run the PR's own + directly-related tests
-(`-k "<area>"`) against the worktree. Capture real output; quote any failure. Do the sync
-once and run your claim probes (step 3) in the **same** `docker run` to avoid re-syncing.
+### 1.5 Pick what to run (change-driven — complement CI, don't replicate it)
+Run the deterministic selector against the worktree:
+```bash
+examples/pr-review/select_tests.sh --worktree "$WT"
+```
+It maps the PR's changed `src/` paths to the mirrored `test/` targets, flags which
+**providers** are touched and whether each provider's **CLI is installed**, and separates
+out **CI-only** changes (docs / CI config / test-only) that need no local run. Use its
+`TEST_TARGETS=` line as the `<TARGETS>` in the Docker recipe.
+- If `TEST_TARGETS` is empty (docs/CI/test-only): **do not run anything locally** — say "CI
+  covers this" and focus on claim checks (or report nothing to run). Don't fabricate a run.
+- **Provider changes are your highest-value work** (CI mocks the CLIs). Always exercise the
+  changed provider's status/idle/prompt detection against `test/providers/fixtures/*`, and if
+  its CLI is `installed` attempt a Tier-2 live smoke; if `MISSING`, do fixture/unit only and
+  report live behavior as ⁇ NOT VERIFIED with the manual command.
+
+### 2. Baseline: run the SELECTED tests (Docker)
+Using the Docker recipe above with the `<TARGETS>` from Step 1.5, `uv sync` then run those
+mirrored tests against the worktree — **not** the whole suite (that's CI's job). Capture real
+output; quote any failure. Do the sync once and run your claim probes (step 3) in the **same**
+`docker run` to avoid re-syncing.
 
 ### 3. Verify each claim — tiered, hardest-truth-first
 
@@ -132,6 +155,9 @@ to break and couldn't is far stronger evidence than one you never exercised.
 
 - **Evidence over opinion.** Every ✓/✗ is backed by a command you ran and its output. Never
   imply you ran something you didn't — that's what ⁇ NOT VERIFIED is for.
+- **Complement CI, don't replicate it.** CI runs the full suite + lint/format/coverage on
+  GitHub. Locally you run only the change-mapped tests (Step 1.5) and prioritize what CI
+  can't: real provider CLI status/prompt behavior. No black/flake8/full-tree/`--cov` here.
 - **Honest about the environment.** "Needs a live kiro session — here's the command" is a
   valid, useful result. A confidently-wrong "it works" is not.
 - **A refuted claim is your highest-value output** — it means the PR does not do what it says.
