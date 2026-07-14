@@ -151,6 +151,14 @@ The **verifier is never the one you block on** — if the static angles are in b
 verifier hasn't returned, synthesize and note "_dynamic verification did not return._" Its
 evidence is a bonus, not a gate.
 
+**You do NOT run the code or tests yourself.** Dynamic verification is exclusively the
+verifier's job. NEVER run the test suite from your own session — and never the *full* suite
+via the local `~/cli-agent-orchestrator/.venv` (it carries pre-existing environment failures
+unrelated to any PR, so it produces misleading "N failed" noise and burns 8–10 min per run).
+If the verifier didn't return, write "_dynamic verification did not return._" — do NOT
+substitute your own test run. You may read files in the worktree; leave all execution to the
+verifier (which uses change-selected targets in a clean Docker toolchain).
+
 Before ending ANY turn, ask: "Do I hold findings AND have nothing pending?" If yes, you
 must synthesize instead of ending idle. When in doubt, synthesize — a report always beats
 a parked session.

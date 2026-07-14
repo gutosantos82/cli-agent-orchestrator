@@ -91,8 +91,10 @@ for pr in "${args[@]}"; do
       --json additions,deletions,changedFiles --jq '"\(.additions) \(.deletions) \(.changedFiles)"' 2>/dev/null)
     lines=$(( ${adds:-0} + ${dels:-0} ))
     hit="$(echo "$files" | grep -Ei "$SENSITIVE_RE" | head -5 | paste -sd, - 2>/dev/null || true)"
+    nh="$(awk -F': ' '/^needs_human:/{gsub(/[ "]/,"",$2);print $2;exit}' "$f")"
     reason=""
-    [[ -n "$hit" ]] && reason="sensitive paths: $hit"
+    [[ "$nh" == "true" ]] && reason="report flagged needs_human"
+    [[ -n "$hit" ]] && reason="${reason:+$reason; }sensitive paths: $hit"
     if (( lines > MAX_LINES )) || (( ${nfiles:-0} > MAX_FILES )); then
       reason="${reason:+$reason; }large diff (${lines} lines, ${nfiles:-?} files)"
     fi
