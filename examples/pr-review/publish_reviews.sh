@@ -26,6 +26,7 @@ set -uo pipefail
 REPO="awslabs/cli-agent-orchestrator"
 DRY_RUN=0
 AS_COMMENT=0
+ACTION_OVERRIDE=""
 ACK_LIST=" "
 MAX_LINES="${CAO_PRR_MAX_LINES:-400}"
 MAX_FILES="${CAO_PRR_MAX_FILES:-15}"
@@ -40,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --repo)      REPO="$2"; shift 2 ;;
     --dry-run)   DRY_RUN=1; shift ;;
     --as-comment) AS_COMMENT=1; shift ;;
+    --action)    ACTION_OVERRIDE="$2"; shift 2 ;;
     --ack)       ACK_LIST=" $2 "; shift 2 ;;
     --max-lines) MAX_LINES="$2"; shift 2 ;;
     --max-files) MAX_FILES="$2"; shift 2 ;;
@@ -88,6 +90,17 @@ for pr in "${args[@]}"; do
   # --as-comment: post the review body as a plain comment regardless of verdict
   # (used by the Telegram "Comment" button — no approval, no guard).
   if [[ "$AS_COMMENT" -eq 1 ]]; then action=comment; act=commented; fi
+  # --action: explicit human-chosen action (dashboard/Telegram click == consent).
+  # Stale-head + notes-stripping still apply; approve bypasses the hold since the
+  # click IS the ack.
+  if [[ -n "$ACTION_OVERRIDE" ]]; then
+    case "$ACTION_OVERRIDE" in
+      approve) action=approve;         act=approved;  ACK_LIST="$ACK_LIST$pr " ;;
+      request) action=request-changes; act=requested ;;
+      comment) action=comment;         act=commented ;;
+      *) echo "#$pr SKIP: bad --action '$ACTION_OVERRIDE'"; continue ;;
+    esac
+  fi
 
   # --- APPROVE guard -------------------------------------------------------
   if [[ "$action" == approve ]]; then

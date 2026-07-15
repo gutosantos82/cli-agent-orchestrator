@@ -30,6 +30,11 @@ import uvicorn
 
 STATE = {"repo": "", "data_dir": Path("."), "execute": False}
 
+# Route dashboard actions through the guarded publisher (stale-head re-check,
+# human-notes stripping, state.json sync) instead of raw gh.
+REPO_ROOT = Path(__file__).resolve().parents[3]
+PUBLISH_SCRIPT = str(Path(__file__).resolve().parents[1] / "publish_reviews.sh")
+
 URGENCY_RANK = {"high": 0, "medium": 1, "low": 2, "": 3}
 URGENCY_COLOR = {"high": "#cf222e", "medium": "#9a6700", "low": "#1a7f37"}
 IMPORTANCE_COLOR = {"high": "#8250df", "medium": "#0969da", "low": "#656d76"}
@@ -229,24 +234,25 @@ def api_prs() -> JSONResponse:
 @app.post("/api/action")
 async def api_action(req: Request) -> JSONResponse:
     d = await req.json()
-    pr, sha, action, body = str(d["pr"]), str(d.get("sha", "")), d["action"], d.get("body", "")
+    pr, action = str(d["pr"]), d["action"]
     repo = STATE["repo"]
-    if action == "approve":
-        res = run_gh(["pr", "review", pr, "--repo", repo, "--approve",
-                      "--body", body or "Approved after multi-angle CAO review."])
-        recorded = "approved"
-    elif action == "request":
-        res = run_gh(["pr", "review", pr, "--repo", repo, "--request-changes",
-                      "--body", body or "Changes requested — see review."])
-        recorded = "requested"
-    elif action == "comment":
-        res = run_gh(["pr", "comment", pr, "--repo", repo, "--body", body])
-        recorded = "commented"
-    else:
+    if action not in ("approve", "request", "comment"):
         return JSONResponse({"ok": False, "output": f"unknown action {action}"}, status_code=400)
-    if res["ok"]:
-        record_action(pr, sha, recorded)
-    return JSONResponse(res)
+    # Guarded path: publish_reviews.sh re-checks the current head, strips
+    # operator-only notes, posts the report body, and syncs state.json. The
+    # dashboard click == consent (approve bypasses the needs_human/size hold, as
+    # with the Telegram button), but stale-head safety is preserved.
+    cmd = ["bash", PUBLISH_SCRIPT, "--repo", repo, "--action", action, pr]
+    if not STATE["execute"]:
+        return JSONResponse({"ok": True, "output": f"[DRY-RUN] would run: {' '.join(cmd)}"})
+    try:
+        r = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=120)
+        blob = (r.stdout + r.stderr).strip()
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"ok": False, "output": str(e)})
+    ok = "POSTED (" in blob
+    # publish_reviews.sh already synced state.json on success; surface the tail.
+    return JSONResponse({"ok": ok, "output": blob[-800:] or ("done" if ok else "no output")})
 
 
 def pill(text: str, color: str) -> str:
