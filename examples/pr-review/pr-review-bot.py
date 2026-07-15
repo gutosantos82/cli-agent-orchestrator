@@ -37,6 +37,50 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "pr-review-data"
 OFFSET_FILE = DATA_DIR / ".telegram_offset"
 PUBLISH = str(REPO_ROOT / "examples/pr-review/publish_reviews.sh")
+REPO = os.environ.get("CAO_PRR_REPO", "awslabs/cli-agent-orchestrator")
+
+
+def current_head(pr):
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "view", pr, "--repo", REPO, "--json", "headRefOid", "--jq", ".headRefOid"],
+            cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=30,
+        )
+        return out.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def current_verdict(pr):
+    """(verdict_str_or_None, head). None verdict = no report at current head."""
+    head = current_head(pr)
+    if not head:
+        return None, ""
+    f = DATA_DIR / "reviews" / f"{pr}-{head}.md"
+    if not f.is_file():
+        return None, head
+    infm = False
+    fences = 0
+    for line in f.read_text().splitlines():
+        if line.strip() == "---":
+            fences += 1
+            infm = fences == 1
+            if fences >= 2:
+                break
+            continue
+        if infm and line.startswith("verdict:"):
+            return line.split(":", 1)[1].strip().strip("\"'"), head
+    return "", head
+
+
+def verdict_code(v):
+    if not v:
+        return None
+    if "Request changes" in v:
+        return "r"
+    if "Approve" in v:
+        return "a"
+    return "c"
 
 
 def _ssl_ctx():
@@ -132,6 +176,8 @@ def run_publish(args):
     blob = out.stdout + out.stderr
     if "POSTED (approved)" in blob:
         return True, "✅ Approved & posted"
+    if "POSTED (requested)" in blob:
+        return True, "🔁 Request-changes posted"
     if "POSTED (commented)" in blob:
         return True, "💬 Posted as comment"
     if "SKIP: no report at current head" in blob:
@@ -157,14 +203,29 @@ def handle_callback(cq):
         api("answerCallbackQuery", callback_query_id=cq_id)
         return
     parts = data.split(":")
-    if len(parts) != 3:
+    if len(parts) < 3:
         api("answerCallbackQuery", callback_query_id=cq_id, text="bad data")
         return
-    _, pr, action = parts
-    print(f"[bot] callback pr=#{pr} action={action}", file=sys.stderr)
+    pr, action = parts[1], parts[2]
+    expected = parts[3] if len(parts) > 3 else ""
+    print(f"[bot] callback pr=#{pr} action={action} expected={expected}", file=sys.stderr)
 
-    if action == "approve":
-        ok, outcome = run_publish(["--ack", pr, pr])
+    if action == "post":
+        # Confirm-the-verdict: re-check the CURRENT head's verdict and post it
+        # only if it still matches what the message showed (a=approve, r=request).
+        verdict, head = current_verdict(pr)
+        vc = verdict_code(verdict)
+        if verdict is None:
+            ok, outcome = False, "⚠️ head moved / no current report — will be re-reviewed"
+        elif vc != expected:
+            shown = {"a": "Approve", "r": "Request changes"}.get(expected, expected)
+            ok, outcome = False, f"⚠️ verdict changed to '{verdict or '?'}' (you confirmed {shown}) — not posted, re-check"
+        elif expected == "a":
+            ok, outcome = run_publish(["--ack", pr, pr])
+        elif expected == "r":
+            ok, outcome = run_publish([pr])  # request-changes posts without the approve guard
+        else:
+            ok, outcome = False, "unknown verdict code"
     elif action == "comment":
         ok, outcome = run_publish(["--as-comment", pr])
     elif action == "skip":

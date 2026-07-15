@@ -45,6 +45,13 @@ for pr in "$@"; do
   [ "${#summ}" -gt 500 ] && summ="${summ:0:500}…"
   flag=""; [ "$nh" = "true" ] && flag="  ⚠️ needs_human"
   url="https://github.com/${REPO}/pull/${pr}"
+  # Primary button + callback reflect the actual verdict. The bot re-checks the
+  # current-head verdict on tap and only posts if it still matches this code.
+  case "$verdict" in
+    *"Request changes"*) primary='{"text":"🔁 Request changes & post","callback_data":"prr:'"$pr"':post:r"}' ;;
+    *Approve*)           primary='{"text":"✅ Approve & post","callback_data":"prr:'"$pr"':post:a"}' ;;
+    *)                   primary='{"text":"💬 Post as comment","callback_data":"prr:'"$pr"':comment"}' ;;
+  esac
   text="🔷 Decision needed — PR #${pr}
 ${title}
 Verdict: ${verdict}${flag}
@@ -53,7 +60,7 @@ ${summ}
 
 ${url}"
 
-  kb='{"inline_keyboard":[[{"text":"✅ Approve & post","callback_data":"prr:'"$pr"':approve"},{"text":"💬 Comment","callback_data":"prr:'"$pr"':comment"},{"text":"🛑 Skip","callback_data":"prr:'"$pr"':skip"}]]}'
+  kb='{"inline_keyboard":[['"$primary"',{"text":"💬 Comment","callback_data":"prr:'"$pr"':comment"},{"text":"🛑 Skip","callback_data":"prr:'"$pr"':skip"}]]}'
 
   if curl -sS --max-time 15 "https://api.telegram.org/bot${TOKEN}/sendMessage" \
        --data-urlencode "chat_id=${CHAT}" \
