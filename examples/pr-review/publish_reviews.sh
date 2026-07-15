@@ -58,13 +58,15 @@ DATA_DIR="pr-review-data"
 [[ -f "$DATA_DIR/state.json" ]] || echo '{}' > "$DATA_DIR/state.json"
 
 strip_fm(){ awk 'BEGIN{c=0} /^---[[:space:]]*$/{c++;next} c>=2{print}' "$1"; }
-# Drop internal, human-only sections so they never reach the public PR comment.
-# Removes any level-2 (## ) section whose heading looks like operator guidance,
-# from that heading up to the next level-2 heading or EOF (### subheadings inside
-# it are NOT treated as boundaries). Kept in the report itself (dashboard shows it).
+# Drop internal, dashboard-only sections so they never reach the public PR comment.
+# The posted comment and the dashboard view are intentionally DIFFERENT: the dashboard
+# shows the full report (triage context), the comment shows only what's useful to the PR
+# author/maintainers. Removes any level-2 (## ) section whose heading is dashboard-only
+# (operator notes, "prior feedback / already raised" restatements, publish-guard notes),
+# from that heading up to the next level-2 heading or EOF. Kept in the report file itself.
 strip_human_notes(){ awk '
   /^##[[:space:]]/{
-    if (tolower($0) ~ /notes? for the human|human publisher|publisher note|do not post|internal[ -]only|reviewer note/) { skip=1; next }
+    if (tolower($0) ~ /notes? for the human|human publisher|publisher note|do not post|internal[ -]only|reviewer note|prior feedback|already raised|publish[ -]?guard/) { skip=1; next }
     skip=0
   }
   !skip { print }

@@ -284,6 +284,15 @@ severity unless they break a user-facing contract.
 > (`publish_reviews.sh`) **strips this section before posting**, so it never reaches the public
 > PR comment — but it stays in the report file and the dashboard. Keep all public-facing review
 > content ABOVE this heading; put nothing public inside it.
+>
+> **The posted comment and the dashboard are DIFFERENT views.** The dashboard shows the full
+> report (triage context); the GitHub comment shows only what helps the PR author/maintainers.
+> `publish_reviews.sh` strips these **dashboard-only** sections from the comment (kept in the
+> report for the dashboard): `## Notes for the human publisher`, `## Prior feedback (already
+> raised …)`, and `## Publish-guard assessment`. So put reviewer-dedup/"already raised"
+> restatements under `## Prior feedback` (dashboard-only) — the public comment should carry
+> only your **net-new** findings + verdict, never process/meta or restatements of what others
+> already said.
 
 ### Step 5 — HUMAN GATE 1: present the report, wait
 
