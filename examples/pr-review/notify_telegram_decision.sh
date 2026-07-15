@@ -42,7 +42,7 @@ for pr in "$@"; do
 
   title="$(fm "$f" title)"; verdict="$(fm "$f" verdict)"
   nh="$(fm "$f" needs_human)"; summ="$(fm "$f" summary)"
-  [ "${#summ}" -gt 500 ] && summ="${summ:0:500}…"
+  [ "${#summ}" -gt 3500 ] && summ="${summ:0:3500}…"
   flag=""; [ "$nh" = "true" ] && flag="  ⚠️ needs_human"
   url="https://github.com/${REPO}/pull/${pr}"
   # Primary button + callback reflect the actual verdict. The bot re-checks the
