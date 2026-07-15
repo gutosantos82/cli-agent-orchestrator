@@ -269,6 +269,15 @@ severity unless they break a user-facing contract.
 > Then end your turn with a one-line
 > confirmation. Do not do Steps 5–6.
 >
+> **Keep triage/operator language OUT of the public body (the whole report gets posted to
+> GitHub).** The `## Verdict` and every other body section are for the PR author and
+> maintainers — write them about the *code/PR only*. NEVER put in the body: the `needs_human`
+> flag or its reasoning, "a human should skim/decide", publish-guard/`--ack` mechanics,
+> dashboard/tooling references, or anything about our review process. All of that goes ONLY in
+> the frontmatter `needs_human_reason` (stripped before posting) and/or the
+> `## Notes for the human publisher` section (also stripped). If you catch yourself writing
+> "needs_human" or "a human should…" inside the Verdict, move it to those stripped locations.
+>
 > **Operator-only notes (kept out of GitHub):** you MAY add a final section headed exactly
 > `## Notes for the human publisher` for guidance meant only for the person deciding whether to
 > publish (why `needs_human`, publish/merge caveats, stale-head warnings). The publish step

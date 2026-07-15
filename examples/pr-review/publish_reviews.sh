@@ -69,6 +69,11 @@ strip_human_notes(){ awk '
   }
   !skip { print }
 '; }
+# Backstop: drop any line that references internal review tooling / operator
+# triage so it can never reach a public PR review, even if the model slips it
+# into the body instead of the (stripped) Notes section. High-precision tokens
+# only — these never legitimately belong in a code review comment.
+scrub_operator(){ grep -viE 'needs_human|--ack|publish[ _-]?guard|publish_reviews\.sh|dashboard will hold|for the ack|re-review before posting|a human should (skim|decide|look|read|review)'; }
 verdict_of(){ awk -F': ' '/^verdict:/{gsub(/"/,"",$2); print $2; exit}' "$1"; }
 
 acted_any=0
@@ -130,7 +135,7 @@ for pr in "${args[@]}"; do
     continue
   fi
 
-  strip_fm "$f" | strip_human_notes > "/tmp/rev_${pr}.md"
+  strip_fm "$f" | strip_human_notes | scrub_operator > "/tmp/rev_${pr}.md"
   if [[ "$action" == comment ]]; then
     posted=$(gh pr comment "$pr" --repo "$REPO" --body-file "/tmp/rev_${pr}.md" && echo ok || echo fail)
   else
