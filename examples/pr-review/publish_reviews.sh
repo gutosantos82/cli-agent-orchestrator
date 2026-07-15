@@ -25,6 +25,7 @@ set -uo pipefail
 
 REPO="awslabs/cli-agent-orchestrator"
 DRY_RUN=0
+AS_COMMENT=0
 ACK_LIST=" "
 MAX_LINES="${CAO_PRR_MAX_LINES:-400}"
 MAX_FILES="${CAO_PRR_MAX_FILES:-15}"
@@ -38,6 +39,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --repo)      REPO="$2"; shift 2 ;;
     --dry-run)   DRY_RUN=1; shift ;;
+    --as-comment) AS_COMMENT=1; shift ;;
     --ack)       ACK_LIST=" $2 "; shift 2 ;;
     --max-lines) MAX_LINES="$2"; shift 2 ;;
     --max-files) MAX_FILES="$2"; shift 2 ;;
@@ -83,6 +85,9 @@ for pr in "${args[@]}"; do
     *Approve*)           action=approve;         act=approved  ;;
     *)                   action=comment;         act=commented ;;
   esac
+  # --as-comment: post the review body as a plain comment regardless of verdict
+  # (used by the Telegram "Comment" button — no approval, no guard).
+  if [[ "$AS_COMMENT" -eq 1 ]]; then action=comment; act=commented; fi
 
   # --- APPROVE guard -------------------------------------------------------
   if [[ "$action" == approve ]]; then

@@ -87,3 +87,16 @@ done
 
 printf '%s\n' "$summary" | "$NOTIFY" || true
 echo "$summary"
+
+# For approves the guard would HOLD (needs_human / sensitive / large), send a
+# per-PR Telegram decision message with Approve/Comment/Skip buttons. The
+# pr-review-bot.py daemon acts on the tap. Reuses the guard via --dry-run so the
+# "held" set is exactly what would be gated at publish time.
+if [ -n "$needed" ]; then
+  held="$(examples/pr-review/publish_reviews.sh --dry-run $needed 2>/dev/null \
+           | awk '/HOLD: approve gated/{n=$1; sub(/^#/,"",n); print n}')"
+  if [ -n "$held" ]; then
+    echo "=== decision messages for held approves: $held ===" >&2
+    examples/pr-review/notify_telegram_decision.sh $held || true
+  fi
+fi
