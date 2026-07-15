@@ -217,6 +217,18 @@ comments; anything that overlaps goes under Prior feedback. If a maintainer alre
 finding you'd have blocked on, still reflect it in the Verdict reasoning (the PR isn't
 mergeable), but credit them rather than re-deriving it.
 
+**Never approve over an open maintainer condition (HARD RULE).** If a *human* maintainer has
+left review feedback or a stated pre-approval condition (e.g. "happy to approve once X is
+addressed", or an unresolved review thread) that is **unaddressed at the current head**, you
+MUST NOT return a plain `Approve`/`Approve with nits` — no matter how minor you judge the item.
+Instead either: (a) verdict = `Request changes`, restating the maintainer's open item under
+Prior feedback; or (b) if you genuinely believe it is minor, keep the nit but set
+`needs_human: true` with `needs_human_reason` naming the unaddressed maintainer condition, so a
+human — not you — decides. Your approval must never override or unblock a human maintainer's
+open ask: an independent Approve can flip GitHub's `reviewDecision` to APPROVED and enable a
+merge the maintainer intended to gate. (This rule is triggered only by **human** maintainers;
+unaddressed **bot** comments — Copilot/CodeQL — do not trigger it, though you still report them.)
+
 Classify each finding as **introduced** by this PR vs. **pre-existing**; never block on
 pre-existing issues.
 
