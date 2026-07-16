@@ -19,6 +19,7 @@ Safety:
 import argparse
 import html
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -34,6 +35,37 @@ STATE = {"repo": "", "data_dir": Path("."), "execute": False}
 # human-notes stripping, state.json sync) instead of raw gh.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PUBLISH_SCRIPT = str(Path(__file__).resolve().parents[1] / "publish_reviews.sh")
+
+# Level-2 sections that publish_reviews.sh strips from the posted comment — kept in
+# the report for the dashboard only. Must mirror strip_human_notes in publish_reviews.sh.
+DASHBOARD_ONLY_RE = re.compile(
+    r"notes? for the human|human publisher|publisher note|do not post|internal[ -]only|"
+    r"reviewer note|prior feedback|already raised|publish[ -]?guard",
+    re.I,
+)
+
+
+def render_body_marked(body: str) -> str:
+    """Render the report markdown, wrapping each dashboard-only section (the ones
+    NOT posted to GitHub) in a visually-distinct block so the human can see at a
+    glance what reaches the PR vs what stays on the dashboard."""
+    if not body:
+        return "<p><em>Deep review pending — metadata only so far.</em></p>"
+    out = []
+    for seg in re.split(r"(?m)^(?=##\s)", body):
+        if not seg.strip():
+            continue
+        first = seg.lstrip().splitlines()[0]
+        rendered = md.markdown(seg, extensions=["fenced_code", "tables"])
+        if first.startswith("##") and DASHBOARD_ONLY_RE.search(first):
+            out.append(
+                '<div class="dash-only"><div class="dash-only-tag">'
+                '🔒 dashboard-only · not posted to GitHub</div>'
+                f'{rendered}</div>'
+            )
+        else:
+            out.append(rendered)
+    return "".join(out)
 
 URGENCY_RANK = {"high": 0, "medium": 1, "low": 2, "": 3}
 URGENCY_COLOR = {"high": "#cf222e", "medium": "#9a6700", "low": "#1a7f37"}
@@ -175,8 +207,7 @@ def list_prs() -> list[dict]:
             "code_changed": meta.get("code_changed", False),
             "human_activity": meta.get("human_activity", False),
             # review body + action state
-            "html": md.markdown(body, extensions=["fenced_code", "tables"]) if body
-                    else "<p><em>Deep review pending — metadata only so far.</em></p>",
+            "html": render_body_marked(body),
             "raw": body,
             "acted": st.get("acted"),
             "acted_sha": st.get("acted_sha"),
@@ -399,6 +430,10 @@ def render_page(prs: list[dict]) -> str:
   .badge.done {{ background:#dafbe1; color:#1a7f37; }} .badge.stale {{ background:#fff1e5; color:#9a6700; }}
   .badge.reviewed {{ background:#ddf4ff; color:#0969da; }}
   .badge.pending {{ background:#f6f8fa; color:#656d76; border:1px solid #d0d7de; }}
+  .dash-only {{ opacity:0.7; background:repeating-linear-gradient(45deg,#f6f8fa,#f6f8fa 10px,#eef1f4 10px,#eef1f4 20px);
+                border:1px dashed #adb5bd; border-radius:8px; padding:6px 12px; margin:10px 0; }}
+  .dash-only-tag {{ font-size:11px; font-weight:600; color:#6e7781; text-transform:uppercase;
+                    letter-spacing:.4px; margin-bottom:4px; }}
   .empty {{ color:#656d76; text-align:center; padding:40px; }}
   /* detail overlay */
   .overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,.45); z-index:10; }}
