@@ -389,7 +389,8 @@ def render_page(prs: list[dict]) -> str:
                  data-f-ci="{r['ci'] or 'none'}"
                  data-f-verdict="{('request' if 'request' in (r['verdict'] or '').lower() else 'approve' if 'approve' in (r['verdict'] or '').lower() else 'none')}"
                  data-f-status="{'reviewed' if r['has_review'] else 'pending'}"
-                 data-f-acted="{'acted' if r['acted'] else 'unacted'}"
+                 data-f-acted="{'acted' if (r['acted'] and not r['stale']) else 'unacted'}"
+                 data-f-pending="{'yes' if (r['has_review'] and not r['code_changed'] and not (r['acted'] and not r['stale'])) else 'no'}"
                  data-f-attention="{'code' if r['code_changed'] else 'discussion' if r['human_activity'] else 'none'}"
                  data-f-text="{html.escape((str(r['pr']) + ' ' + (r['title'] or '') + ' ' + (r['author'] or '')).lower())}"
                  onclick="openDetail(this)">
@@ -480,7 +481,8 @@ def render_page(prs: list[dict]) -> str:
   <select id="f-ci" onchange="applyFilters()"><option value="">CI: any</option><option>passing</option><option>failing</option><option>pending</option><option value="none">none</option></select>
   <select id="f-verdict" onchange="applyFilters()"><option value="">verdict: any</option><option value="request">request changes</option><option value="approve">approve</option></select>
   <select id="f-status" onchange="applyFilters()"><option value="">review: any</option><option value="reviewed">reviewed</option><option value="pending">pending</option></select>
-  <select id="f-acted" onchange="applyFilters()"><option value="">action: any</option><option value="unacted">not acted</option><option value="acted">acted</option></select>
+  <select id="f-acted" onchange="applyFilters()"><option value="">action: any</option><option value="unacted">not acted (at head)</option><option value="acted">acted</option></select>
+  <select id="f-pending" onchange="applyFilters()"><option value="">pending: any</option><option value="yes">⚡ pending my decision</option></select>
   <select id="f-attention" onchange="applyFilters()"><option value="">attention: any</option><option value="code">🔁 code changed</option><option value="discussion">💬 discussion</option></select>
   <button id="f-reset" onclick="resetFilters()">reset</button>
   <span id="f-count"></span>
@@ -536,6 +538,7 @@ document.addEventListener('keydown', e => {{ if(e.key==='Escape') closeDetail();
 const FILTERS = [
   ['f-urgency','fUrgency'], ['f-ci','fCi'], ['f-verdict','fVerdict'],
   ['f-status','fStatus'], ['f-acted','fActed'], ['f-attention','fAttention'],
+  ['f-pending','fPending'],
 ];
 function applyFilters() {{
   const text = document.getElementById('f-text').value.trim().toLowerCase();
