@@ -378,6 +378,15 @@ def render_page(prs: list[dict]) -> str:
                 when_short = f" · {r['acted_at'][5:10]}"        # MM-DD in the badge
             acted_badge = (f'<span class="badge {cls}" title="{html.escape(when_full)}">'
                            f'{r["acted"]}{when_short}{extra}</span>')
+        # Verdict badge — rendered from frontmatter so it's always visible, even
+        # when the report body has no "## Verdict" section (e.g. #428).
+        verdict_badge = ""
+        if r["verdict"]:
+            _vl = r["verdict"].lower()
+            _vc = ("#cf222e" if "request" in _vl else "#9a6700" if "nits" in _vl
+                   else "#1a7f37" if "approve" in _vl else "#6e7781")
+            verdict_badge = (f'<span class="badge" style="background:{_vc};color:#fff">'
+                             f'{html.escape(r["verdict"])}</span>')
         cards.append(f"""
         <article class="card" data-pr="{r['pr']}" data-sha="{r['sha']}"
                  data-raw="{html.escape(json.dumps(r['raw']))}"
@@ -394,7 +403,7 @@ def render_page(prs: list[dict]) -> str:
                  data-f-attention="{'code' if r['code_changed'] else 'discussion' if r['human_activity'] else 'none'}"
                  data-f-text="{html.escape((str(r['pr']) + ' ' + (r['title'] or '') + ' ' + (r['author'] or '')).lower())}"
                  onclick="openDetail(this)">
-          <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{acted_badge}</span></div>
+          <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{verdict_badge}{acted_badge}</span></div>
           <h3>{html.escape(r['title'])}</h3>
           <p class="summary">{html.escape(r['summary'] or r['verdict'] or '')}</p>
           <div class="flags">{''.join(flags)}</div>
