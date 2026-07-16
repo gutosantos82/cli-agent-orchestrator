@@ -106,6 +106,22 @@ reap_finished() {
 # parked supervisor kept reading as "active" and never got nudged (the original bug). We strip
 # the volatile chrome first — the status bar's ticking "Midway:" timer, the box rules, and the
 # prompt line — which change on their own even when the agent is idle. A live agent still moves
+# Deliver a message to a review session's supervisor. Prefer `cao session send`
+# (tracked, structured); if that fails — e.g. the terminal reads as status
+# 'unknown' so cao-server refuses delivery — fall back to typing the task straight
+# into the supervisor pane (:0), which the kiro TUI accepts regardless of the
+# detected status. Keeps task delivery resilient to status-detection glitches.
+deliver_task() {
+  local sess="$1" text="$2"
+  cao session send "$sess" "$text" --async >/dev/null 2>&1 && return 0
+  if tmux has-session -t "$sess" 2>/dev/null; then
+    tmux send-keys -t "${sess}:0" "$text"; sleep 1; tmux send-keys -t "${sess}:0" Enter
+    echo "    ($sess: cao send failed — delivered via direct pane input)"
+    return 0
+  fi
+  return 1
+}
+
 # the fingerprint (new transcript lines, or a ticking spinner); a parked one is static.
 watchdog_nudge() {
   local now; now="$(date +%s)"
@@ -127,9 +143,9 @@ watchdog_nudge() {
     [[ "$n" -ge "$MAX_NUDGES" ]] && continue
     NUDGES[$pr]=$((n+1)); IDLE_SINCE[$pr]="$now"                      # reset timer after nudging
     echo "  ⏰ watchdog: #$pr idle ${WATCHDOG_SECS}s w/o report — nudge $((n+1))/$MAX_NUDGES"
-    cao session send "$s" \
+    deliver_task "$s" \
       "Check your inbox now. If you hold findings from any reviewers, synthesize the report immediately with what you have (name any missing angle) and write it to ${DATA_DIR}/reviews/${pr}-${sha}.md with the YAML frontmatter (title, urgency, importance, verdict, summary), then remove the worktree. Do not wait for more reviewers." \
-      --async >/dev/null 2>&1 || true
+      || true
   done
 }
 
@@ -286,8 +302,8 @@ for i in "${!PRS[@]}"; do
        --session-name "prr-${pr}" >/dev/null 2>&1; then
     sleep 12   # let the supervisor finish booting before sending the task
     LAUNCH_SHA[$pr]="$sha"
-    cao session send "cao-prr-${pr}" "$msg" --async >/dev/null 2>&1 \
-      || echo "    (send for #$pr failed — check 'cao session status cao-prr-${pr}')"
+    deliver_task "cao-prr-${pr}" "$msg" \
+      || echo "    (delivery for #$pr failed — check 'tmux ls')"
   else
     echo "    (launch for #$pr failed — check 'tmux ls')"
   fi
