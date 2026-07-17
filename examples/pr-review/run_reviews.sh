@@ -194,10 +194,34 @@ write_meta() {
   # Bot accounts (codecov, dependabot, github-actions, copilot) are excluded so their
   # automated comments don't masquerade as human engagement.
   local act comments reviews code_changed human_activity rev_epoch
-  act="$(gh pr view "$pr" --repo "$REPO" --json comments,reviews 2>/dev/null || echo '{}')"
+  act="$(gh pr view "$pr" --repo "$REPO" --json comments,reviews,mergeable,reviewDecision,reviewRequests 2>/dev/null || echo '{}')"
   comments="$(jq -r '(.comments|length) // 0' <<<"$act" 2>/dev/null || echo 0)"
   reviews="$(jq -r '(.reviews|length) // 0' <<<"$act" 2>/dev/null || echo 0)"
   code_changed=false; human_activity=false
+
+  # --- Human-engagement + mergeability signals (surfaced on the dashboard) ---
+  #   mergeable        : MERGEABLE / CONFLICTING / UNKNOWN  (CONFLICTING = clashes with base)
+  #   review_decision  : GitHub's rollup — APPROVED / CHANGES_REQUESTED / REVIEW_REQUIRED
+  #   human_reviewers  : deduped non-bot reviewers -> their LATEST review state
+  #   last_human       : latest non-bot comment/review note (author + snippet)
+  # These let the dashboard warn when a human is already reviewing, a human decision
+  # disagrees with our verdict, or the PR no longer merges cleanly.
+  local mergeable review_decision human_reviewers last_human
+  mergeable="$(jq -r '.mergeable // "UNKNOWN"' <<<"$act" 2>/dev/null || echo UNKNOWN)"
+  review_decision="$(jq -r '.reviewDecision // ""' <<<"$act" 2>/dev/null || echo "")"
+  human_reviewers="$(jq -c '
+    def is_bot($l): ($l|ascii_downcase)|test("bot|codecov|dependabot|github-actions|copilot");
+    [ .reviews[]? | {login:(.author.login//""), state:.state, at:.submittedAt}
+      | select(.login!="" and (is_bot(.login)|not)) ]
+    | group_by(.login) | map(max_by(.at)) | map({login, state})' <<<"$act" 2>/dev/null || echo '[]')"
+  [[ -n "$human_reviewers" ]] || human_reviewers='[]'
+  last_human="$(jq -c '
+    def is_bot($l): ($l|ascii_downcase)|test("bot|codecov|dependabot|github-actions|copilot");
+    [ (.comments[]?, .reviews[]?) | {login:(.author.login//""), body:(.body//""), at:(.createdAt//.submittedAt)}
+      | select(.login!="" and (is_bot(.login)|not) and ((.body//"")|length)>0) ]
+    | (sort_by(.at) | last) // null
+    | if .==null then null else {login, at, note:((.body|gsub("[\r\n]+";" "))[:200])} end' <<<"$act" 2>/dev/null || echo 'null')"
+  [[ -n "$last_human" ]] || last_human='null'
 
   # code_changed: a review exists at an OLDER sha but NOT at the current head sha.
   if [[ ! -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]] && ls "$DATA_DIR/reviews/${pr}-"*.md >/dev/null 2>&1; then
@@ -228,10 +252,14 @@ write_meta() {
     --arg ci "$ci" --argjson labels "$labels" \
     --argjson comments "${comments:-0}" --argjson reviews "${reviews:-0}" \
     --argjson code_changed "$code_changed" --argjson human_activity "$human_activity" \
+    --arg mergeable "$mergeable" --arg review_decision "$review_decision" \
+    --argjson human_reviewers "$human_reviewers" --argjson last_human "$last_human" \
     '{title:$title,size:$size,additions:$additions,deletions:$deletions,files:$files,
       days_waiting:$days_waiting,author:$author,author_merged_prs:$author_merged_prs,
       ci:$ci,labels:$labels,comments:$comments,reviews:$reviews,
-      code_changed:$code_changed,human_activity:$human_activity,draft:false}' \
+      code_changed:$code_changed,human_activity:$human_activity,
+      mergeable:$mergeable,review_decision:$review_decision,
+      human_reviewers:$human_reviewers,last_human:$last_human,draft:false}' \
     > "$DATA_DIR/meta/${pr}-${sha}.json"
 }
 

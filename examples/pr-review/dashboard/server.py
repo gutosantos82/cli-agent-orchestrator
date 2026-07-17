@@ -206,6 +206,11 @@ def list_prs() -> list[dict]:
             "reviews_count": meta.get("reviews"),
             "code_changed": meta.get("code_changed", False),
             "human_activity": meta.get("human_activity", False),
+            # human-engagement + mergeability signals
+            "mergeable": meta.get("mergeable", ""),
+            "review_decision": meta.get("review_decision", ""),
+            "human_reviewers": meta.get("human_reviewers", []) or [],
+            "last_human": meta.get("last_human"),
             # review body + action state
             "html": render_body_marked(body),
             "raw": body,
@@ -387,6 +392,34 @@ def render_page(prs: list[dict]) -> str:
                    else "#1a7f37" if "approve" in _vl else "#6e7781")
             verdict_badge = (f'<span class="badge" style="background:{_vc};color:#fff">'
                              f'{html.escape(r["verdict"])}</span>')
+        # --- Human-engagement + mergeability badges (deterministic GitHub signals) ---
+        signal_badges = ""
+        conflicting = str(r["mergeable"]).upper() == "CONFLICTING"
+        if conflicting:
+            signal_badges += '<span class="badge" style="background:#cf222e;color:#fff" title="Head conflicts with the base branch">⚠️ conflicts</span>'
+        rd = (r["review_decision"] or "").upper()
+        who = ", ".join(sorted({hr.get("login", "") for hr in (r["human_reviewers"] or []) if hr.get("login")}))
+        who_e = html.escape(who)
+        if rd == "APPROVED":
+            signal_badges += f'<span class="badge" style="background:#1a7f37;color:#fff" title="A human approved this PR on GitHub">👤 human-approved{(" · " + who_e) if who else ""}</span>'
+        elif rd == "CHANGES_REQUESTED":
+            signal_badges += f'<span class="badge" style="background:#cf222e;color:#fff" title="A human requested changes on GitHub">👤 human: changes requested{(" · " + who_e) if who else ""}</span>'
+        elif who:
+            signal_badges += f'<span class="badge" style="background:#0969da;color:#fff" title="A human is already reviewing this PR">👤 reviewing: {who_e}</span>'
+        # verdict-vs-human mismatch: our verdict disagrees with the human decision.
+        _vlow = (r["verdict"] or "").lower()
+        mismatch = ((rd == "APPROVED" and "request" in _vlow)
+                    or (rd == "CHANGES_REQUESTED" and "approve" in _vlow))
+        if mismatch:
+            signal_badges += '<span class="badge" style="background:#bf3989;color:#fff" title="Our verdict disagrees with the human review decision on GitHub">⚠️ verdict vs human</span>'
+        has_human = bool(who) or rd in ("APPROVED", "CHANGES_REQUESTED")
+        # latest human comment/review note
+        last_human_line = ""
+        lh = r["last_human"]
+        if isinstance(lh, dict) and lh.get("note"):
+            _when = (lh.get("at") or "")[:10]
+            last_human_line = (f'<p class="lasthuman">💬 <b>{html.escape(lh.get("login",""))}</b>'
+                               f'{(" · " + _when) if _when else ""}: {html.escape(lh["note"])}</p>')
         cards.append(f"""
         <article class="card" data-pr="{r['pr']}" data-sha="{r['sha']}"
                  data-raw="{html.escape(json.dumps(r['raw']))}"
@@ -401,11 +434,15 @@ def render_page(prs: list[dict]) -> str:
                  data-f-acted="{'acted' if (r['acted'] and not r['stale']) else 'unacted'}"
                  data-f-pending="{'yes' if (r['has_review'] and not r['code_changed'] and not (r['acted'] and not r['stale'])) else 'no'}"
                  data-f-attention="{'code' if r['code_changed'] else 'discussion' if r['human_activity'] else 'none'}"
+                 data-f-conflicts="{'yes' if conflicting else 'no'}"
+                 data-f-human="{'yes' if has_human else 'no'}"
+                 data-f-mismatch="{'yes' if mismatch else 'no'}"
                  data-f-text="{html.escape((str(r['pr']) + ' ' + (r['title'] or '') + ' ' + (r['author'] or '')).lower())}"
                  onclick="openDetail(this)">
-          <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{verdict_badge}{acted_badge}</span></div>
+          <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{verdict_badge}{signal_badges}{acted_badge}</span></div>
           <h3>{html.escape(r['title'])}</h3>
           <p class="summary">{html.escape(r['summary'] or r['verdict'] or '')}</p>
+          {last_human_line}
           <div class="flags">{''.join(flags)}</div>
         </article>""")
     grid = "\n".join(cards) or "<p class='empty'>No reviews yet. Run the pr_review_manager.</p>"
@@ -433,6 +470,7 @@ def render_page(prs: list[dict]) -> str:
   .num {{ color:#656d76; font-size:13px; font-weight:600; }}
   .card h3 {{ font-size:14px; margin:6px 0; line-height:1.35; }}
   .summary {{ font-size:13px; color:#57606a; margin:0 0 10px; max-height:3em; overflow:hidden; }}
+  .lasthuman {{ font-size:12px; color:#3b3b6a; background:#f3f0ff; border-left:3px solid #8250df; padding:4px 8px; margin:0 0 8px; border-radius:0 4px 4px 0; max-height:3.4em; overflow:hidden; }}
   .flags {{ display:flex; flex-wrap:wrap; gap:5px; }}
   .pill {{ color:#fff; font-size:11px; padding:2px 8px; border-radius:10px; white-space:nowrap; }}
   .badges {{ display:flex; gap:4px; }}
@@ -493,6 +531,9 @@ def render_page(prs: list[dict]) -> str:
   <select id="f-acted" onchange="applyFilters()"><option value="">action: any</option><option value="unacted">not acted (at head)</option><option value="acted">acted</option></select>
   <select id="f-pending" onchange="applyFilters()"><option value="">pending: any</option><option value="yes">⚡ pending my decision</option></select>
   <select id="f-attention" onchange="applyFilters()"><option value="">attention: any</option><option value="code">🔁 code changed</option><option value="discussion">💬 discussion</option></select>
+  <select id="f-conflicts" onchange="applyFilters()"><option value="">merge: any</option><option value="yes">⚠️ conflicts</option></select>
+  <select id="f-human" onchange="applyFilters()"><option value="">human review: any</option><option value="yes">👤 has human reviewer</option></select>
+  <select id="f-mismatch" onchange="applyFilters()"><option value="">mismatch: any</option><option value="yes">⚠️ verdict vs human</option></select>
   <button id="f-reset" onclick="resetFilters()">reset</button>
   <span id="f-count"></span>
 </div>
@@ -548,6 +589,7 @@ const FILTERS = [
   ['f-urgency','fUrgency'], ['f-ci','fCi'], ['f-verdict','fVerdict'],
   ['f-status','fStatus'], ['f-acted','fActed'], ['f-attention','fAttention'],
   ['f-pending','fPending'],
+  ['f-conflicts','fConflicts'], ['f-human','fHuman'], ['f-mismatch','fMismatch'],
 ];
 function applyFilters() {{
   const text = document.getElementById('f-text').value.trim().toLowerCase();
