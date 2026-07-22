@@ -267,6 +267,24 @@ def api_prs() -> JSONResponse:
     return JSONResponse(list_prs())
 
 
+@app.get("/api/graph")
+def api_graph() -> JSONResponse:
+    """Serve the prebuilt PR relationship graph (from build_pr_graph.sh)."""
+    f = data() / "graph.json"
+    if not f.exists():
+        return JSONResponse({"nodes": [], "edges": [], "counts": {},
+                             "error": "graph.json not found — run examples/pr-review/build_pr_graph.sh"})
+    try:
+        return JSONResponse(json.loads(f.read_text()))
+    except json.JSONDecodeError as e:
+        return JSONResponse({"nodes": [], "edges": [], "counts": {}, "error": str(e)})
+
+
+@app.get("/graph", response_class=HTMLResponse)
+def graph_page() -> str:
+    return render_graph_page()
+
+
 @app.post("/api/action")
 async def api_action(req: Request) -> JSONResponse:
     d = await req.json()
@@ -520,7 +538,7 @@ def render_page(prs: list[dict]) -> str:
   .secbar .seclist li {{ margin:2px 0; }}
   .secbar .secpath {{ color:#57606a; font-family:ui-monospace,monospace; font-size:11px; }}
 </style></head><body>
-<div class="topbar"><h1>CAO PR Triage · {STATE['repo']} · {len(prs)} open</h1><span class="mode {mode_cls}">{mode}</span></div>
+<div class="topbar"><h1>CAO PR Triage · {STATE['repo']} · {len(prs)} open</h1><a href="/graph" style="color:#fff;text-decoration:none;font-size:13px;border:1px solid #ffffff55;padding:3px 10px;border-radius:12px;margin-left:12px">🕸 relationship graph</a><span class="mode {mode_cls}">{mode}</span></div>
 {sec_banner}
 <div class="filterbar">
   <input class="search" id="f-text" type="search" placeholder="search # / title / author…" oninput="applyFilters()">
@@ -631,6 +649,225 @@ async function act(action) {{
   }} catch(e) {{ result.className='result err'; result.textContent=String(e); }}
 }}
 </script></body></html>"""
+
+
+_GRAPH_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>CAO PR Graph — __REPO__</title>
+<style>
+  html,body { margin:0; height:100%; font:14px/1.4 -apple-system,system-ui,sans-serif; background:#0d1117; color:#e6edf3; overflow:hidden; }
+  .topbar { position:fixed; top:0; left:0; right:0; height:44px; background:#161b22; border-bottom:1px solid #30363d; display:flex; align-items:center; gap:16px; padding:0 16px; z-index:10; }
+  .topbar h1 { font-size:15px; margin:0; font-weight:600; }
+  .topbar a { color:#58a6ff; text-decoration:none; font-size:13px; }
+  .topbar .meta { color:#8b949e; font-size:12px; margin-left:auto; }
+  .panel { position:fixed; top:56px; left:12px; width:230px; background:#161b22ee; border:1px solid #30363d; border-radius:8px; padding:12px 14px; z-index:9; font-size:12.5px; max-height:calc(100vh - 72px); overflow:auto; }
+  .panel h3 { margin:2px 0 8px; font-size:12px; text-transform:uppercase; letter-spacing:.5px; color:#8b949e; }
+  .panel label { display:flex; align-items:center; gap:7px; padding:3px 0; cursor:pointer; }
+  .panel .sect { margin-bottom:12px; border-bottom:1px solid #21262d; padding-bottom:10px; }
+  .panel input[type=search] { width:100%; box-sizing:border-box; background:#0d1117; border:1px solid #30363d; color:#e6edf3; border-radius:6px; padding:5px 8px; }
+  .legrow { display:flex; align-items:center; gap:8px; padding:2px 0; }
+  .dot { width:12px; height:12px; border-radius:50%; flex:none; }
+  .dia { width:11px; height:11px; flex:none; transform:rotate(45deg); border:2px solid #e3a008; }
+  .ln { width:20px; height:0; flex:none; border-top-width:2px; border-top-style:solid; }
+  svg { position:fixed; inset:0; width:100vw; height:100vh; }
+  #tip { position:fixed; pointer-events:none; background:#161b22; border:1px solid #30363d; border-radius:6px; padding:8px 10px; font-size:12px; max-width:320px; z-index:20; display:none; box-shadow:0 4px 16px #0008; }
+  #tip b { color:#58a6ff; }
+  #tip .k { color:#8b949e; }
+  .node circle, .node polygon { cursor:pointer; stroke:#0d1117; stroke-width:1.5; }
+  .node text { font-size:9px; fill:#c9d1d9; pointer-events:none; text-anchor:middle; }
+  .hint { color:#8b949e; font-size:11px; margin-top:6px; }
+  .empty { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; color:#8b949e; text-align:center; padding:40px; }
+</style></head><body>
+<div class="topbar">
+  <h1>CAO PR Relationship Graph</h1>
+  <a href="/">← back to triage board</a>
+  <span class="meta" id="meta"></span>
+</div>
+<div class="panel">
+  <div class="sect">
+    <h3>Edges</h3>
+    <label><input type="checkbox" id="e-reference" checked> references (#N)</label>
+    <label><input type="checkbox" id="e-issue" checked> issue links</label>
+    <label><input type="checkbox" id="e-file-overlap"> file overlap</label>
+  </div>
+  <div class="sect">
+    <h3>Nodes</h3>
+    <label><input type="checkbox" id="n-open" checked> open PRs</label>
+    <label><input type="checkbox" id="n-merged" checked> merged PRs</label>
+    <label><input type="checkbox" id="n-closed" checked> closed PRs</label>
+    <label><input type="checkbox" id="n-issue" checked> issues</label>
+    <label><input type="checkbox" id="only-connected"> hide isolated nodes</label>
+  </div>
+  <div class="sect">
+    <h3>Open-PR class</h3>
+    <div class="legrow"><span class="dot" style="background:#a371f7"></span> follow-up</div>
+    <div class="legrow"><span class="dot" style="background:#58a6ff"></span> builds-on</div>
+    <div class="legrow"><span class="dot" style="background:#3fb950"></span> related</div>
+    <div class="legrow"><span class="dot" style="background:#d29922"></span> new</div>
+    <div class="legrow"><span class="dot" style="background:#6e7681"></span> merged</div>
+    <div class="legrow"><span class="dot" style="background:#f85149"></span> closed</div>
+    <div class="legrow"><span class="dia"></span> issue</div>
+  </div>
+  <div class="sect">
+    <h3>Edge types</h3>
+    <div class="legrow"><span class="ln" style="border-color:#a371f7"></span> follow-up/supersedes</div>
+    <div class="legrow"><span class="ln" style="border-color:#3fb950"></span> fixes/closes</div>
+    <div class="legrow"><span class="ln" style="border-color:#8b949e"></span> refs/mentions</div>
+    <div class="legrow"><span class="ln" style="border-color:#e3a008;border-top-style:dashed"></span> issue link</div>
+    <div class="legrow"><span class="ln" style="border-color:#30474d"></span> file overlap</div>
+  </div>
+  <input type="search" id="search" placeholder="highlight #num or title…">
+  <div class="hint">drag nodes · scroll to zoom · drag bg to pan · click = open on GitHub</div>
+</div>
+<svg id="svg"><g id="vp"><g id="edges"></g><g id="nodes"></g></g>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b949e"/></marker>
+  </defs>
+</svg>
+<div id="tip"></div>
+<script>
+const REPO = "__REPO__";
+const svg = document.getElementById('svg'), vp = document.getElementById('vp');
+const gEdges = document.getElementById('edges'), gNodes = document.getElementById('nodes');
+const tip = document.getElementById('tip');
+const CLS = {'follow-up':'#a371f7','builds-on':'#58a6ff','related':'#3fb950','new':'#d29922'};
+const EK = {'followup':'#a371f7','supersedes':'#a371f7','buildson':'#a371f7','partof':'#a371f7',
+            'fixes':'#3fb950','closes':'#3fb950','refs':'#8b949e','mentions':'#8b949e'};
+let nodes=[], edges=[], byId={}, view={tx:innerWidth/2,ty:innerHeight/2,s:0.8}, alpha=1, dragging=null, panning=null;
+
+function nodeColor(n){
+  if(n.type==='issue') return '#e3a008';
+  if(n.state==='OPEN') return CLS[n.classification]||'#8b949e';
+  if(n.state==='MERGED') return '#6e7681';
+  return '#f85149';
+}
+function nodeR(n){ if(n.type==='issue') return 6; return 6 + Math.min(10, (n.n_files||0)*0.5) + (n.open?2:0); }
+function edgeColor(e){ if(e.type==='file-overlap') return '#30474d'; if(e.type==='issue') return '#e3a008'; return EK[e.kind]||'#8b949e'; }
+
+fetch('/api/graph').then(r=>r.json()).then(g=>{
+  if(g.error || !g.nodes || !g.nodes.length){
+    document.body.insertAdjacentHTML('beforeend','<div class="empty">'+(g.error||'No graph data.')+'<br><br>Run <code>examples/pr-review/build_pr_graph.sh</code> then reload.</div>'); return;
+  }
+  nodes = g.nodes; edges = g.edges;
+  document.getElementById('meta').textContent =
+    (g.counts.prs||0)+' PRs · '+(g.counts.issues||0)+' issues · '+(edges.length)+' edges · '+(g.generated_at||'');
+  const R=Math.min(innerWidth,innerHeight)*0.42;
+  nodes.forEach((n,i)=>{ n.key=String(n.id); byId[n.key]=n;
+    const a=i*2.399; n.x=Math.cos(a)*R*Math.random(); n.y=Math.sin(a)*R*Math.random(); n.vx=0; n.vy=0; n.deg=0; });
+  edges.forEach(e=>{ e.s=byId[String(e.source)]; e.t=byId[String(e.target)];
+    if(e.s&&e.t){ e.s.deg++; e.t.deg++; } });
+  edges = edges.filter(e=>e.s&&e.t);
+  build(); requestAnimationFrame(tick);
+  ['e-reference','e-issue','e-file-overlap','n-open','n-merged','n-closed','n-issue','only-connected']
+    .forEach(id=>document.getElementById(id).addEventListener('change',applyFilters));
+  document.getElementById('search').addEventListener('input',applyFilters);
+  applyFilters();
+});
+
+let lineEls=[], nodeEls=[];
+function build(){
+  gEdges.innerHTML=''; gNodes.innerHTML=''; lineEls=[]; nodeEls=[];
+  edges.forEach(e=>{ const l=document.createElementNS('http://www.w3.org/2000/svg','line');
+    l.setAttribute('stroke',edgeColor(e));
+    l.setAttribute('stroke-width', e.type==='file-overlap'?Math.min(3,0.5+(e.weight||1)/8):1.6);
+    l.setAttribute('stroke-opacity', e.type==='file-overlap'?0.28:0.7);
+    if(e.type==='issue') l.setAttribute('stroke-dasharray','4 3');
+    if(e.type==='reference') l.setAttribute('marker-end','url(#arrow)');
+    e.el=l; gEdges.appendChild(l); lineEls.push(l); });
+  nodes.forEach(n=>{ const g=document.createElementNS('http://www.w3.org/2000/svg','g'); g.setAttribute('class','node');
+    let shape;
+    if(n.type==='issue'){ shape=document.createElementNS('http://www.w3.org/2000/svg','rect');
+      const s=9; shape.setAttribute('width',s); shape.setAttribute('height',s); shape.setAttribute('x',-s/2); shape.setAttribute('y',-s/2);
+      shape.setAttribute('transform','rotate(45)'); }
+    else { shape=document.createElementNS('http://www.w3.org/2000/svg','circle'); shape.setAttribute('r',nodeR(n)); }
+    shape.setAttribute('fill',nodeColor(n));
+    if(n.draft) shape.setAttribute('stroke-dasharray','2 2');
+    g.appendChild(shape);
+    const t=document.createElementNS('http://www.w3.org/2000/svg','text'); t.setAttribute('dy',nodeR(n)+9);
+    t.textContent=(n.type==='issue'?'#'+n.number:'#'+n.id); g.appendChild(t);
+    n.el=g; n.shape=shape;
+    g.addEventListener('mousedown',ev=>startDrag(ev,n));
+    g.addEventListener('mouseenter',ev=>showTip(ev,n));
+    g.addEventListener('mousemove',ev=>{tip.style.left=(ev.clientX+14)+'px';tip.style.top=(ev.clientY+14)+'px';});
+    g.addEventListener('mouseleave',()=>tip.style.display='none');
+    g.addEventListener('click',ev=>{ if(n._moved){n._moved=false;return;}
+      const kind=n.type==='issue'?'issues':'pull'; window.open('https://github.com/'+REPO+'/'+kind+'/'+(n.number||n.id),'_blank'); });
+    gNodes.appendChild(g); nodeEls.push(g); });
+}
+
+function tick(){
+  if(alpha>0.005){
+    const k=alpha;
+    for(let i=0;i<nodes.length;i++){ const a=nodes[i];
+      for(let j=i+1;j<nodes.length;j++){ const b=nodes[j];
+        let dx=a.x-b.x, dy=a.y-b.y, d2=dx*dx+dy*dy||0.01; if(d2>90000) continue;
+        const f=1400/d2; const d=Math.sqrt(d2); const fx=dx/d*f, fy=dy/d*f;
+        a.vx+=fx*k; a.vy+=fy*k; b.vx-=fx*k; b.vy-=fy*k; } }
+    edges.forEach(e=>{ const a=e.s,b=e.t; let dx=b.x-a.x, dy=b.y-a.y, d=Math.sqrt(dx*dx+dy*dy)||0.01;
+      const L = e.type==='file-overlap'?150:90; const str=(e.type==='file-overlap'?0.005:0.03);
+      const f=(d-L)*str*k; const fx=dx/d*f, fy=dy/d*f; a.vx+=fx; a.vy+=fy; b.vx-=fx; b.vy-=fy; });
+    nodes.forEach(n=>{ n.vx+=(-n.x)*0.002*k; n.vy+=(-n.y)*0.002*k;
+      if(n===dragging) return;
+      n.x+=n.vx*=0.85; n.y+=n.vy*=0.85; });
+    alpha*=0.992;
+  }
+  vp.setAttribute('transform','translate('+view.tx+','+view.ty+') scale('+view.s+')');
+  lineEls.forEach((l,i)=>{ const e=edges[i]; l.setAttribute('x1',e.s.x); l.setAttribute('y1',e.s.y); l.setAttribute('x2',e.t.x); l.setAttribute('y2',e.t.y); });
+  nodeEls.forEach((g,i)=>{ const n=nodes[i]; g.setAttribute('transform','translate('+n.x+','+n.y+')'); });
+  requestAnimationFrame(tick);
+}
+
+function applyFilters(){
+  const on={reference:document.getElementById('e-reference').checked, issue:document.getElementById('e-issue').checked, 'file-overlap':document.getElementById('e-file-overlap').checked};
+  const ns={OPEN:document.getElementById('n-open').checked, MERGED:document.getElementById('n-merged').checked, CLOSED:document.getElementById('n-closed').checked};
+  const showIssue=document.getElementById('n-issue').checked;
+  const onlyConn=document.getElementById('only-connected').checked;
+  const q=document.getElementById('search').value.trim().toLowerCase();
+  const vis={};
+  nodes.forEach(n=>{ let v = n.type==='issue'?showIssue:(ns[n.state]!==false);
+    n._vis=v; vis[n.key]=v; });
+  // edge visibility depends on its type toggle AND both endpoints visible
+  const conn={};
+  edges.forEach(e=>{ const v = on[e.type] && vis[e.s.key] && vis[e.t.key];
+    e.el.style.display=v?'':'none'; if(v){conn[e.s.key]=1;conn[e.t.key]=1;} });
+  nodes.forEach(n=>{ let v=n._vis; if(v&&onlyConn&&!conn[n.key]) v=false;
+    let dim=false; if(q){ const hay=('#'+ (n.number||n.id)+' '+(n.title||'')).toLowerCase(); dim = !hay.includes(q); }
+    n.el.style.display=v?'':'none'; n.el.style.opacity=(v&&dim)?0.15:1; });
+  alpha=Math.max(alpha,0.3);
+}
+
+function showTip(ev,n){
+  let h;
+  if(n.type==='issue'){ h='<b>issue #'+n.number+'</b>'; }
+  else { h='<b>PR #'+n.id+'</b> <span class="k">'+n.state+(n.draft?' · draft':'')+'</span><br>'+
+    (n.title||'').replace(/</g,'&lt;')+'<br>'+
+    '<span class="k">@'+(n.author||'?')+(n.classification?' · '+n.classification:'')+(n.verdict?' · '+n.verdict:'')+'</span>'+
+    (n.n_files?'<br><span class="k">'+n.n_files+' files</span>':'')+
+    (Object.keys(n.pr_refs||{}).length?'<br><span class="k">→ refs PR '+Object.entries(n.pr_refs).map(x=>'#'+x[0]+'('+x[1]+')').join(', ')+'</span>':'')+
+    (Object.keys(n.issue_refs||{}).length?'<br><span class="k">→ issue '+Object.keys(n.issue_refs).map(x=>'#'+x).join(', ')+'</span>':''); }
+  tip.innerHTML=h; tip.style.display='block'; tip.style.left=(ev.clientX+14)+'px'; tip.style.top=(ev.clientY+14)+'px';
+}
+
+// ---- interaction: node drag, background pan, zoom ----
+function toWorld(px,py){ return {x:(px-view.tx)/view.s, y:(py-view.ty)/view.s}; }
+function startDrag(ev,n){ ev.stopPropagation(); dragging=n; n._down=[ev.clientX,ev.clientY]; alpha=Math.max(alpha,0.5); }
+svg.addEventListener('mousedown',ev=>{ if(!dragging){ panning=[ev.clientX,ev.clientY,view.tx,view.ty]; } });
+window.addEventListener('mousemove',ev=>{
+  if(dragging){ const w=toWorld(ev.clientX,ev.clientY); dragging.x=w.x; dragging.y=w.y; dragging.vx=0; dragging.vy=0;
+    if(dragging._down && (Math.abs(ev.clientX-dragging._down[0])>3||Math.abs(ev.clientY-dragging._down[1])>3)) dragging._moved=true; }
+  else if(panning){ view.tx=panning[2]+(ev.clientX-panning[0]); view.ty=panning[3]+(ev.clientY-panning[1]); }
+});
+window.addEventListener('mouseup',()=>{ dragging=null; panning=null; });
+svg.addEventListener('wheel',ev=>{ ev.preventDefault(); const f=ev.deltaY<0?1.1:0.9;
+  const wx=(ev.clientX-view.tx)/view.s, wy=(ev.clientY-view.ty)/view.s;
+  view.s=Math.max(0.15,Math.min(4,view.s*f)); view.tx=ev.clientX-wx*view.s; view.ty=ev.clientY-wy*view.s; },{passive:false});
+</script>
+</body></html>"""
+
+
+def render_graph_page() -> str:
+    repo = STATE["repo"] or "awslabs/cli-agent-orchestrator"
+    return _GRAPH_HTML.replace("__REPO__", html.escape(repo))
 
 
 def main() -> None:
