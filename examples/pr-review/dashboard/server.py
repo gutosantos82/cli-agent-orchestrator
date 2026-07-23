@@ -40,7 +40,7 @@ PUBLISH_SCRIPT = str(Path(__file__).resolve().parents[1] / "publish_reviews.sh")
 # the report for the dashboard only. Must mirror strip_human_notes in publish_reviews.sh.
 DASHBOARD_ONLY_RE = re.compile(
     r"notes? for the human|human publisher|publisher note|do not post|internal[ -]only|"
-    r"reviewer note|prior feedback|already raised|publish[ -]?guard",
+    r"reviewer note|prior feedback|already raised|publish[ -]?guard|roadmap|vision fit",
     re.I,
 )
 
@@ -190,6 +190,7 @@ def list_prs() -> list[dict]:
             "urgency": str(fm.get("urgency", "")).lower(),
             "importance": str(fm.get("importance", "")).lower(),
             "verdict": fm.get("verdict", ""),
+            "fit": str(fm.get("fit", "")).lower().strip(),
             "summary": fm.get("summary", "") or ("Review pending…" if not has_review else ""),
             # deterministic fields (from manager metadata)
             "size": meta.get("size", ""),
@@ -410,6 +411,13 @@ def render_page(prs: list[dict]) -> str:
                    else "#1a7f37" if "approve" in _vl else "#6e7781")
             verdict_badge = (f'<span class="badge" style="background:{_vc};color:#fff">'
                              f'{html.escape(r["verdict"])}</span>')
+        # vision/mission fit badge (advisory, from vision_reviewer)
+        fit_badge = ""
+        if r["fit"]:
+            _fc = {"core": "#1a7f37", "adjacent": "#0969da",
+                   "scope-creep": "#9a6700", "off-mission": "#cf222e"}.get(r["fit"], "#6e7781")
+            fit_badge = (f'<span class="badge" style="background:{_fc};color:#fff" '
+                         f'title="Strategic fit vs CAO vision (advisory)">🎯 {html.escape(r["fit"])}</span>')
         # --- Human-engagement + mergeability badges (deterministic GitHub signals) ---
         signal_badges = ""
         conflicting = str(r["mergeable"]).upper() == "CONFLICTING"
@@ -455,9 +463,10 @@ def render_page(prs: list[dict]) -> str:
                  data-f-conflicts="{'yes' if conflicting else 'no'}"
                  data-f-human="{'yes' if has_human else 'no'}"
                  data-f-mismatch="{'yes' if mismatch else 'no'}"
+                 data-f-fit="{r['fit'] or 'none'}"
                  data-f-text="{html.escape((str(r['pr']) + ' ' + (r['title'] or '') + ' ' + (r['author'] or '')).lower())}"
                  onclick="openDetail(this)">
-          <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{verdict_badge}{signal_badges}{acted_badge}</span></div>
+          <div class="card-top"><span class="num">#{r['pr']}</span><span class="badges">{review_badge}{verdict_badge}{fit_badge}{signal_badges}{acted_badge}</span></div>
           <h3>{html.escape(r['title'])}</h3>
           <p class="summary">{html.escape(r['summary'] or r['verdict'] or '')}</p>
           {last_human_line}
@@ -552,6 +561,7 @@ def render_page(prs: list[dict]) -> str:
   <select id="f-conflicts" onchange="applyFilters()"><option value="">merge: any</option><option value="yes">⚠️ conflicts</option></select>
   <select id="f-human" onchange="applyFilters()"><option value="">human review: any</option><option value="yes">👤 has human reviewer</option></select>
   <select id="f-mismatch" onchange="applyFilters()"><option value="">mismatch: any</option><option value="yes">⚠️ verdict vs human</option></select>
+  <select id="f-fit" onchange="applyFilters()"><option value="">fit: any</option><option value="core">🎯 core</option><option value="adjacent">🎯 adjacent</option><option value="scope-creep">🎯 scope-creep</option><option value="off-mission">🎯 off-mission</option></select>
   <button id="f-reset" onclick="resetFilters()">reset</button>
   <span id="f-count"></span>
 </div>
@@ -607,7 +617,7 @@ const FILTERS = [
   ['f-urgency','fUrgency'], ['f-ci','fCi'], ['f-verdict','fVerdict'],
   ['f-status','fStatus'], ['f-acted','fActed'], ['f-attention','fAttention'],
   ['f-pending','fPending'],
-  ['f-conflicts','fConflicts'], ['f-human','fHuman'], ['f-mismatch','fMismatch'],
+  ['f-conflicts','fConflicts'], ['f-human','fHuman'], ['f-mismatch','fMismatch'], ['f-fit','fFit'],
 ];
 function applyFilters() {{
   const text = document.getElementById('f-text').value.trim().toLowerCase();

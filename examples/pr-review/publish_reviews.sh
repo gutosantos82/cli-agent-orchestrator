@@ -66,7 +66,7 @@ strip_fm(){ awk 'BEGIN{c=0} /^---[[:space:]]*$/{c++;next} c>=2{print}' "$1"; }
 # from that heading up to the next level-2 heading or EOF. Kept in the report file itself.
 strip_human_notes(){ awk '
   /^##[[:space:]]/{
-    if (tolower($0) ~ /notes? for the human|human publisher|publisher note|do not post|internal[ -]only|reviewer note|prior feedback|already raised|publish[ -]?guard/) { skip=1; next }
+    if (tolower($0) ~ /notes? for the human|human publisher|publisher note|do not post|internal[ -]only|reviewer note|prior feedback|already raised|publish[ -]?guard|roadmap|vision fit/) { skip=1; next }
     skip=0
   }
   !skip { print }
