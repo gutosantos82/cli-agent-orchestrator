@@ -481,27 +481,32 @@ def render_page(prs: list[dict]) -> str:
   .topbar h1 {{ font-size:16px; margin:0; }}
   .mode {{ font-size:12px; padding:3px 10px; border-radius:12px; }}
   .mode.dry {{ background:#9a6700; }} .mode.exec {{ background:#cf222e; }}
-  main {{ max-width:1100px; margin:20px auto; padding:0 16px; }}
+  main {{ max-width:1280px; margin:18px auto; padding:0 20px; }}
   .filterbar {{ position:sticky; top:45px; z-index:4; background:#eaeef2; border-bottom:1px solid #d0d7de;
-    padding:8px 20px; display:flex; flex-wrap:wrap; gap:10px; align-items:center; }}
-  .filterbar select, .filterbar input {{ font:13px inherit; padding:4px 8px; border:1px solid #d0d7de; border-radius:6px; background:#fff; }}
-  .filterbar input.search {{ min-width:200px; }}
+    padding:8px 20px; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }}
+  .filterbar select, .filterbar input {{ font:12px inherit; padding:3px 6px; border:1px solid #d0d7de; border-radius:6px; background:#fff; color:#3a4149; }}
+  .filterbar select:hover {{ border-color:#0969da; }}
+  .filterbar input.search {{ min-width:180px; }}
   .filterbar label {{ font-size:12px; color:#57606a; }}
   #f-count {{ margin-left:auto; font-size:12px; color:#57606a; }}
   #f-reset {{ cursor:pointer; border:1px solid #d0d7de; border-radius:6px; padding:4px 10px; background:#fff; font:13px inherit; }}
-  .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:14px; }}
+  .grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; align-items:start; }}
+  @media (max-width:860px) {{ .grid {{ grid-template-columns:1fr; }} }}
   .card.hidden {{ display:none; }}
-  .card {{ background:#fff; border:1px solid #d0d7de; border-radius:8px; padding:14px; cursor:pointer; transition:box-shadow .15s,border-color .15s; }}
-  .card:hover {{ box-shadow:0 3px 12px rgba(0,0,0,.1); border-color:#0969da; }}
-  .card-top {{ display:flex; justify-content:space-between; align-items:center; }}
-  .num {{ color:#656d76; font-size:13px; font-weight:600; }}
-  .card h3 {{ font-size:14px; margin:6px 0; line-height:1.35; }}
-  .summary {{ font-size:13px; color:#57606a; margin:0 0 10px; max-height:3em; overflow:hidden; }}
-  .lasthuman {{ font-size:12px; color:#3b3b6a; background:#f3f0ff; border-left:3px solid #8250df; padding:4px 8px; margin:0 0 8px; border-radius:0 4px 4px 0; max-height:3.4em; overflow:hidden; }}
-  .flags {{ display:flex; flex-wrap:wrap; gap:5px; }}
-  .pill {{ color:#fff; font-size:11px; padding:2px 8px; border-radius:10px; white-space:nowrap; }}
-  .badges {{ display:flex; gap:4px; }}
-  .badge {{ font-size:11px; padding:2px 8px; border-radius:10px; }}
+  .card {{ background:#fff; border:1px solid #d0d7de; border-radius:10px; padding:14px 16px; cursor:pointer; transition:box-shadow .15s,border-color .15s; }}
+  .card:hover {{ box-shadow:0 3px 14px rgba(0,0,0,.1); border-color:#0969da; }}
+  .card-top {{ display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }}
+  .num {{ color:#656d76; font-size:13px; font-weight:700; flex:none; padding-top:2px; }}
+  .card h3 {{ font-size:14.5px; font-weight:600; margin:7px 0 6px; line-height:1.35;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }}
+  .summary {{ font-size:12.5px; color:#57606a; margin:0 0 10px; line-height:1.45;
+    display:-webkit-box; -webkit-line-clamp:3; -webkit-box-orient:vertical; overflow:hidden; }}
+  .lasthuman {{ font-size:12px; color:#3b3b6a; background:#f3f0ff; border-left:3px solid #8250df; padding:5px 9px; margin:0 0 8px; border-radius:0 5px 5px 0;
+    display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }}
+  .flags {{ display:flex; flex-wrap:wrap; gap:4px; margin-top:2px; }}
+  .pill {{ color:#fff; font-size:10.5px; padding:1px 7px; border-radius:9px; white-space:nowrap; opacity:.9; }}
+  .badges {{ display:flex; flex-wrap:wrap; gap:4px; justify-content:flex-end; max-width:62%; }}
+  .badge {{ font-size:11px; padding:2px 8px; border-radius:10px; white-space:nowrap; }}
   .badge.done {{ background:#dafbe1; color:#1a7f37; }} .badge.stale {{ background:#fff1e5; color:#9a6700; }}
   .badge.reviewed {{ background:#ddf4ff; color:#0969da; }}
   .badge.pending {{ background:#f6f8fa; color:#656d76; border:1px solid #d0d7de; }}
