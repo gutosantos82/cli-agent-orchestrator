@@ -158,3 +158,82 @@ class TestSetLearningEnabled:
 
         with pytest.raises(ValueError, match="learning_enabled must be a bool"):
             set_memory_setting("learning_enabled", "yes")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# AC5 — instruction_promotion_enabled: promotion ⊂ learning ⊂ memory
+# ---------------------------------------------------------------------------
+
+
+class TestInstructionPromotionFlag:
+    def test_defaults_to_false(self, settings_file: Path) -> None:
+        from cli_agent_orchestrator.services.settings_service import (
+            is_instruction_promotion_enabled,
+        )
+
+        assert is_instruction_promotion_enabled() is False
+
+    def test_requires_learning_enabled(self, settings_file: Path) -> None:
+        from cli_agent_orchestrator.services.settings_service import (
+            is_instruction_promotion_enabled,
+        )
+
+        # Promotion on but learning off → forced off.
+        settings_file.write_text(json.dumps({"memory": {"instruction_promotion_enabled": True}}))
+        assert is_instruction_promotion_enabled() is False
+
+    def test_full_chain_enabled(self, settings_file: Path) -> None:
+        from cli_agent_orchestrator.services.settings_service import (
+            is_instruction_promotion_enabled,
+        )
+
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "memory": {
+                        "enabled": True,
+                        "learning_enabled": True,
+                        "instruction_promotion_enabled": True,
+                    }
+                }
+            )
+        )
+        assert is_instruction_promotion_enabled() is True
+
+    def test_memory_off_forces_promotion_off(self, settings_file: Path) -> None:
+        from cli_agent_orchestrator.services.settings_service import (
+            is_instruction_promotion_enabled,
+        )
+
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "memory": {
+                        "enabled": False,
+                        "learning_enabled": True,
+                        "instruction_promotion_enabled": True,
+                    }
+                }
+            )
+        )
+        assert is_instruction_promotion_enabled() is False
+
+    def test_env_override(self, settings_file: Path) -> None:
+        from cli_agent_orchestrator.services.settings_service import (
+            is_instruction_promotion_enabled,
+        )
+
+        settings_file.write_text(json.dumps({"memory": {"learning_enabled": True}}))
+        with patch.dict("os.environ", {"CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED": "true"}):
+            assert is_instruction_promotion_enabled() is True
+
+    def test_set_round_trip_and_validation(self, settings_file: Path) -> None:
+        from cli_agent_orchestrator.services.settings_service import (
+            get_memory_settings,
+            set_memory_setting,
+        )
+
+        set_memory_setting("instruction_promotion_enabled", True)
+        assert get_memory_settings()["instruction_promotion_enabled"] is True
+        with pytest.raises(ValueError, match="instruction_promotion_enabled must be a bool"):
+            set_memory_setting("instruction_promotion_enabled", 1)  # type: ignore[arg-type]

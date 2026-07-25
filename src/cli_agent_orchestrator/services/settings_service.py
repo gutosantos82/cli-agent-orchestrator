@@ -302,6 +302,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "flush_threshold": 0.85,
         "lint_enabled": True,
         "learning_enabled": False,
+        "instruction_promotion_enabled": False,
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
@@ -319,6 +320,15 @@ def get_memory_settings() -> Dict[str, Any]:
     env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
     if env_learning is not None and env_learning.strip() != "":
         result["learning_enabled"] = env_learning.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED beats settings.json
+    env_promotion = os.environ.get("CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED")
+    if env_promotion is not None and env_promotion.strip() != "":
+        result["instruction_promotion_enabled"] = env_promotion.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
     # Env-var overlay: CAO_MEMORY_FLUSH_THRESHOLD beats settings.json
     env_threshold = os.environ.get("CAO_MEMORY_FLUSH_THRESHOLD")
@@ -421,6 +431,29 @@ def is_learning_enabled() -> bool:
         return False
 
 
+def is_instruction_promotion_enabled() -> bool:
+    """Return True when learned-lesson promotion into profile files is enabled.
+
+    Precedence: CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED env var >
+    memory.instruction_promotion_enabled in settings.json > default (False).
+
+    Promotion is the highest-risk learning tier — it mutates agent profile
+    markdown shared by every session — so it nests inside learning:
+    promotion ⊂ learning ⊂ memory. Any parent off forces it off. Read
+    errors default to False (fail closed).
+    """
+    try:
+        if not is_learning_enabled():
+            return False
+        settings = get_memory_settings()
+        return bool(settings.get("instruction_promotion_enabled", False))
+    except Exception as e:
+        logger.warning(
+            f"Failed to read memory.instruction_promotion_enabled, defaulting to False: {e}"
+        )
+        return False
+
+
 def get_compile_mode() -> str:
     """Return the active wiki-compilation mode.
 
@@ -477,6 +510,8 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
         ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
+        ``instruction_promotion_enabled`` (bool) — learned-lesson promotion
+        into agent profile files (requires learning_enabled).
     """
     settings = _load()
     memory = settings.get("memory", {})
@@ -494,6 +529,12 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
     elif key == "learning_enabled":
         if not isinstance(value, bool):
             raise ValueError(f"learning_enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "instruction_promotion_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"instruction_promotion_enabled must be a bool, got {type(value).__name__}"
+            )
         memory[key] = value
     elif key == "flush_threshold":
         fval = float(value)
