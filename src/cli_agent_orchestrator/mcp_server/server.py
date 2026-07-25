@@ -1667,6 +1667,77 @@ async def memory_forget(
 
 
 @mcp.tool()
+async def report_outcome(
+    task_label: str = Field(
+        description=(
+            "Short label for the unit of work, e.g. 'convert package CustomerETL' "
+            "or 'review round 2'. Max 200 chars."
+        )
+    ),
+    success: bool = Field(description="Whether the task succeeded"),
+    workflow_name: Optional[str] = Field(
+        default=None,
+        description="Optional workflow grouping label, e.g. 'ssis-migration'",
+    ),
+    agent_profile: Optional[str] = Field(
+        default=None,
+        description=(
+            "Agent profile that performed the work. Defaults to the calling "
+            "terminal's profile when omitted."
+        ),
+    ),
+    score: Optional[int] = Field(
+        default=None,
+        description="Optional 0-100 quality metric (e.g. an engine benchmark score)",
+    ),
+    friction_notes: str = Field(
+        default="",
+        description=(
+            "1-3 short sentences on what went wrong or was harder than expected. "
+            "Conclusions only — never transcripts, logs, or file contents. Max 1000 chars."
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Record the outcome of a unit of agent work (self-learning signal).
+
+    Outcomes feed the retrospector agent, which distills recurring friction
+    and successes into durable memory lessons at session end. Supervisors
+    should report one outcome per completed workflow step or delegated task.
+
+    Requires memory.learning_enabled=true (opt-in); otherwise returns a
+    disabled payload without recording anything.
+    """
+    from cli_agent_orchestrator.services.outcome_service import (
+        LearningDisabledError,
+        OutcomeService,
+    )
+
+    try:
+        terminal_context = _get_terminal_context_from_env()
+        if not terminal_context:
+            return {
+                "success": False,
+                "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
+            }
+        service = OutcomeService()
+        outcome = service.record_outcome(
+            session_name=terminal_context["session_name"],
+            task_label=task_label,
+            success=success,
+            workflow_name=workflow_name,
+            agent_profile=agent_profile or terminal_context.get("agent_profile"),
+            source_terminal_id=terminal_context["terminal_id"],
+            score=score,
+            friction_notes=friction_notes,
+        )
+        return {"success": True, "outcome_id": outcome["id"]}
+    except LearningDisabledError as e:
+        return {"success": False, "disabled": True, "error": str(e)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
 async def workflow_return(
     output: Dict[str, Any] = Field(description="The structured JSON output for this workflow step"),
     output_schema: Optional[Dict[str, Any]] = Field(

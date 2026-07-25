@@ -301,6 +301,7 @@ def get_memory_settings() -> Dict[str, Any]:
         "enabled": True,
         "flush_threshold": 0.85,
         "lint_enabled": True,
+        "learning_enabled": False,
     }
     saved = settings.get("memory", {})
     if not isinstance(saved, dict):
@@ -313,6 +314,11 @@ def get_memory_settings() -> Dict[str, Any]:
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
     if env_enabled is not None and env_enabled.strip() != "":
         result["enabled"] = env_enabled.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_LEARNING_ENABLED beats settings.json
+    env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
+    if env_learning is not None and env_learning.strip() != "":
+        result["learning_enabled"] = env_learning.strip().lower() in ("1", "true", "yes")
 
     # Env-var overlay: CAO_MEMORY_FLUSH_THRESHOLD beats settings.json
     env_threshold = os.environ.get("CAO_MEMORY_FLUSH_THRESHOLD")
@@ -396,6 +402,25 @@ def is_memory_enabled() -> bool:
     return bool(value)
 
 
+def is_learning_enabled() -> bool:
+    """Return True when workflow self-learning (outcome capture) is enabled.
+
+    Precedence: CAO_MEMORY_LEARNING_ENABLED env var > memory.learning_enabled
+    in settings.json > default (False — learning is opt-in).
+
+    Learning is a child of the memory subsystem: lessons distilled from
+    outcomes are stored via memory, so a disabled memory subsystem disables
+    learning regardless of this flag. Read errors default to False (opt-in
+    features fail closed, mirroring the default).
+    """
+    try:
+        settings = get_memory_settings()
+        return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
+    except Exception as e:
+        logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
+        return False
+
+
 def get_compile_mode() -> str:
     """Return the active wiki-compilation mode.
 
@@ -451,6 +476,7 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
         ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
+        ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
     """
     settings = _load()
     memory = settings.get("memory", {})
@@ -464,6 +490,10 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
     elif key == "lint_enabled":
         if not isinstance(value, bool):
             raise ValueError(f"lint_enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "learning_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"learning_enabled must be a bool, got {type(value).__name__}")
         memory[key] = value
     elif key == "flush_threshold":
         fval = float(value)
