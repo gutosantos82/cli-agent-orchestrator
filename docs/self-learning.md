@@ -162,12 +162,32 @@ profile markdown, inside a delimited block:
 A lesson is **eligible** when all of:
 
 - agent scope, keyed to the target profile;
-- type `feedback` or `project`;
+- type `feedback` or `project` (the memory **type label** — promotion only
+  ever draws from *agent-scope* memories; project-*scope* memories are not
+  promotable);
 - `access_count >= 3` (configurable via `--min-recalls`) — i.e. it was
   *recalled* at least 3 times after storage. Recall frequency is the
   reinforcement signal: every recall means an agent or curator found the
   lesson relevant again;
 - ≤ 400 characters (compact it first if longer).
+
+### Promotion, recall, and retention
+
+Promotion **copies, never moves**. The backing memory stays in the wiki and
+continues to participate in recall and injection unchanged; the promoted
+text additionally becomes part of the profile itself — present in **every**
+session deterministically, without competing for the injection budget or
+needing a `memory_recall`. Re-running `promote` never proposes an
+already-promoted lesson again unless its memory text changed, in which case
+it proposes an **update** to the same block item.
+
+Promoted lessons are **not subject to memory retention**: the profile block
+is a file, not a memory, so `cleanup_service` never touches it — once
+promoted, a learning survives even if the backing memory were later
+forgotten. (In practice the backing memories cannot expire either: agent
+scope has no retention window, and `feedback`-type memories are permanent
+regardless of scope.) Removing a promoted lesson is always an explicit
+operation — a remove delta or editing the profile — never a timer.
 
 ### Safety design
 
