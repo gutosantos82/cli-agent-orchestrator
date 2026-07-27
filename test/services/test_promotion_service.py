@@ -198,6 +198,22 @@ class TestApply:
             report = promo.apply(plan)
         assert not (report.added or report.updated)
 
+    def test_audit_event_type_is_whitelisted(self, stack: Any) -> None:
+        """The promotion audit entry must not be silently dropped.
+
+        Regression: 'instruction_promotion' was missing from the audit event
+        whitelist, so every apply()'s audit entry was rejected as
+        unknown_event.
+        """
+        from cli_agent_orchestrator.services.audit_log import (
+            AUDIT_EVENT_WHITELIST,
+            NOWAIT_AUDIT_EVENTS,
+        )
+
+        # _audit uses write_audit_nowait, so the NOWAIT set is the one that matters.
+        assert "instruction_promotion" in NOWAIT_AUDIT_EVENTS
+        assert "instruction_promotion" in AUDIT_EVENT_WHITELIST
+
 
 # ---------------------------------------------------------------------------
 # AC3 — lesson text extraction
