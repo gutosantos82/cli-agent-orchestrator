@@ -162,3 +162,53 @@ class TestReportOutcomeMcpTool:
 
         assert result["success"] is False
         assert "terminal context" in result["error"]
+
+
+class TestReportOutcomeErrorPaths:
+    def test_service_exception_returns_error_payload(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import report_outcome
+
+        ctx = {
+            "terminal_id": "t",
+            "session_name": "s",
+            "agent_profile": "a",
+            "provider": "claude_code",
+            "cwd": "/tmp",
+        }
+        with (
+            patch(LEARNING_TARGET, return_value=True),
+            patch.object(srv, "_get_terminal_context_from_env", return_value=ctx),
+            patch(
+                "cli_agent_orchestrator.services.outcome_service.OutcomeService.record_outcome",
+                side_effect=RuntimeError("db locked"),
+            ),
+        ):
+            result = asyncio.run(
+                report_outcome(
+                    task_label="t",
+                    success=True,
+                    workflow_name=None,
+                    agent_profile=None,
+                    score=None,
+                    friction_notes="",
+                )
+            )
+        assert result["success"] is False
+        assert "db locked" in result["error"]
+
+    def test_post_learning_disabled_error_from_service_is_404(self, client, isolated_db):
+        """Race: gate passes but service raises LearningDisabledError."""
+        from cli_agent_orchestrator.services.outcome_service import LearningDisabledError
+
+        with (
+            patch(LEARNING_TARGET, return_value=True),
+            patch(
+                "cli_agent_orchestrator.services.outcome_service.OutcomeService.record_outcome",
+                side_effect=LearningDisabledError("disabled"),
+            ),
+        ):
+            response = client.post("/outcomes", json=BODY)
+        assert response.status_code == 404

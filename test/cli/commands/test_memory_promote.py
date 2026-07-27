@@ -7,6 +7,7 @@ test_memory.py conventions.
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.memory import promote_cmd
@@ -106,3 +107,76 @@ class TestPromoteCmd:
                 ["transformer", "--profile-path", str(profile), "--min-recalls", "7"],
             )
         assert mock_svc.plan.call_args.kwargs["min_access_count"] == 7
+
+
+class TestResolveProfilePath:
+    def test_finds_flat_profile_in_agent_dir(self, tmp_path: Path) -> None:
+        from cli_agent_orchestrator.cli.commands.memory import _resolve_profile_path
+
+        agent_dir = tmp_path / "agents"
+        agent_dir.mkdir()
+        (agent_dir / "transformer.md").write_text("# T\n")
+        with (
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={"claude_code": str(agent_dir)},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+                return_value=[],
+            ),
+        ):
+            assert _resolve_profile_path("transformer") == agent_dir / "transformer.md"
+
+    def test_finds_nested_profile_layout(self, tmp_path: Path) -> None:
+        from cli_agent_orchestrator.cli.commands.memory import _resolve_profile_path
+
+        agent_dir = tmp_path / "agents"
+        (agent_dir / "transformer").mkdir(parents=True)
+        (agent_dir / "transformer" / "agent.md").write_text("# T\n")
+        with (
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={"claude_code": str(agent_dir)},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+                return_value=[],
+            ),
+        ):
+            assert _resolve_profile_path("transformer") == agent_dir / "transformer" / "agent.md"
+
+    def test_missing_profile_is_click_error(self, tmp_path: Path) -> None:
+        import click
+
+        from cli_agent_orchestrator.cli.commands.memory import _resolve_profile_path
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_agent_dirs",
+                return_value={"claude_code": str(tmp_path / "empty")},
+            ),
+            patch(
+                "cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs",
+                return_value=[],
+            ),
+        ):
+            with pytest.raises(click.ClickException, match="No writable profile"):
+                _resolve_profile_path("ghost")
+
+
+class TestPromoteSkippedOutput:
+    def test_skipped_lessons_reported(self, tmp_path: Path) -> None:
+        profile = tmp_path / "transformer.md"
+        profile.write_text("# T\n")
+        mock_svc = MagicMock()
+        mock_svc.plan.return_value = _plan(profile, [_candidate()])
+        mock_svc.apply.return_value = PromotionReport(
+            agent_profile="transformer", added=[], updated=[], skipped=["overflow-key"]
+        )
+        with patch(SVC_TARGET, return_value=mock_svc):
+            result = CliRunner().invoke(
+                promote_cmd, ["transformer", "--profile-path", str(profile), "--apply"]
+            )
+        assert result.exit_code == 0
+        assert "overflow-key" in result.output

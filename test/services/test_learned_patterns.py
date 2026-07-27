@@ -187,3 +187,48 @@ class TestIdempotence:
     def test_whitespace_normalized(self, profile: Path) -> None:
         apply_deltas(profile, add={"k1": "  Multi\n  line\ttext.  "})
         assert read_lessons(profile) == {"k1": "Multi line text."}
+
+
+# ---------------------------------------------------------------------------
+# Coverage completions — empty text, suffix handling, read_lessons
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    def test_empty_lesson_text_raises(self, profile: Path) -> None:
+        with pytest.raises(LearnedPatternsError, match="empty"):
+            apply_deltas(profile, add={"k1": "   "})
+
+    def test_block_midfile_preserves_suffix(self, tmp_path: Path) -> None:
+        """Content AFTER the block (suffix) survives edits and block removal."""
+        p = tmp_path / "mid.md"
+        p.write_text("# Agent\n\n## Role\nTop.\n", encoding="utf-8")
+        apply_deltas(p, add={"k1": "Lesson."})
+        # Move a section after the block by appending to the file.
+        p.write_text(p.read_text() + "\n## Appendix\nBottom half.\n", encoding="utf-8")
+        apply_deltas(p, add={"k2": "Second."})
+        content = p.read_text()
+        assert "Bottom half." in content
+        assert list(read_lessons(p)) == ["k1", "k2"]
+        # Removing everything drops the block but keeps both halves.
+        apply_deltas(p, remove=["k1", "k2"])
+        content = p.read_text()
+        assert BEGIN_MARKER not in content
+        assert "Top." in content and "Bottom half." in content
+
+    def test_read_lessons_missing_file(self, tmp_path: Path) -> None:
+        assert read_lessons(tmp_path / "nope.md") == {}
+
+    def test_bullet_without_space_parses(self, tmp_path: Path) -> None:
+        """A '-text' bullet (no space) still round-trips through the parser."""
+        from cli_agent_orchestrator.services.learned_patterns import parse_profile
+
+        p = tmp_path / "b.md"
+        p.write_text(
+            f"{BEGIN_MARKER}\n## Learned Patterns\n"
+            "<!-- lesson: k1 -->\n-tight bullet text\n"
+            f"{END_MARKER}\n",
+            encoding="utf-8",
+        )
+        block = parse_profile(p.read_text())
+        assert block.lessons == {"k1": "tight bullet text"}

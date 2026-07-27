@@ -193,3 +193,30 @@ class TestListing:
         # Absurd limits are clamped, not errors.
         assert len(svc.list_outcomes(limit=100_000)) == 1
         assert len(svc.list_outcomes(limit=0)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Coverage completions — guard fallback, label truncation
+# ---------------------------------------------------------------------------
+
+
+class TestGuardFallback:
+    def test_is_learning_enabled_fails_closed_on_error(self) -> None:
+        from cli_agent_orchestrator.services import outcome_service
+
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.is_learning_enabled",
+            side_effect=RuntimeError("settings unreadable"),
+        ):
+            assert outcome_service._is_learning_enabled() is False
+
+    def test_task_label_truncated(self, tmp_path: Path, enabled: Any) -> None:
+        from cli_agent_orchestrator.services.outcome_service import MAX_TASK_LABEL_CHARS
+
+        svc = _make_svc(tmp_path / "o.db")
+        rec = svc.record_outcome(
+            session_name="s",
+            task_label="t" * (MAX_TASK_LABEL_CHARS + 100),
+            success=True,
+        )
+        assert len(rec["task_label"]) == MAX_TASK_LABEL_CHARS

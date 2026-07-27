@@ -237,3 +237,27 @@ class TestInstructionPromotionFlag:
         assert get_memory_settings()["instruction_promotion_enabled"] is True
         with pytest.raises(ValueError, match="instruction_promotion_enabled must be a bool"):
             set_memory_setting("instruction_promotion_enabled", 1)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# AC6 — read errors fail closed (opt-in features)
+# ---------------------------------------------------------------------------
+
+
+class TestFailClosed:
+    def test_learning_fails_closed_on_settings_error(self, settings_file: Path) -> None:
+        from cli_agent_orchestrator.services import settings_service
+
+        with patch.object(
+            settings_service, "get_memory_settings", side_effect=RuntimeError("boom")
+        ):
+            assert settings_service.is_learning_enabled() is False
+
+    def test_promotion_fails_closed_on_settings_error(self, settings_file: Path) -> None:
+        from cli_agent_orchestrator.services import settings_service
+
+        settings_file.write_text(json.dumps({"memory": {"learning_enabled": True}}))
+        with patch.object(
+            settings_service, "get_memory_settings", side_effect=RuntimeError("boom")
+        ):
+            assert settings_service.is_instruction_promotion_enabled() is False

@@ -236,3 +236,91 @@ class TestLessonText:
     def test_missing_file_returns_empty(self, stack: Any, tmp_path: Path) -> None:
         mem, promo, profile, engine = stack
         assert promo._lesson_text(tmp_path / "ghost.md") == ""
+
+
+# ---------------------------------------------------------------------------
+# Coverage completions — guard fallbacks, plan skips, apply abort, audit
+# ---------------------------------------------------------------------------
+
+
+class TestGuardFallback:
+    def test_is_promotion_enabled_fails_closed_on_import_error(self) -> None:
+        from cli_agent_orchestrator.services import promotion_service
+
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.is_instruction_promotion_enabled",
+            side_effect=RuntimeError("settings unreadable"),
+        ):
+            assert promotion_service._is_promotion_enabled() is False
+
+    def test_is_promotion_enabled_reads_settings(self) -> None:
+        from cli_agent_orchestrator.services import promotion_service
+
+        with patch(
+            "cli_agent_orchestrator.services.settings_service.is_instruction_promotion_enabled",
+            return_value=True,
+        ):
+            assert promotion_service._is_promotion_enabled() is True
+
+
+class TestPlanSkips:
+    def test_oversized_lesson_skipped_in_plan(self, stack: Any) -> None:
+        from cli_agent_orchestrator.services.learned_patterns import MAX_LESSON_CHARS
+
+        mem, promo, profile, engine = stack
+        _store_lesson(mem, "too-long", "y" * (MAX_LESSON_CHARS + 50))
+        plan = promo.plan(agent_profile="transformer", profile_path=profile)
+        assert plan.empty  # oversized lessons are excluded, not errors
+
+    def test_missing_wiki_file_skipped_in_plan(self, stack: Any) -> None:
+        mem, promo, profile, engine = stack
+        _store_lesson(mem, "ghost-lesson", "Some lesson.")
+        # Delete the wiki file behind the metadata row.
+        with mem._get_db_session() as db:
+            row = db.query(MemoryMetadataModel).filter_by(key="ghost-lesson").one()
+            Path(row.file_path).unlink()
+        plan = promo.plan(agent_profile="transformer", profile_path=profile)
+        assert plan.empty
+
+
+class TestApplyAbort:
+    def test_apply_wraps_learned_patterns_error(self, stack: Any) -> None:
+        from cli_agent_orchestrator.services.learned_patterns import LearnedPatternsError
+        from cli_agent_orchestrator.services.promotion_service import PromotionCandidate
+
+        mem, promo, profile, engine = stack
+        plan = promo.plan(agent_profile="transformer", profile_path=profile)
+        # Inject a candidate that will fail apply-time validation (bad key
+        # simulates text/key mutation between plan and apply).
+        plan.candidates.append(
+            PromotionCandidate(key="BAD KEY", text="x", access_count=5, action="add")
+        )
+        with patch(ENABLED_TARGET, return_value=True):
+            with pytest.raises(LearnedPatternsError, match="promotion aborted"):
+                promo.apply(plan)
+
+    def test_audit_failure_never_blocks_promotion(self, stack: Any) -> None:
+        mem, promo, profile, engine = stack
+        _store_lesson(mem, "k1", "Lesson.")
+        plan = promo.plan(agent_profile="transformer", profile_path=profile)
+        with (
+            patch(ENABLED_TARGET, return_value=True),
+            patch(
+                "cli_agent_orchestrator.services.audit_log.write_audit_nowait",
+                side_effect=RuntimeError("audit down"),
+            ),
+        ):
+            report = promo.apply(plan)  # must not raise
+        assert report.added == ["k1"]
+
+    def test_audit_success_path_emits_event(self, stack: Any) -> None:
+        mem, promo, profile, engine = stack
+        _store_lesson(mem, "k1", "Lesson.")
+        plan = promo.plan(agent_profile="transformer", profile_path=profile)
+        with (
+            patch(ENABLED_TARGET, return_value=True),
+            patch("cli_agent_orchestrator.services.audit_log.write_audit_nowait") as mock_audit,
+        ):
+            promo.apply(plan)
+        assert mock_audit.call_count == 1
+        assert mock_audit.call_args.args[0] == "instruction_promotion"
