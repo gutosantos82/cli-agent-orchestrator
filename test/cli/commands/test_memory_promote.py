@@ -180,3 +180,38 @@ class TestPromoteSkippedOutput:
             )
         assert result.exit_code == 0
         assert "overflow-key" in result.output
+
+
+class TestBuiltinProfileRefusal:
+    """--profile-path must not bypass the built-in-package-profile refusal.
+
+    Review finding (PR #515): the refusal lived only in _resolve_profile_path,
+    so an explicit --profile-path pointing into the installed agent_store
+    could mutate a bundled profile.
+    """
+
+    def test_profile_path_into_builtin_store_is_refused(self) -> None:
+        import cli_agent_orchestrator.agent_store as agent_store_pkg
+
+        builtin = Path(next(iter(agent_store_pkg.__path__))) / "retrospector.md"
+        assert builtin.is_file(), "test needs a real built-in profile"
+        mock_svc = MagicMock()
+        with patch(SVC_TARGET, return_value=mock_svc):
+            result = CliRunner().invoke(
+                promote_cmd, ["retrospector", "--profile-path", str(builtin)]
+            )
+        assert result.exit_code != 0
+        assert "built-in" in result.output.lower()
+        mock_svc.plan.assert_not_called()
+
+    def test_agent_dir_profile_path_still_allowed(self, tmp_path: Path) -> None:
+        profile = tmp_path / "transformer.md"
+        profile.write_text("# T\n")
+        mock_svc = MagicMock()
+        mock_svc.plan.return_value = _plan(profile)
+        with patch(SVC_TARGET, return_value=mock_svc):
+            result = CliRunner().invoke(
+                promote_cmd, ["transformer", "--profile-path", str(profile)]
+            )
+        assert result.exit_code == 0
+        mock_svc.plan.assert_called_once()

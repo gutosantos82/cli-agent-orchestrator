@@ -761,6 +761,36 @@ def _resolve_profile_path(agent_name: str) -> Path:
     )
 
 
+def _reject_builtin_profile_path(path: Path) -> None:
+    """Refuse promotion into the built-in package agent store.
+
+    The default lookup (``_resolve_profile_path``) never returns built-in
+    profiles, but ``--profile-path`` accepts any existing file — without
+    this check the explicit route could mutate a bundled package profile,
+    which is not a writable store (edits are shared by every session and
+    silently lost on upgrade).
+    """
+    import cli_agent_orchestrator.agent_store as _agent_store_pkg
+
+    try:
+        # __path__ covers namespace/multiplexed layouts where
+        # ``str(resources.files(...))`` is not a usable filesystem path.
+        store_roots = [Path(p).resolve() for p in _agent_store_pkg.__path__]
+    except Exception:  # pragma: no cover — non-filesystem package layouts
+        return
+    resolved = path.resolve()
+    for store_root in store_roots:
+        try:
+            resolved.relative_to(store_root)
+        except ValueError:
+            continue
+        raise click.ClickException(
+            f"Refusing to promote into built-in package profile: {path}. "
+            "Built-in profiles are not a writable store — copy the profile into "
+            "an agent directory first."
+        )
+
+
 @memory.command(name="promote")
 @click.argument("agent_name")
 @click.option(
@@ -800,6 +830,9 @@ def promote_cmd(agent_name, do_apply, min_recalls, profile_path):
     target = profile_path if profile_path is not None else _resolve_profile_path(agent_name)
     if not target.is_file():
         raise click.ClickException(f"Profile file not found: {target}")
+    # The default lookup never returns built-in profiles; enforce the same
+    # refusal on the explicit --profile-path route.
+    _reject_builtin_profile_path(target)
 
     svc = PromotionService()
     plan = svc.plan(

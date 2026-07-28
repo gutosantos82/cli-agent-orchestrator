@@ -202,6 +202,16 @@ operation — a remove delta or editing the profile — never a timer.
 
 ### Safety design
 
+> **⚠️ Security: promoted lessons are untrusted instructions.** Lesson text
+> is written by agents from agent-observed outcomes. Promotion validates
+> length and rejects marker injection, but it does **not** — and cannot —
+> validate lesson *content* for adversarial or subtly wrong instructions.
+> `cao memory promote --apply` elevates that text into standing profile
+> instructions that every future session of the agent obeys. Treat every
+> promote diff as an **untrusted-instruction change**: review it with the
+> same scrutiny as a pull request that edits an agent's system prompt,
+> before applying. Never wire `--apply` into an unattended pipeline.
+
 - **Dry-run by default.** `cao memory promote <agent>` prints the plan;
   only `--apply` mutates, and only when `instruction_promotion_enabled` is
   true. (Mirrors `cao memory heal`.)
@@ -217,7 +227,8 @@ operation — a remove delta or editing the profile — never a timer.
   new adds are *skipped* (reported), never silently evicted — removal is
   always an explicit operation.
 - **Only writable stores.** Promotion targets profiles in your configured
-  agent directories; built-in package profiles are refused (copy them into
+  agent directories; built-in package profiles are refused on both the
+  default lookup and the explicit `--profile-path` route (copy them into
   an agent dir first). Profile files must already exist.
 - **Audited.** Every apply writes a content-free entry (profile + lesson
   keys) to the memory audit log.
