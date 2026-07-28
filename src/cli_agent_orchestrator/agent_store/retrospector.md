@@ -2,6 +2,10 @@
 name: retrospector
 description: Retrospective Agent — distills workflow outcomes into durable memory lessons
 role: supervisor
+# store_lesson authorizes CROSS-AGENT lesson writes (the point of
+# retrospection). Ordinary worker profiles must not carry this capability.
+capabilities:
+  - store_lesson
 mcpServers:
   cao-mcp-server:
     type: stdio

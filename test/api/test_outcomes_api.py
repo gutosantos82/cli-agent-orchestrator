@@ -417,3 +417,199 @@ class TestStoreLessonMcpTool:
             assert row.memory_type == "feedback"
             # Provenance still identifies the actual caller.
             assert row.source_terminal_id == "term-retro"
+
+
+class TestStoreLessonAuthorization:
+    """Cross-agent lesson writes require server-side authorization.
+
+    Review finding (PR #515): store_lesson accepted any target_agent_profile
+    from any caller — a persistent cross-agent instruction-injection path.
+    Authorization is the caller PROFILE's 'store_lesson' capability, resolved
+    server-side from the terminal record + profile frontmatter, never from
+    tool arguments.
+    """
+
+    def _ctx(self, profile: str) -> dict:
+        return {
+            "terminal_id": "term-attacker",
+            "session_name": "sess-x",
+            "agent_profile": profile,
+            "provider": "claude_code",
+            "cwd": "/tmp",
+        }
+
+    def test_non_privileged_caller_cannot_write_other_scope(self, isolated_db):
+        """A worker without the capability is refused a cross-agent write."""
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import store_lesson
+
+        with (
+            patch(LEARNING_TARGET, return_value=True),
+            patch.object(
+                srv, "_get_terminal_context_from_env", return_value=self._ctx("developer")
+            ),
+            patch.object(srv, "_caller_has_store_lesson_capability", return_value=False),
+        ):
+            result = asyncio.run(
+                store_lesson(
+                    target_agent_profile="reviewer",
+                    content="Attacker-chosen instruction. Applies when: always.",
+                    key="evil-lesson",
+                    tags=None,
+                )
+            )
+        assert result["success"] is False
+        assert "not authorized" in result["error"]
+
+    def test_context_free_caller_is_refused(self, isolated_db):
+        """Missing terminal context fails closed — no anonymous writes."""
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import store_lesson
+
+        with (
+            patch(LEARNING_TARGET, return_value=True),
+            patch.object(srv, "_get_terminal_context_from_env", return_value=None),
+        ):
+            result = asyncio.run(
+                store_lesson(
+                    target_agent_profile="reviewer",
+                    content="Anonymous instruction.",
+                    key=None,
+                    tags=None,
+                )
+            )
+        assert result["success"] is False
+        assert "terminal context" in result["error"]
+
+    def test_self_write_needs_no_capability(self, isolated_db, tmp_path):
+        """target == caller grants nothing beyond memory_store; allowed."""
+        import asyncio
+
+        from sqlalchemy import create_engine
+
+        from cli_agent_orchestrator.clients.database import Base
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import store_lesson
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 's.db'}", connect_args={"check_same_thread": False}
+        )
+        Base.metadata.create_all(bind=engine)
+        svc = MemoryService(base_dir=tmp_path / "mem", db_engine=engine)
+
+        with (
+            patch(LEARNING_TARGET, return_value=True),
+            patch(
+                "cli_agent_orchestrator.services.memory_service._is_memory_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                srv, "_get_terminal_context_from_env", return_value=self._ctx("developer")
+            ),
+            patch.object(srv, "_caller_has_store_lesson_capability", return_value=False),
+            patch(
+                "cli_agent_orchestrator.services.memory_service.MemoryService",
+                return_value=svc,
+            ),
+        ):
+            result = asyncio.run(
+                store_lesson(
+                    target_agent_profile="developer",
+                    content="My own lesson. Applies when: always.",
+                    key="own-lesson",
+                    tags=None,
+                )
+            )
+        assert result["success"] is True, result
+        assert result["scope_id"] == "developer"
+
+    def test_capability_check_uses_profile_frontmatter(self):
+        """The real capability helper reads the caller profile's frontmatter."""
+        from cli_agent_orchestrator.mcp_server.server import (
+            _caller_has_store_lesson_capability,
+        )
+
+        # Built-in retrospector declares the capability.
+        assert _caller_has_store_lesson_capability("retrospector") is True
+        # Built-in memory_manager does not.
+        assert _caller_has_store_lesson_capability("memory_manager") is False
+        # Unknown/missing profiles fail closed.
+        assert _caller_has_store_lesson_capability("no-such-profile") is False
+        assert _caller_has_store_lesson_capability(None) is False
+
+
+class TestListOutcomesFailClosed:
+    """list_outcomes must not fall back to an unfiltered cross-session query.
+
+    Review finding (PR #515): a transient context-lookup failure made the
+    no-session_name path list every session's outcomes.
+    """
+
+    def test_context_lookup_failure_is_error_not_cross_session(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import list_outcomes
+        from cli_agent_orchestrator.services.outcome_service import OutcomeService
+
+        with patch(LEARNING_TARGET, return_value=True):
+            OutcomeService().record_outcome(
+                session_name="unrelated-session",
+                task_label="secret work",
+                success=True,
+                friction_notes="sensitive note",
+            )
+            with patch.object(srv, "_get_terminal_context_from_env", return_value=None):
+                result = asyncio.run(
+                    list_outcomes(
+                        session_name=None, agent_profile=None, workflow_name=None, limit=50
+                    )
+                )
+        assert result["success"] is False
+        assert result["outcomes"] == []
+        assert "session" in result["error"]
+
+    def test_context_without_session_name_is_error(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import list_outcomes
+
+        ctx = {"terminal_id": "t", "agent_profile": "a", "provider": "p"}  # no session_name
+        with (
+            patch(LEARNING_TARGET, return_value=True),
+            patch.object(srv, "_get_terminal_context_from_env", return_value=ctx),
+        ):
+            result = asyncio.run(
+                list_outcomes(session_name=None, agent_profile=None, workflow_name=None, limit=50)
+            )
+        assert result["success"] is False
+        assert result["outcomes"] == []
+
+    def test_explicit_session_still_works(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import list_outcomes
+        from cli_agent_orchestrator.services.outcome_service import OutcomeService
+
+        with patch(LEARNING_TARGET, return_value=True):
+            OutcomeService().record_outcome(
+                session_name="named-session", task_label="t", success=True
+            )
+            with patch.object(srv, "_get_terminal_context_from_env", return_value=None):
+                result = asyncio.run(
+                    list_outcomes(
+                        session_name="named-session",
+                        agent_profile=None,
+                        workflow_name=None,
+                        limit=50,
+                    )
+                )
+        assert result["success"] is True
+        assert result["count"] == 1

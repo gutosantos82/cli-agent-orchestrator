@@ -1466,6 +1466,27 @@ def _get_terminal_context_from_env() -> Optional[Dict[str, Any]]:
         return None
 
 
+def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
+    """True when the caller's PROFILE declares the ``store_lesson`` capability.
+
+    Server-side authorization for cross-agent lesson writes: the profile name
+    comes from the terminal's registered record (never tool arguments), and
+    the capability list comes from the profile file's frontmatter — an
+    operator-owned artifact a worker cannot edit through MCP. Fails closed on
+    any lookup error.
+    """
+    if not caller_profile:
+        return False
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        profile = load_agent_profile(caller_profile)
+        return "store_lesson" in (profile.capabilities or [])
+    except Exception as e:  # noqa: BLE001 — authz check fails closed
+        logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
+        return False
+
+
 @mcp.tool()
 async def memory_store(
     content: str = Field(description="Memory content to store (markdown supported)"),
@@ -1772,9 +1793,22 @@ async def list_outcomes(
                 "outcomes": [],
             }
         if session_name is None:
+            # Fail closed: without an explicit session filter the caller's
+            # own session is REQUIRED. Proceeding with None would run an
+            # unfiltered cross-session query, leaking other sessions'
+            # friction notes on a transient context-lookup failure.
             terminal_context = _get_terminal_context_from_env()
-            if terminal_context:
-                session_name = terminal_context.get("session_name")
+            session_name = (terminal_context or {}).get("session_name")
+            if not session_name:
+                return {
+                    "success": False,
+                    "error": (
+                        "Could not resolve the calling terminal's session; pass "
+                        "session_name explicitly (unfiltered cross-session listing "
+                        "is not permitted from this tool)"
+                    ),
+                    "outcomes": [],
+                }
         outcomes = OutcomeService().list_outcomes(
             session_name=session_name,
             agent_profile=agent_profile,
@@ -1816,6 +1850,12 @@ async def store_lesson(
     memory type is always 'feedback' (permanent), and the target profile is
     recorded verbatim as the scope id.
 
+    Cross-agent writes are authorized server-side: the CALLER's profile
+    (resolved from its terminal record, never from tool arguments) must
+    declare the ``store_lesson`` capability in its frontmatter. Writing to
+    the caller's OWN scope needs no capability — that grants nothing beyond
+    what memory_store(scope="agent") already permits.
+
     Requires memory.learning_enabled=true; returns a disabled payload
     otherwise.
     """
@@ -1829,7 +1869,33 @@ async def store_lesson(
         if not target:
             return {"success": False, "error": "target_agent_profile is required"}
 
-        terminal_context = _get_terminal_context_from_env() or {}
+        # Fail closed: a resolved caller identity is REQUIRED. Accepting a
+        # missing context would let a context-free caller write permanent
+        # feedback into any profile's scope.
+        terminal_context = _get_terminal_context_from_env()
+        if not terminal_context:
+            return {
+                "success": False,
+                "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
+            }
+        caller_profile = terminal_context.get("agent_profile")
+
+        # Cross-agent lesson writes are a privileged operation: permanent
+        # feedback memory injected into ANOTHER agent's future sessions.
+        # Authorize via the caller profile's declared capabilities —
+        # resolved server-side from the terminal's registered profile, so a
+        # worker cannot self-grant it through tool arguments.
+        if target != caller_profile:
+            if not _caller_has_store_lesson_capability(caller_profile):
+                return {
+                    "success": False,
+                    "error": (
+                        f"caller profile {caller_profile!r} is not authorized to store "
+                        f"lessons for {target!r}: cross-agent lesson writes require the "
+                        "'store_lesson' capability in the caller's profile frontmatter"
+                    ),
+                }
+
         # Overriding agent_profile redirects resolve_scope_id's agent-scope
         # resolution to the target worker. Provenance fields (provider,
         # terminal_id) still identify the actual caller.

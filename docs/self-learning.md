@@ -137,6 +137,18 @@ lesson under `retrospector`. `store_lesson` takes a required
 `cao memory promote <worker>` actually find the lessons. Provenance fields
 still record the retrospector as the writer.
 
+Cross-agent writes are **authorized server-side**: the caller's profile —
+resolved from its terminal record, never from tool arguments — must declare
+the `store_lesson` capability in its frontmatter (the built-in retrospector
+does; ordinary worker profiles must not). Without it, a worker calling
+`store_lesson(target_agent_profile="reviewer", ...)` is refused — otherwise
+any agent could inject permanent feedback into any other agent's future
+sessions. Writing to one's *own* scope needs no capability (it grants
+nothing beyond `memory_store(scope="agent")`), and a caller whose terminal
+context cannot be resolved is refused outright. `list_outcomes` likewise
+fails closed: without an explicit `session_name` it requires the caller's
+own session and never falls back to a cross-session listing.
+
 Lesson contract (enforced by the profile's rules):
 
 - **Agent scope** (`scope="agent"`) for craft lessons; project scope for
