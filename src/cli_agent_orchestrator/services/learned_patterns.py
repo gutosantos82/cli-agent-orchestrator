@@ -92,6 +92,11 @@ def _validate_text(text: str) -> str:
 def parse_profile(content: str) -> LearnedBlock:
     """Extract the learned block (if any) from profile file content.
 
+    ``prefix`` and ``suffix`` are RAW slices of everything before/after the
+    marker-delimited range — no whitespace normalization — so a rewrite can
+    splice a new block into exactly the bytes the old one occupied and leave
+    the rest of the file untouched (byte-for-byte contract).
+
     Stray/unclosed BEGIN markers are dropped (token only), matching the
     corruption handling in claude_code_memory._strip_existing_block.
     """
@@ -108,8 +113,8 @@ def parse_profile(content: str) -> LearnedBlock:
         return block
 
     block.had_block = True
-    block.prefix = content[:begin].rstrip("\n")
-    block.suffix = content[end + len(END_MARKER) :].lstrip("\n")
+    block.prefix = content[:begin]
+    block.suffix = content[end + len(END_MARKER) :]
 
     body = content[begin + len(BEGIN_MARKER) : end]
     # Parse "<!-- lesson: key -->" followed by its text (up to the next
@@ -130,8 +135,12 @@ def parse_profile(content: str) -> LearnedBlock:
     return block
 
 
-def render_block(lessons: Dict[str, str]) -> str:
-    """Render the delimited block from an ordered lesson mapping."""
+def render_block(lessons: Dict[str, str], newline: str = "\n") -> str:
+    """Render the delimited block from an ordered lesson mapping.
+
+    ``newline`` lets the caller match the host file's line-ending style so a
+    CRLF profile does not end up with a mixed-ending block.
+    """
     lines = [BEGIN_MARKER, SECTION_HEADING]
     lines.append(
         "<!-- Maintained by CAO instruction promotion. Edit via "
@@ -141,7 +150,7 @@ def render_block(lessons: Dict[str, str]) -> str:
         lines.append(f"<!-- lesson: {key} -->")
         lines.append(f"- {text}")
     lines.append(END_MARKER)
-    return "\n".join(lines)
+    return newline.join(lines)
 
 
 @dataclass
@@ -167,6 +176,12 @@ def apply_deltas(
     silently evicted — removal is always an explicit delta) and reported in
     ``result.skipped``.
 
+    Preservation contract: only the marker-delimited byte range changes.
+    Bytes outside the block — including blank-line runs at the boundaries
+    and CRLF line endings — are preserved exactly. A symlinked profile is
+    edited through the link (the target file is rewritten; the link
+    remains), and the target's permission mode survives the atomic replace.
+
     The file must exist — promotion never creates profile files. Raises
     ``LearnedPatternsError`` on invalid input, ``FileNotFoundError`` when
     the profile is missing.
@@ -174,10 +189,19 @@ def apply_deltas(
     if not profile_path.is_file():
         raise FileNotFoundError(f"profile file not found: {profile_path}")
 
+    # Edit the symlink TARGET, not the link: os.replace() on the link path
+    # would delete the link and orphan its managed source (review finding,
+    # PR #515). resolve() also pins the path against rename races between
+    # read and replace.
+    real_path = profile_path.resolve()
+
     add = {_validate_key(k): _validate_text(v) for k, v in (add or {}).items()}
     remove_keys = [_validate_key(k) for k in (remove or [])]
 
-    content = profile_path.read_text(encoding="utf-8")
+    # newline="" disables universal-newline translation so CRLF content
+    # round-trips byte-identically.
+    with open(real_path, "r", encoding="utf-8", newline="") as f:
+        content = f.read()
     block = parse_profile(content)
     result = DeltaResult()
 
@@ -209,27 +233,45 @@ def apply_deltas(
     if not (result.added or result.updated or result.removed):
         return result  # nothing changed — do not rewrite the file
 
-    if block.lessons:
-        rendered = render_block(block.lessons)
-        parts = [p for p in (block.prefix, rendered) if p]
-        new_content = "\n\n".join(parts)
-        if block.suffix:
-            new_content += f"\n\n{block.suffix}"
-        if not new_content.endswith("\n"):
-            new_content += "\n"
-    else:
-        # Last lesson removed → drop the whole block.
-        new_content = block.prefix
-        if block.suffix:
-            new_content += f"\n\n{block.suffix}"
-        if new_content and not new_content.endswith("\n"):
-            new_content += "\n"
+    # Match the host file's dominant line-ending style for the block itself.
+    newline = (
+        "\r\n" if content.count("\r\n") > content.count("\n") - content.count("\r\n") else "\n"
+    )
 
-    # Atomic temp-file + replace (same idiom as claude_code_memory).
-    temp_path = profile_path.with_suffix(profile_path.suffix + ".tmp")
+    if block.lessons:
+        rendered = render_block(block.lessons, newline=newline)
+        if block.had_block:
+            # Splice the new block into exactly the byte range the old one
+            # occupied — prefix and suffix are raw slices, untouched.
+            new_content = block.prefix + rendered + block.suffix
+        else:
+            # First promotion: append the block at the end. Only the join
+            # seam is new; the original content bytes are preserved.
+            sep = "" if (not block.prefix or block.prefix.endswith(newline)) else newline
+            new_content = block.prefix + sep + newline + rendered + newline
+    else:
+        # Last lesson removed → drop the whole block, absorbing the seam the
+        # append path created around it (one trailing newline after the
+        # block, one blank line before it) so add→remove round-trips to the
+        # original bytes. Everything else in prefix/suffix stays exact.
+        prefix, suffix = block.prefix, block.suffix
+        if suffix.startswith(newline):
+            suffix = suffix[len(newline) :]
+        if prefix.endswith(newline * 2):
+            prefix = prefix[: -len(newline)]
+        new_content = prefix + suffix
+
+    # Atomic temp-file + replace on the RESOLVED target (same idiom as
+    # claude_code_memory), preserving the original file's permission mode —
+    # a fresh temp file would otherwise take the process umask and widen a
+    # 0600 profile to 0644 (review finding, PR #515).
+    original_mode = real_path.stat().st_mode
+    temp_path = real_path.with_suffix(real_path.suffix + ".tmp")
     try:
-        temp_path.write_text(new_content, encoding="utf-8")
-        os.replace(temp_path, profile_path)
+        with open(temp_path, "w", encoding="utf-8", newline="") as f:
+            f.write(new_content)
+        os.chmod(temp_path, original_mode)
+        os.replace(temp_path, real_path)
     finally:
         if temp_path.exists():
             temp_path.unlink()

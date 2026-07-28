@@ -24,6 +24,7 @@ from cli_agent_orchestrator.services.memory_service import (
     MemoryDisabledError,
     MemoryPartialWriteError,
 )
+from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
@@ -1732,6 +1733,139 @@ async def report_outcome(
         )
         return {"success": True, "outcome_id": outcome["id"]}
     except LearningDisabledError as e:
+        return {"success": False, "disabled": True, "error": str(e)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def list_outcomes(
+    session_name: Optional[str] = Field(
+        default=None,
+        description="Filter by session name. Defaults to the calling terminal's session.",
+    ),
+    agent_profile: Optional[str] = Field(
+        default=None, description="Filter by the agent profile that did the work"
+    ),
+    workflow_name: Optional[str] = Field(
+        default=None, description="Filter by workflow grouping label"
+    ),
+    limit: int = Field(default=50, description="Max records to return (newest first, max 200)"),
+) -> Dict[str, Any]:
+    """List recorded workflow outcomes (retrospector read path).
+
+    Returns outcomes newest-first. Defaults to the calling terminal's own
+    session so a retrospector reads the session it was dispatched for.
+
+    Requires memory.learning_enabled=true; returns an empty list with a
+    disabled marker otherwise.
+    """
+    from cli_agent_orchestrator.services.outcome_service import OutcomeService
+    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
+
+    try:
+        if not is_learning_enabled():
+            return {
+                "success": False,
+                "disabled": True,
+                "error": LEARNING_DISABLED_MESSAGE,
+                "outcomes": [],
+            }
+        if session_name is None:
+            terminal_context = _get_terminal_context_from_env()
+            if terminal_context:
+                session_name = terminal_context.get("session_name")
+        outcomes = OutcomeService().list_outcomes(
+            session_name=session_name,
+            agent_profile=agent_profile,
+            workflow_name=workflow_name,
+            limit=limit,
+        )
+        return {"success": True, "outcomes": outcomes, "count": len(outcomes)}
+    except Exception as e:
+        return {"success": False, "error": str(e), "outcomes": []}
+
+
+@mcp.tool()
+async def store_lesson(
+    target_agent_profile: str = Field(
+        description=(
+            "Agent profile the lesson is for (e.g. 'transformer'). The lesson is "
+            "stored in THAT profile's agent scope so it reaches that agent's "
+            "future sessions."
+        )
+    ),
+    content: str = Field(
+        description=(
+            "The lesson: 1-2 sentence conclusion ending with 'Applies when: <trigger>'. "
+            "Conclusions only — never transcripts, logs, or secrets."
+        )
+    ),
+    key: Optional[str] = Field(
+        default=None,
+        description="Slug identifier (e.g. 'honor-lookup-cache-mode'). Auto-generated if omitted.",
+    ),
+    tags: Optional[str] = Field(default=None, description="Comma-separated tags for search"),
+) -> Dict[str, Any]:
+    """Store a retrospective lesson in a target agent's scope (retrospector write path).
+
+    Unlike memory_store — which resolves agent scope from the CALLING
+    terminal's profile — this tool targets the named worker profile, so a
+    retrospector can place lessons where the worker (and instruction
+    promotion) will find them. Deliberately narrow: scope is always 'agent',
+    memory type is always 'feedback' (permanent), and the target profile is
+    recorded verbatim as the scope id.
+
+    Requires memory.learning_enabled=true; returns a disabled payload
+    otherwise.
+    """
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+    from cli_agent_orchestrator.services.settings_service import is_learning_enabled
+
+    try:
+        if not is_learning_enabled():
+            return {"success": False, "disabled": True, "error": LEARNING_DISABLED_MESSAGE}
+        target = (target_agent_profile or "").strip()
+        if not target:
+            return {"success": False, "error": "target_agent_profile is required"}
+
+        terminal_context = _get_terminal_context_from_env() or {}
+        # Overriding agent_profile redirects resolve_scope_id's agent-scope
+        # resolution to the target worker. Provenance fields (provider,
+        # terminal_id) still identify the actual caller.
+        lesson_context = {**terminal_context, "agent_profile": target}
+
+        service = MemoryService()
+        memory = await service.store(
+            content=content,
+            scope="agent",
+            memory_type="feedback",
+            key=key,
+            tags=tags or "",
+            terminal_context=lesson_context,
+        )
+        return {
+            "success": True,
+            "key": memory.key,
+            "scope": memory.scope,
+            "scope_id": memory.scope_id,
+            "target_agent_profile": target,
+        }
+    except MemoryPartialWriteError as e:
+        return {
+            "success": False,
+            "error_kind": e.error_kind,
+            "error": str(e),
+            "partial_write": {
+                "key": e.key,
+                "scope": e.scope,
+                "scope_id": e.scope_id,
+                "file_path": e.file_path,
+                "completed_phases": e.completed_phases,
+                "repair_command": e.repair_command,
+            },
+        }
+    except MemoryDisabledError as e:
         return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}

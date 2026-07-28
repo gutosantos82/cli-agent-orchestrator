@@ -93,10 +93,14 @@ agent-scope lessons, but your routing helps.
 
 ## If you are the RETROSPECTOR
 
-Follow your profile (`retrospector.md`). The quality bar, in brief: 0–3
-lessons per retrospection, each supported by a concrete outcome, actionable,
-general enough to recur, under 400 characters, ending with `Applies when:`.
-"No lessons" is a valid and often correct answer.
+Follow your profile (`retrospector.md`). Read outcomes with the
+`list_outcomes` tool; store worker-craft lessons with
+`store_lesson(target_agent_profile=..., content=...)` — NOT `memory_store`,
+which files agent-scope lessons under YOUR profile, where the worker will
+never see them. The quality bar, in brief: 0–3 lessons per retrospection,
+each supported by a concrete outcome, actionable, general enough to recur,
+under 400 characters, ending with `Applies when:`. "No lessons" is a valid
+and often correct answer.
 
 ## What happens to lessons afterwards
 

@@ -232,3 +232,115 @@ class TestEdgeCases:
         )
         block = parse_profile(p.read_text())
         assert block.lessons == {"k1": "tight bullet text"}
+
+
+# ---------------------------------------------------------------------------
+# PR #515 review regressions — symlinks, permissions, exact byte preservation
+# ---------------------------------------------------------------------------
+
+
+class TestSymlinkPreservation:
+    def test_symlinked_profile_stays_a_symlink(self, tmp_path: Path) -> None:
+        """Promotion edits the TARGET through the link, never replaces the link."""
+        target = tmp_path / "managed" / "transformer.md"
+        target.parent.mkdir()
+        target.write_text(PROFILE, encoding="utf-8")
+        link = tmp_path / "agents" / "transformer.md"
+        link.parent.mkdir()
+        link.symlink_to(target)
+
+        apply_deltas(link, add={"k1": "Lesson."})
+
+        assert link.is_symlink(), "the configured symlink must survive promotion"
+        assert link.resolve() == target.resolve()
+        assert "Lesson." in target.read_text()
+        assert read_lessons(link) == {"k1": "Lesson."}
+
+    def test_symlink_edit_roundtrip_remove(self, tmp_path: Path) -> None:
+        target = tmp_path / "t.md"
+        target.write_text(PROFILE, encoding="utf-8")
+        link = tmp_path / "l.md"
+        link.symlink_to(target)
+        apply_deltas(link, add={"k1": "One."})
+        apply_deltas(link, remove=["k1"])
+        assert link.is_symlink()
+        assert BEGIN_MARKER not in target.read_text()
+
+
+class TestModePreservation:
+    def test_restrictive_mode_survives_promotion(self, tmp_path: Path) -> None:
+        """A 0600 profile must not widen to umask defaults (0644)."""
+        import stat
+
+        p = tmp_path / "private.md"
+        p.write_text(PROFILE, encoding="utf-8")
+        p.chmod(0o600)
+
+        apply_deltas(p, add={"k1": "Lesson."})
+
+        mode = stat.S_IMODE(p.stat().st_mode)
+        assert mode == 0o600, f"mode widened to {oct(mode)}"
+
+    def test_mode_preserved_across_update_and_remove(self, tmp_path: Path) -> None:
+        import stat
+
+        p = tmp_path / "private.md"
+        p.write_text(PROFILE, encoding="utf-8")
+        p.chmod(0o640)
+        apply_deltas(p, add={"k1": "One."})
+        apply_deltas(p, add={"k1": "Two."})
+        apply_deltas(p, remove=["k1"])
+        assert stat.S_IMODE(p.stat().st_mode) == 0o640
+
+
+class TestExactBytePreservation:
+    def test_outside_bytes_exact_on_update(self, tmp_path: Path) -> None:
+        """Bytes outside the block — including 3-newline runs — are untouched."""
+        p = tmp_path / "exact.md"
+        original = "# Agent\n\n\n## Role\nTop.\n\n\n"  # deliberate 3-newline runs
+        p.write_text(original, encoding="utf-8")
+        apply_deltas(p, add={"k1": "One."})
+        after_add = p.read_bytes()
+        # Updating the lesson must leave every byte outside the block alone.
+        apply_deltas(p, add={"k1": "Two."})
+        after_update = p.read_bytes()
+        assert after_update.replace(b"Two.", b"One.") == after_add
+
+    def test_block_removal_restores_boundary_bytes(self, tmp_path: Path) -> None:
+        """Add then remove returns the file to its original bytes."""
+        p = tmp_path / "roundtrip.md"
+        original = "# Agent\n\n\n## Role\nMiddle.\n\n\n## Tail\nEnd.\n"
+        p.write_text(original, encoding="utf-8")
+        apply_deltas(p, add={"k1": "Temp."})
+        apply_deltas(p, remove=["k1"])
+        assert p.read_text() == original
+
+    def test_crlf_profile_preserved(self, tmp_path: Path) -> None:
+        """CRLF line endings outside the block survive; block uses CRLF too."""
+        p = tmp_path / "crlf.md"
+        original = "# Agent\r\n\r\n## Role\r\nWindows-authored.\r\n"
+        p.write_bytes(original.encode("utf-8"))
+
+        apply_deltas(p, add={"k1": "Lesson."})
+        raw = p.read_bytes()
+        # Original CRLF content intact.
+        assert b"# Agent\r\n\r\n## Role\r\nWindows-authored.\r\n" in raw
+        # No bare-LF lines introduced inside the block.
+        assert b"<!-- lesson: k1 -->\r\n- Lesson." in raw
+        assert read_lessons(p) == {"k1": "Lesson."}
+
+        apply_deltas(p, remove=["k1"])
+        assert p.read_bytes() == original.encode("utf-8")
+
+    def test_lf_interior_of_prefix_never_rewritten(self, tmp_path: Path) -> None:
+        """Blank-line runs BETWEEN block and content are preserved on splice."""
+        p = tmp_path / "gap.md"
+        p.write_text("# Top\n", encoding="utf-8")
+        apply_deltas(p, add={"k1": "One."})
+        # Hand-widen the gap between prefix and block to 3 newlines.
+        content = p.read_text()
+        content = content.replace("# Top\n\n<!--", "# Top\n\n\n\n<!--")
+        p.write_text(content, encoding="utf-8")
+        widened = p.read_bytes()
+        apply_deltas(p, add={"k1": "Two."})
+        assert p.read_bytes().replace(b"Two.", b"One.") == widened

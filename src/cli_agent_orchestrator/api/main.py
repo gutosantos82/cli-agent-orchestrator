@@ -3674,6 +3674,7 @@ async def list_outcomes_endpoint(
     agent_profile: Optional[str] = None,
     workflow_name: Optional[str] = None,
     limit: int = Query(default=50, ge=1, le=200),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> Dict:
     """List recorded workflow outcomes newest-first (retrospector read path)."""
     from cli_agent_orchestrator.services.outcome_service import OutcomeService

@@ -212,3 +212,208 @@ class TestReportOutcomeErrorPaths:
         ):
             response = client.post("/outcomes", json=BODY)
         assert response.status_code == 404
+
+
+class TestOutcomesAuth:
+    """Regression: GET /outcomes must be scope-gated when OAuth is enabled.
+
+    Review finding (PR #515): the read route shipped without
+    require_any_scope, serving outcome data (session names, agent identity,
+    friction notes) to unauthenticated callers on auth-enabled servers.
+    """
+
+    def test_get_outcomes_has_scope_dependency(self):
+        from cli_agent_orchestrator.api.main import app
+
+        route = next(
+            r for r in app.routes if getattr(r, "path", None) == "/outcomes" and "GET" in r.methods
+        )
+        stack = list(route.dependant.dependencies)
+        found = False
+        while stack:
+            dep = stack.pop()
+            call = getattr(dep, "call", None)
+            if call is not None and "require_any_scope" in getattr(call, "__qualname__", ""):
+                found = True
+                break
+            stack.extend(getattr(dep, "dependencies", []))
+        assert found, "GET /outcomes is missing a require_any_scope dependency"
+
+    def test_get_outcomes_missing_token_is_401_when_auth_enabled(
+        self, client, isolated_db, monkeypatch
+    ):
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example/jwks")
+        with patch(LEARNING_TARGET, return_value=True):
+            response = client.get("/outcomes")
+        assert response.status_code == 401
+
+
+class TestListOutcomesMcpTool:
+    def _ctx(self):
+        return {
+            "terminal_id": "term-retro",
+            "session_name": "sess-retro",
+            "agent_profile": "retrospector",
+            "provider": "claude_code",
+            "cwd": "/tmp",
+        }
+
+    def test_disabled_returns_disabled_payload(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server.server import list_outcomes
+
+        with patch(LEARNING_TARGET, return_value=False):
+            result = asyncio.run(
+                list_outcomes(session_name=None, agent_profile=None, workflow_name=None, limit=50)
+            )
+        assert result["success"] is False
+        assert result["disabled"] is True
+        assert result["outcomes"] == []
+
+    def test_defaults_to_caller_session(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import list_outcomes
+        from cli_agent_orchestrator.services.outcome_service import OutcomeService
+
+        with patch(LEARNING_TARGET, return_value=True):
+            OutcomeService().record_outcome(
+                session_name="sess-retro", task_label="in-session", success=True
+            )
+            OutcomeService().record_outcome(
+                session_name="other-session", task_label="elsewhere", success=True
+            )
+            with patch.object(srv, "_get_terminal_context_from_env", return_value=self._ctx()):
+                result = asyncio.run(
+                    list_outcomes(
+                        session_name=None, agent_profile=None, workflow_name=None, limit=50
+                    )
+                )
+        assert result["success"] is True
+        assert result["count"] == 1
+        assert result["outcomes"][0]["task_label"] == "in-session"
+
+    def test_explicit_session_wins(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import list_outcomes
+        from cli_agent_orchestrator.services.outcome_service import OutcomeService
+
+        with patch(LEARNING_TARGET, return_value=True):
+            OutcomeService().record_outcome(
+                session_name="other-session", task_label="elsewhere", success=True
+            )
+            with patch.object(srv, "_get_terminal_context_from_env", return_value=self._ctx()):
+                result = asyncio.run(
+                    list_outcomes(
+                        session_name="other-session",
+                        agent_profile=None,
+                        workflow_name=None,
+                        limit=50,
+                    )
+                )
+        assert result["count"] == 1
+
+
+class TestStoreLessonMcpTool:
+    """store_lesson targets the WORKER's agent scope, not the caller's.
+
+    Review finding (PR #515): memory_store resolves agent scope from the
+    calling terminal, so retrospector lessons landed under 'retrospector'
+    and promotion for the worker found nothing.
+    """
+
+    def _retro_ctx(self):
+        return {
+            "terminal_id": "term-retro",
+            "session_name": "sess-retro",
+            "agent_profile": "retrospector",
+            "provider": "claude_code",
+            "cwd": "/tmp",
+        }
+
+    def test_disabled_returns_disabled_payload(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server.server import store_lesson
+
+        with patch(LEARNING_TARGET, return_value=False):
+            result = asyncio.run(
+                store_lesson(
+                    target_agent_profile="transformer",
+                    content="A lesson.",
+                    key=None,
+                    tags=None,
+                )
+            )
+        assert result["success"] is False
+        assert result["disabled"] is True
+
+    def test_blank_target_is_error(self, isolated_db):
+        import asyncio
+
+        from cli_agent_orchestrator.mcp_server.server import store_lesson
+
+        with patch(LEARNING_TARGET, return_value=True):
+            result = asyncio.run(
+                store_lesson(target_agent_profile="  ", content="A lesson.", key=None, tags=None)
+            )
+        assert result["success"] is False
+        assert "target_agent_profile" in result["error"]
+
+    def test_lesson_lands_in_target_worker_scope(self, isolated_db, tmp_path):
+        """Called from a retrospector terminal, the persisted scope_id is the WORKER."""
+        import asyncio
+
+        from sqlalchemy import create_engine
+
+        from cli_agent_orchestrator.clients.database import Base, MemoryMetadataModel
+        from cli_agent_orchestrator.mcp_server import server as srv
+        from cli_agent_orchestrator.mcp_server.server import store_lesson
+        from cli_agent_orchestrator.services.memory_service import MemoryService
+
+        engine = create_engine(
+            f"sqlite:///{tmp_path / 'lesson.db'}", connect_args={"check_same_thread": False}
+        )
+        Base.metadata.create_all(bind=engine)
+        svc = MemoryService(base_dir=tmp_path / "mem", db_engine=engine)
+
+        with (
+            patch(LEARNING_TARGET, return_value=True),
+            patch(
+                "cli_agent_orchestrator.services.memory_service._is_memory_enabled",
+                return_value=True,
+            ),
+            patch.object(srv, "_get_terminal_context_from_env", return_value=self._retro_ctx()),
+            patch(
+                "cli_agent_orchestrator.services.memory_service.MemoryService",
+                return_value=svc,
+            ),
+        ):
+            result = asyncio.run(
+                store_lesson(
+                    target_agent_profile="transformer",
+                    content="Honor Lookup cache modes. Applies when: translating Lookups.",
+                    key="honor-lookup-cache-mode",
+                    tags=None,
+                )
+            )
+
+        assert result["success"] is True, result
+        assert result["scope"] == "agent"
+        assert result["scope_id"] == "transformer"  # the worker, NOT 'retrospector'
+
+        # And the persisted metadata row agrees.
+        from sqlalchemy.orm import sessionmaker
+
+        Session = sessionmaker(bind=engine)
+        with Session() as db:
+            row = db.query(MemoryMetadataModel).filter_by(key="honor-lookup-cache-mode").one()
+            assert row.scope == "agent"
+            assert row.scope_id == "transformer"
+            assert row.memory_type == "feedback"
+            # Provenance still identifies the actual caller.
+            assert row.source_terminal_id == "term-retro"

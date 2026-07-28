@@ -15,9 +15,10 @@ that never touches the flags behaves identically to one without the feature.
 worker/supervisor ──report_outcome (MCP)──▶ workflow_outcomes (SQLite)
                                                    │
 session/package completes                          ▼
-supervisor ──handoff──▶ retrospector ──reads──▶ GET /outcomes
+supervisor ──handoff──▶ retrospector ──reads──▶ list_outcomes (MCP)
                             │
-                            └──memory_store──▶ agent-scope memory lessons
+                            └──store_lesson(target_agent_profile)──▶
+                               the WORKER's agent-scope memory lessons
                                                    │
 lessons recalled in later sessions                 │ (each recall bumps
 (injected via <cao-memory> / CLAUDE.md)            │  access_count)
@@ -85,11 +86,13 @@ a package conversion, a review round.
 
 Surfaces:
 
-- **MCP tool** `report_outcome` — how agents report. Session and agent
-  profile resolve automatically from the calling terminal.
+- **MCP tools** — `report_outcome` (how agents report; session and agent
+  profile resolve automatically from the calling terminal) and
+  `list_outcomes` (how the retrospector reads them back, newest first,
+  defaulting to the caller's session).
 - **HTTP** `POST /outcomes` (write-scope gated) and
-  `GET /outcomes?session_name=&agent_profile=&workflow_name=&limit=` —
-  how the retrospector (or an operator) reads them back, newest first.
+  `GET /outcomes?session_name=&agent_profile=&workflow_name=&limit=`
+  (read-scope gated) — the operator surface.
 - Storage: `workflow_outcomes` table in CAO's SQLite DB, indexed by
   `(session_name, created_at)` and `(agent_profile, created_at)`.
 
@@ -122,9 +125,17 @@ packages this guidance).
 ## The retrospector agent
 
 `agent_store/retrospector.md` is a built-in single-purpose profile, patterned
-on `memory_manager`: it reads the session's outcomes (`GET /outcomes`),
+on `memory_manager`: it reads the session's outcomes (`list_outcomes`),
 checks which lessons already exist (`memory_recall`), and distills **0–3
-lessons per retrospection** via `memory_store`.
+lessons per retrospection** via `store_lesson`.
+
+`store_lesson` exists because `memory_store` resolves agent scope from the
+**calling** terminal's profile — a retrospector using it would file every
+lesson under `retrospector`. `store_lesson` takes a required
+`target_agent_profile` and stores into **that worker's** agent scope
+(type fixed to `feedback`), so the worker's future sessions and
+`cao memory promote <worker>` actually find the lessons. Provenance fields
+still record the retrospector as the writer.
 
 Lesson contract (enforced by the profile's rules):
 

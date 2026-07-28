@@ -107,7 +107,13 @@ def test_full_learning_loop(stack: Any) -> None:
                 friction_notes=notes,
             )
 
-        # ---- Stage 2: retrospector reads outcomes and distills ONE lesson
+        # ---- Stage 2: retrospector reads outcomes and distills ONE lesson.
+        # This runs the REAL retrospector path: the store_lesson MCP tool
+        # called from a RETROSPECTOR terminal context, targeting the
+        # transformer profile. (A prior version of this test called
+        # MemoryService.store() with a synthetic transformer context, which
+        # masked lessons landing under the retrospector's own scope — PR
+        # #515 review finding.)
         recorded = outcomes.list_outcomes(session_name="ssis-batch-1")
         assert len(recorded) == 3
         failures = [o for o in recorded if not o["success"]]
@@ -118,16 +124,40 @@ def test_full_learning_loop(stack: Any) -> None:
         "partial cache; direct join emission produced invalid Glue code in "
         "CustomerETL and OrdersETL. Applies when: converting Lookup components."
     )
-    with MEMORY_ON:
-        asyncio.run(
-            mem.store(
+    from cli_agent_orchestrator.mcp_server import server as srv
+    from cli_agent_orchestrator.mcp_server.server import store_lesson
+
+    retro_ctx = _ctx(agent="retrospector")  # the CALLER is the retrospector
+    with (
+        MEMORY_ON,
+        patch(
+            "cli_agent_orchestrator.services.settings_service.is_learning_enabled",
+            return_value=True,
+        ),
+        patch.object(srv, "_get_terminal_context_from_env", return_value=retro_ctx),
+        patch(
+            "cli_agent_orchestrator.services.memory_service.MemoryService",
+            return_value=mem,
+        ),
+    ):
+        result = asyncio.run(
+            store_lesson(
+                target_agent_profile="transformer",
                 content=lesson_text,
-                scope="agent",
-                memory_type="feedback",
                 key="lookup-partial-cache-broadcast",
-                terminal_context=_ctx(),
+                tags=None,
             )
         )
+    assert result["success"] is True, result
+    # The lesson must land in the WORKER's scope, not the retrospector's —
+    # both in the response and in the persisted metadata row.
+    assert result["scope_id"] == "transformer"
+    with mem._get_db_session() as db:
+        persisted = (
+            db.query(MemoryMetadataModel).filter_by(key="lookup-partial-cache-broadcast").one()
+        )
+        assert persisted.scope == "agent"
+        assert persisted.scope_id == "transformer"
 
     # ---- Stage 3: later sessions recall the lesson (reinforcement).
     # recall() bumps access_count through the rate-limited batch path; for
