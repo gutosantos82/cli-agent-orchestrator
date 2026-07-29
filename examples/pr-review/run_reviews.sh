@@ -354,3 +354,38 @@ if [[ -n "$remaining" ]]; then
 else
   echo "All reviews complete. Open the dashboard to triage."
 fi
+
+# --- self-learning: distill this batch's outcomes into lessons -------------------
+# Each supervisor reports one outcome per PR (Step 7 of its profile). Retrospection
+# runs ONCE per batch, not per PR, so lessons are drawn across the whole run.
+# Opt-in: only when learning is on AND at least one review was launched. The
+# retrospector reads outcomes via list_outcomes and writes worker-scoped lessons;
+# it never touches GitHub. Instruction promotion stays a separate manual step
+# (`cao memory promote <agent>` — dry-run by default).
+if [[ "$launched" -gt 0 ]] && [[ "${CAO_PRR_RETROSPECT:-1}" = "1" ]]; then
+  if curl -sf -m 5 "http://127.0.0.1:9889/outcomes" >/dev/null 2>&1; then
+    echo "Dispatching retrospector for this batch…"
+    if cao launch --agents retrospector --provider kiro_cli --yolo --headless \
+         --session-name "prr-retro" >/dev/null 2>&1; then
+      sleep 12
+      deliver_task "cao-prr-retro" \
+        "Retrospect on workflow pr-review — the review batch that just finished. Agents involved: pr_review_supervisor, correctness_reviewer, security_reviewer, tests_reviewer, conventions_reviewer, consistency_reviewer, conversation_reviewer, vision_reviewer, verifier. Read the recorded outcomes, store only lessons that would change what an agent does next time, then reply with your one-line summary." \
+        || echo "  (retrospector delivery failed — inspect: tmux attach -t cao-prr-retro)"
+      # Give it room to read outcomes and store lessons, then leave the session for
+      # inspection if it hasn't exited on its own.
+      for _ in $(seq 1 20); do
+        tmux has-session -t cao-prr-retro 2>/dev/null || break
+        sleep 15
+      done
+      if tmux has-session -t cao-prr-retro 2>/dev/null; then
+        echo "  (retrospector still running — inspect: tmux attach -t cao-prr-retro)"
+      else
+        echo "  retrospection complete — review lessons with: cao memory list"
+      fi
+    else
+      echo "  (retrospector launch failed — skipping retrospection)"
+    fi
+  else
+    echo "Learning disabled (/outcomes unavailable) — skipping retrospection."
+  fi
+fi

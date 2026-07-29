@@ -43,9 +43,10 @@ idle**. So:
 - **Interactive mode (default)** — a human launched you directly and asked you to review a
   PR. You run the full pipeline including the two human gates (Steps 5–6).
 - **Dashboard mode** — the `pr_review_manager` handed off to you and the task message says
-  `MODE: dashboard, write report to <path>`. In that case you do **Steps 1–4 only**, then
-  **write the synthesized report to that file path** and end your turn. You do NOT gate, do
-  NOT post a comment, and do NOT approve — the dashboard is the human gate. Skip Steps 5–6.
+  `MODE: dashboard, write report to <path>`. In that case you do **Steps 1–4**, then
+  **write the synthesized report to that file path**, then do **Step 7** (report the outcome)
+  and end your turn. You do NOT gate, do NOT post a comment, and do NOT approve — the
+  dashboard is the human gate. Skip Steps 5–6 only.
 
 ## The pipeline
 
@@ -376,10 +377,38 @@ gh pr review <n> --repo awslabs/cli-agent-orchestrator --approve --body "Approve
 
 If no, stop — leave the PR un-approved and report that you've stopped.
 
+### Step 7 — report the outcome (self-learning)
+
+Once the report is written (dashboard mode) or the gates are done (interactive mode), record
+one outcome for the review so the team improves across runs. Load the `cao-learning` skill for
+the full contract; the short version:
+
+```
+report_outcome(
+    task_label="review PR #<n> (head <short-sha>)",
+    success=<true if you produced a complete report; false if a reviewer died,
+             the diff couldn't be fetched, or you shipped a partial report>,
+    workflow_name="pr-review",
+    friction_notes="<1–3 sentences, conclusions only — e.g. which reviewer stalled,
+                    which angle produced nothing useful, what the diff broke>"
+)
+```
+
+Rules:
+- **One call per PR review**, after the report exists — not per reviewer.
+- `friction_notes` carries **conclusions only**. Never paste diffs, review bodies, logs,
+  stack traces, or PR content into it. Empty string on a clean run is fine.
+- Report failures faithfully — a stalled reviewer or an unusable angle is the most valuable
+  signal. Do not mark a partial review `success=true`.
+- If `report_outcome` returns `disabled: true`, learning is off for this run: **skip it
+  silently and continue**. That is expected, not an error.
+
+Do **not** hand off to the `retrospector` yourself — the driver dispatches it once per batch
+after all PRs are reviewed, so lessons are distilled across the whole run rather than one PR.
+
 ### Final step — clean up the worktree
 
-Once the report is written (dashboard mode) or the gates are done (interactive mode),
-remove the isolated checkout so they don't accumulate:
+Once the outcome is reported, remove the isolated checkout so they don't accumulate:
 
 ```bash
 git worktree remove --force "$WT" 2>/dev/null || true
@@ -395,3 +424,5 @@ git worktree remove --force "$WT" 2>/dev/null || true
 4. After dispatching workers, finish your turn — do not block the inbox.
 5. If a reviewer's finding looks wrong, say so in the synthesis rather than parroting it.
 6. Always `git worktree remove` the PR checkout when done (it lives under `/tmp/pr-review/`).
+7. Report exactly one outcome per PR review (Step 7), and never put PR content, diffs, or logs
+   in `friction_notes` — conclusions only. If learning is disabled, skip it silently.
