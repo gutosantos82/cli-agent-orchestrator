@@ -1,11 +1,47 @@
 const BASE = ''  // Vite proxy handles routing to backend
 
+/**
+ * Error thrown by fetchJSON on a non-OK response. Carries the HTTP status and
+ * the server's `detail` string so callers can branch on them (e.g. the graph
+ * export's 422 secret-gate path surfaces `detail` — the matched PATTERN name
+ * only, never the memory bytes). `message` stays "<status> <statusText>" for
+ * back-compat with existing callers.
+ */
+export interface ApiError extends Error {
+  status?: number
+  detail?: string
+  kind?: string
+  detailMeta?: Record<string, unknown>
+}
+
 async function fetchJSON<T>(url: string, opts?: RequestInit & { timeoutMs?: number }): Promise<T> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), opts?.timeoutMs ?? 10000)
   try {
     const res = await fetch(`${BASE}${url}`, { ...opts, signal: controller.signal })
-    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`)
+    if (!res.ok) {
+      // Best-effort read of the JSON error body to expose the server's
+      // `detail` without leaking a full response. A non-JSON body is fine —
+      // detail just stays undefined.
+      let detail: string | undefined
+      let kind: string | undefined
+      let detailMeta: Record<string, unknown> | undefined
+      try {
+        const body = await res.json()
+        if (body && typeof body.detail === 'string') detail = body.detail
+        if (body && body.detail && typeof body.detail === 'object') {
+          detailMeta = body.detail as Record<string, unknown>
+          if (typeof detailMeta.message === 'string') detail = detailMeta.message
+          if (typeof detailMeta.kind === 'string') kind = detailMeta.kind
+        }
+      } catch { /* non-JSON error body */ }
+      const err: ApiError = new Error(`${res.status} ${res.statusText}`)
+      err.status = res.status
+      err.detail = detail
+      err.kind = kind
+      err.detailMeta = detailMeta
+      throw err
+    }
     return res.json()
   } finally {
     clearTimeout(timeout)
@@ -54,11 +90,17 @@ export interface AgentProfileInfo {
   name: string
   description: string
   source: AgentProfileSource
+  // Other enabled directories that also define this profile name (the winner
+  // above is what loads). Empty/absent when the name is unique. (GH #280)
+  duplicated_in?: string[]
 }
 
 export interface AgentDirsSettings {
   agent_dirs: Record<string, string>
   extra_dirs: string[]
+  // Directory paths toggled OFF: kept in the list but skipped when scanning
+  // for agent profiles. (GH #280/#281)
+  disabled_dirs?: string[]
 }
 
 export interface InboxMessage {
@@ -107,6 +149,46 @@ export interface MemoryDetail extends MemorySummary {
   content: string
 }
 
+// ── Graph layer (Issue #348) ────────────────────────────────────────────
+// Wire shape of GET /graph/{provider}. Mirrors the server's GraphView.to_dict
+// (src/cli_agent_orchestrator/api/main.py get_graph_endpoint). `attrs` is an
+// open bag — the renderer reads is_hub / is_orphan but the server may add more.
+export interface GraphNode {
+  id: string
+  kind: string
+  label: string
+  status: string
+  attrs: Record<string, unknown>
+}
+
+export interface GraphEdge {
+  source: string
+  target: string
+  type: string
+  attrs: Record<string, unknown>
+}
+
+export interface GraphView {
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  meta: Record<string, unknown>
+}
+
+// Request body for POST /graph/{provider}/export. `dest` MUST be a relative
+// name; the server confines it under CAO_GRAPH_EXPORT_ROOT and rejects
+// absolute/traversal paths with 400.
+export interface GraphExportBody {
+  sink: string
+  dest: string
+  options?: Record<string, unknown>
+}
+
+export interface GraphExportResult {
+  written_files: string[]
+  sink: string
+  dest: string
+}
+
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
@@ -114,7 +196,7 @@ export const api = {
 
   // Settings
   getAgentDirs: () => fetchJSON<AgentDirsSettings>('/settings/agent-dirs'),
-  setAgentDirs: (data: { agent_dirs?: Record<string, string>; extra_dirs?: string[] }) =>
+  setAgentDirs: (data: { agent_dirs?: Record<string, string>; extra_dirs?: string[]; disabled_dirs?: string[] }) =>
     fetchJSON<AgentDirsSettings>('/settings/agent-dirs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -185,4 +267,34 @@ export const api = {
     fetchJSON<{ success: boolean }>(`/memory/${encodeURIComponent(key)}?scope=${encodeURIComponent(scope)}${scopeId ? `&scope_id=${encodeURIComponent(scopeId)}` : ''}`, { method: 'DELETE' }),
   clearMemories: (scope: string, scopeId?: string) =>
     fetchJSON<{ success: boolean; deleted_count: number }>(`/memory?scope=${encodeURIComponent(scope)}${scopeId ? `&scope_id=${encodeURIComponent(scopeId)}` : ''}`, { method: 'DELETE' }),
+
+  // Graph (Issue #348). The projection runs wiki_lint (ripgrep detectors)
+  // server-side, so both routes get a wide timeout — a populated scope can take
+  // ~30s typical, up to ~148s under load. Errors surface as ApiError (status +
+  // server detail) for the caller.
+  getGraph: (provider = 'memory', scope?: string, scopeId?: string) => {
+    const params = [
+      scope ? `scope=${encodeURIComponent(scope)}` : '',
+      scopeId ? `scope_id=${encodeURIComponent(scopeId)}` : '',
+    ].filter(Boolean).join('&')
+    return fetchJSON<GraphView>(
+      `/graph/${encodeURIComponent(provider)}${params ? `?${params}` : ''}`,
+      { timeoutMs: 120000 },
+    )
+  },
+  exportGraph: (provider = 'memory', body: GraphExportBody, scope?: string, scopeId?: string) => {
+    const params = [
+      scope ? `scope=${encodeURIComponent(scope)}` : '',
+      scopeId ? `scope_id=${encodeURIComponent(scopeId)}` : '',
+    ].filter(Boolean).join('&')
+    return fetchJSON<GraphExportResult>(
+      `/graph/${encodeURIComponent(provider)}/export${params ? `?${params}` : ''}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ options: {}, ...body }),
+        timeoutMs: 60000,
+      },
+    )
+  },
 }

@@ -4,9 +4,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +16,13 @@ SETTINGS_FILE = CAO_HOME_DIR / "settings.json"
 # Default agent directories per provider
 _DEFAULTS = {
     "kiro_cli": str(Path.home() / ".kiro" / "agents"),
-    "claude_code": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "codex": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-store"),
-    "cao_installed": str(Path.home() / ".aws" / "cli-agent-orchestrator" / "agent-context"),
+    "claude_code": str(CAO_HOME_DIR / "agent-store"),
+    "codex": str(CAO_HOME_DIR / "agent-store"),
+    "cao_installed": str(CAO_HOME_DIR / "agent-context"),
 }
+
+_BOOL_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_BOOL_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
 
 
 def _load() -> Dict[str, Any]:
@@ -92,12 +96,93 @@ def set_agent_dirs(dirs: Dict[str, str]) -> Dict[str, str]:
     return get_agent_dirs()
 
 
+def get_disabled_agent_dirs() -> List[str]:
+    """Directory paths the user has toggled OFF.
+
+    A disabled directory stays listed in Settings but is skipped when scanning
+    for (and loading) agent profiles, so its profiles disappear from the active
+    set without editing paths. Covers both provider defaults (fixes GH #281 —
+    a removed default used to silently reappear) and user extras (GH #280).
+
+    Reads from the nested schema first (``agents.disabled_dirs``), falls back
+    to the legacy flat key (``disabled_agent_dirs``) — same contract as the
+    sibling ``agents.dirs`` / ``agents.extra_dirs`` settings.
+    """
+    settings = _load()
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and isinstance(nested.get("disabled_dirs"), list):
+        # list(...) narrows the untyped-dict Any to list[str] for mypy's
+        # no-any-return gate, matching get_extra_agent_dirs' return guard.
+        return list(nested["disabled_dirs"])
+    dirs = settings.get("disabled_agent_dirs", [])
+    return dirs if isinstance(dirs, list) else []
+
+
+def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
+    """Persist which configured directories are disabled.
+
+    Only paths that are actually configured (a provider default from
+    ``get_agent_dirs`` or a user extra) are accepted — an arbitrary path would
+    silently match nothing during scanning, so rejecting it keeps the stored
+    state honest and the UI truthful. Validation uses the same path
+    normalization as the scan/load side (``utils.paths.normalized_path``), so
+    a valid directory sent in a different spelling (trailing slash, ``~``,
+    symlink) is accepted rather than silently dropped; what gets PERSISTED is
+    always the configured spelling, so the UI's exact-string matching keeps
+    working. Order and duplicates are normalized away.
+
+    Writes to the nested schema (``agents.disabled_dirs``) and the legacy flat
+    key (``disabled_agent_dirs``) for backward compatibility — mirroring
+    ``set_agent_dirs`` / ``set_extra_agent_dirs``.
+    """
+    norm_to_configured = {
+        normalized_path(v): v
+        for v in list(get_agent_dirs().values()) + list(get_extra_agent_dirs())
+        if isinstance(v, str)
+    }
+    seen: Set[str] = set()
+    cleaned: List[str] = []
+    for d in dirs:
+        if not isinstance(d, str) or not d.strip():
+            continue
+        configured = norm_to_configured.get(normalized_path(d.strip()))
+        if configured is not None and configured not in seen:
+            seen.add(configured)
+            cleaned.append(configured)
+    settings = _load()
+    # Write nested format
+    agents_section = settings.get("agents", {})
+    if not isinstance(agents_section, dict):
+        agents_section = {}
+    agents_section["disabled_dirs"] = cleaned
+    settings["agents"] = agents_section
+    # Also write flat key for backward compat
+    settings["disabled_agent_dirs"] = cleaned
+    _save(settings)
+    logger.info(f"Disabled agent dirs: {cleaned}")
+    return cleaned
+
+
 # Default server tuning values
 _SERVER_DEFAULTS = {
     "mcp_request_timeout": 30,
     "event_bus_max_queue_size": 1024,
     "provider_init_timeout": 60,
     "startup_prompt_handler_timeout": 20,
+    # Rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+    # status detection and GET /terminals/{id}/output (mode=full) — see
+    # StatusMonitor._process_chunk. The old fixed 8192 was measured too small
+    # against the pyte screen geometry this buffer has to outlive: a single
+    # full-screen repaint of a 220x50 viewport is already ~11,000 visible
+    # characters before per-line/per-cell ANSI escapes are added on top, so
+    # one repaint alone could exceed the old cap. A long, chatty session with
+    # several such repaints (status-bar refreshes, spinner frames, full menu
+    # redraws) could evict a still-pending prompt from the buffer before it
+    # was ever read back. 32KB covers several trailing repaints instead of a
+    # fraction of one, while staying a deliberately bounded trade-off (not
+    # unbounded scrollback) — configurable rather than a second blind guess,
+    # since the "safe" size is provider/workload-dependent, not one constant.
+    "state_buffer_max": 32768,
 }
 
 # Env-var overrides for server settings. Precedence: env var > settings.json > default.
@@ -106,6 +191,7 @@ _SERVER_ENV_VARS = {
     "event_bus_max_queue_size": "CAO_EVENT_BUS_MAX_QUEUE_SIZE",
     "provider_init_timeout": "CAO_PROVIDER_INIT_TIMEOUT",
     "startup_prompt_handler_timeout": "CAO_STARTUP_PROMPT_HANDLER_TIMEOUT",
+    "state_buffer_max": "CAO_STATE_BUFFER_MAX",
 }
 
 
@@ -121,9 +207,17 @@ def get_server_settings() -> Dict[str, Any]:
     Returns a dict with the following keys (defaults shown):
       - mcp_request_timeout (30): Seconds to wait for MCP HTTP calls
       - event_bus_max_queue_size (1024): Max events buffered per subscriber
-      - provider_init_timeout (60): Seconds to wait for a CLI agent to reach IDLE
-      - startup_prompt_handler_timeout (20): Seconds to handle startup prompts
-        (e.g., workspace trust dialogs) before giving up
+      - provider_init_timeout (60): Seconds to wait for a CLI agent to reach IDLE.
+        Also the hard outer cap on total time the startup-prompt handler may run.
+      - startup_prompt_handler_timeout (20): Idle gap, in seconds, between
+        consecutive startup prompts (e.g. workspace trust / bypass dialogs). The
+        handler keeps polling and resets this timer every time it answers a
+        prompt; it stops once no new prompt appears for this many seconds (so a
+        dialog a cold/containerized start renders late is still handled). Total
+        time is bounded by provider_init_timeout.
+      - state_buffer_max (32768): Bytes of raw terminal output StatusMonitor
+        keeps per terminal for raw-path status detection and
+        GET /terminals/{id}/output (mode=full)
 
     Values can be set via CAO_* environment variables or in
     ~/.aws/cli-agent-orchestrator/settings.json under the "server" key:
@@ -133,7 +227,8 @@ def get_server_settings() -> Dict[str, Any]:
             "mcp_request_timeout": 120,
             "event_bus_max_queue_size": 8192,
             "provider_init_timeout": 90,
-            "startup_prompt_handler_timeout": 5
+            "startup_prompt_handler_timeout": 5,
+            "state_buffer_max": 65536
           }
         }
     """
@@ -169,10 +264,21 @@ def get_server_settings() -> Dict[str, Any]:
     # Validate types and ranges; coerce to int for queue size
     for key, default in _SERVER_DEFAULTS.items():
         val = result[key]
-        if isinstance(val, bool) or not isinstance(val, (int, float)) or val <= 0:
+        # int(val), not val <= 0: a float in (0, 1) (e.g. a settings.json
+        # value of 0.5) passes val <= 0 but truncates to 0 once coerced to
+        # int below (state_buffer_max) or by Queue(maxsize=...)
+        # (event_bus_max_queue_size), reintroducing the same
+        # unbounded-buffer/unbounded-queue failure mode this validation
+        # exists to prevent. isinstance(val, (int, float)) above guarantees
+        # int(val) cannot itself raise here.
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or int(val) <= 0:
             logger.warning(f"Invalid server setting {key}={val!r}, using default {default}")
             result[key] = default
     result["event_bus_max_queue_size"] = int(result["event_bus_max_queue_size"])
+    # buffer[-state_buffer_max:] requires an int -- a float survives the
+    # generic isinstance(val, (int, float)) check above (e.g. a settings.json
+    # value of 32768.0), and a float slice bound raises TypeError.
+    result["state_buffer_max"] = int(result["state_buffer_max"])
     _server_settings_cache = result
     _server_settings_mtime_ns = mtime_ns
     return dict(result)
@@ -181,15 +287,27 @@ def get_server_settings() -> Dict[str, Any]:
 def get_memory_settings() -> Dict[str, Any]:
     """Get memory-related settings.
 
-    Precedence per key: CAO_* env var > settings.json > built-in default.
+    Precedence for most keys: CAO_* env var > settings.json > built-in
+    default. ``memory.lint_enabled`` intentionally uses
+    ``is_memory_lint_enabled()`` fail-closed semantics instead: any explicit
+    false in persisted settings or ``CAO_MEMORY_LINT_ENABLED`` disables lint.
 
     ``enabled`` defaults to ``True`` (opt-out) to preserve current shipping
     behavior. Setting it to ``False`` disables all memory subsystem
     operations — see ``is_memory_enabled()``.
     """
     settings = _load()
-    defaults: Dict[str, Any] = {"enabled": True, "flush_threshold": 0.85}
+    defaults: Dict[str, Any] = {
+        "enabled": True,
+        "flush_threshold": 0.85,
+        "lint_enabled": True,
+        "learning_enabled": False,
+        "instruction_promotion_enabled": False,
+    }
     saved = settings.get("memory", {})
+    if not isinstance(saved, dict):
+        logger.warning("Invalid settings.memory=%r (expected object); using defaults", saved)
+        saved = {}
     result = dict(defaults)
     result.update(saved)
 
@@ -197,6 +315,20 @@ def get_memory_settings() -> Dict[str, Any]:
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
     if env_enabled is not None and env_enabled.strip() != "":
         result["enabled"] = env_enabled.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_LEARNING_ENABLED beats settings.json
+    env_learning = os.environ.get("CAO_MEMORY_LEARNING_ENABLED")
+    if env_learning is not None and env_learning.strip() != "":
+        result["learning_enabled"] = env_learning.strip().lower() in ("1", "true", "yes")
+
+    # Env-var overlay: CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED beats settings.json
+    env_promotion = os.environ.get("CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED")
+    if env_promotion is not None and env_promotion.strip() != "":
+        result["instruction_promotion_enabled"] = env_promotion.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
     # Env-var overlay: CAO_MEMORY_FLUSH_THRESHOLD beats settings.json
     env_threshold = os.environ.get("CAO_MEMORY_FLUSH_THRESHOLD")
@@ -216,7 +348,54 @@ def get_memory_settings() -> Dict[str, Any]:
                 f"(expected float); using file/default"
             )
 
+    result["lint_enabled"] = is_memory_lint_enabled(settings=settings)
     return result
+
+
+def _coerce_optional_bool(value: Any, *, label: str) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "":
+            return None
+        if normalized in _BOOL_TRUE_VALUES:
+            return True
+        if normalized in _BOOL_FALSE_VALUES:
+            return False
+    logger.warning("Ignoring invalid %s=%r (expected bool); using file/default", label, value)
+    return None
+
+
+def _explicit_false(value: Any, *, label: str) -> bool:
+    return _coerce_optional_bool(value, label=label) is False
+
+
+def is_memory_lint_enabled(settings: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True unless persisted settings or env explicitly disable lint.
+
+    This is intentionally not normal env precedence: either explicit false
+    source disables lint, so env true cannot override persisted false and
+    persisted true cannot override env false.
+    """
+    try:
+        data = settings if settings is not None else _load()
+        saved = data.get("memory", {}) if isinstance(data, dict) else {}
+        if not isinstance(saved, dict):
+            saved = {}
+
+        if _explicit_false(saved.get("lint_enabled", True), label="memory.lint_enabled"):
+            return False
+
+        raw_env = os.environ.get("CAO_MEMORY_LINT_ENABLED")
+        if raw_env is not None and raw_env.strip() != "":
+            coerced = _coerce_optional_bool(raw_env, label="CAO_MEMORY_LINT_ENABLED")
+            if coerced is False:
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to read memory.lint_enabled, defaulting to True: {e}")
+        return True
 
 
 def is_memory_enabled() -> bool:
@@ -231,6 +410,48 @@ def is_memory_enabled() -> bool:
         logger.warning(f"Failed to read memory.enabled, defaulting to True: {e}")
         return True
     return bool(value)
+
+
+def is_learning_enabled() -> bool:
+    """Return True when workflow self-learning (outcome capture) is enabled.
+
+    Precedence: CAO_MEMORY_LEARNING_ENABLED env var > memory.learning_enabled
+    in settings.json > default (False — learning is opt-in).
+
+    Learning is a child of the memory subsystem: lessons distilled from
+    outcomes are stored via memory, so a disabled memory subsystem disables
+    learning regardless of this flag. Read errors default to False (opt-in
+    features fail closed, mirroring the default).
+    """
+    try:
+        settings = get_memory_settings()
+        return bool(settings.get("enabled", True)) and bool(settings.get("learning_enabled", False))
+    except Exception as e:
+        logger.warning(f"Failed to read memory.learning_enabled, defaulting to False: {e}")
+        return False
+
+
+def is_instruction_promotion_enabled() -> bool:
+    """Return True when learned-lesson promotion into profile files is enabled.
+
+    Precedence: CAO_MEMORY_INSTRUCTION_PROMOTION_ENABLED env var >
+    memory.instruction_promotion_enabled in settings.json > default (False).
+
+    Promotion is the highest-risk learning tier — it mutates agent profile
+    markdown shared by every session — so it nests inside learning:
+    promotion ⊂ learning ⊂ memory. Any parent off forces it off. Read
+    errors default to False (fail closed).
+    """
+    try:
+        if not is_learning_enabled():
+            return False
+        settings = get_memory_settings()
+        return bool(settings.get("instruction_promotion_enabled", False))
+    except Exception as e:
+        logger.warning(
+            f"Failed to read memory.instruction_promotion_enabled, defaulting to False: {e}"
+        )
+        return False
 
 
 def get_compile_mode() -> str:
@@ -287,13 +508,33 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
     Supported keys:
         ``enabled`` (bool) — master switch for the memory subsystem.
         ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
+        ``lint_enabled`` (bool) — expensive wiki lint enrichment switch.
+        ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
+        ``instruction_promotion_enabled`` (bool) — learned-lesson promotion
+        into agent profile files (requires learning_enabled).
     """
     settings = _load()
     memory = settings.get("memory", {})
+    if not isinstance(memory, dict):
+        memory = {}
 
     if key == "enabled":
         if not isinstance(value, bool):
             raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "lint_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"lint_enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "learning_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(f"learning_enabled must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key == "instruction_promotion_enabled":
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"instruction_promotion_enabled must be a bool, got {type(value).__name__}"
+            )
         memory[key] = value
     elif key == "flush_threshold":
         fval = float(value)
@@ -347,6 +588,12 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     # Also write flat key for backward compat
     settings["extra_agent_dirs"] = extra_agent_dirs
     _save(settings)
+    # Prune disabled entries that no longer point at any configured directory —
+    # otherwise removing an extra dir leaves a stale disabled entry behind, and
+    # re-adding that path later would come back silently pre-disabled.
+    disabled = get_disabled_agent_dirs()
+    if disabled:
+        set_disabled_agent_dirs(disabled)
     return extra_agent_dirs
 
 

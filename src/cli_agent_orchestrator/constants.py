@@ -22,6 +22,29 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back when the value is invalid."""
+    try:
+        return float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    """Read a float env var, falling back when the value is invalid OR non-positive.
+
+    For env vars that feed a ``threading.Event.wait(timeout)``-style poll
+    interval, a non-positive value isn't just atypical, it's actually
+    invalid for the parameter's meaning: ``Event.wait(0)``/``wait(negative)``
+    returns immediately, turning a periodic poll loop into a hot spin (round-3
+    Copilot review on #397, ``PIPE_LIVENESS_CHECK_INTERVAL_S``). Treated the
+    same way ``_env_float`` already treats a malformed string — fall back to
+    the default — rather than introducing a separate arbitrary floor value.
+    """
+    value = _env_float(name, default)
+    return value if value > 0 else default
+
+
 # =============================================================================
 # Session Configuration
 # =============================================================================
@@ -45,11 +68,51 @@ DEFAULT_PROVIDER = ProviderType.KIRO_CLI.value
 # Higher values provide more context but increase memory usage
 TMUX_HISTORY_LINES = 200
 
+# Foreground commands to treat as bracketed-paste INCOMPATIBLE.
+# (\x1b[200~...\x1b[201~). send_keys(force_bracketed_paste=True) checks the
+# pane's live #{pane_current_command} against this set before wrapping, so a
+# terminal whose provider process has already exited back to a bare shell
+# (e.g. after a TUI's own `/exit`) doesn't get the escape bytes glued onto
+# the first token of the next command. Bash is included deliberately even
+# though it CAN understand bracketed paste: readline's support is
+# version/config-dependent (default-off before readline 8.1/bash 5.1,
+# default-on after, and always overridable via `set enable-bracketed-paste`
+# in .inputrc) and there's no reliable way to detect from here whether it's
+# active in a given pane -- so the safe default is to skip wrapping rather
+# than risk the pasted markers leaking into the command on a
+# bracketed-paste-off bash.
+BRACKETED_PASTE_INCOMPATIBLE_SHELLS = frozenset(
+    {"sh", "dash", "bash", "zsh", "ksh", "mksh", "csh", "tcsh", "fish", "ash"}
+)
+
 # =============================================================================
 # Application Directory Structure
 # =============================================================================
-# Base directory for all CAO data (~/.aws/cli-agent-orchestrator)
-CAO_HOME_DIR = Path.home() / ".aws" / "cli-agent-orchestrator"
+# Base directory for all CAO data. Defaults to ``~/.aws/cli-agent-orchestrator``,
+# overridable via the ``CAO_HOME_DIR`` env var (read at import, mirroring the
+# ``CAO_AGENTS_DIR`` / ``CAO_GRAPH_EXPORT_ROOT`` convention). Every path below
+# derives from it, so one override relocates the whole tree. Motivating case:
+# environments that restrict reads under ``~/.aws`` at the OS level (e.g.
+# AppArmor, mount namespaces, or similar path-based sandboxing) to protect
+# credentials; pointing this outside ``~/.aws`` keeps the sandbox enabled.
+# Must be set before this module is first imported. Empty or whitespace-only
+# values are treated as unset; tilde is expanded and the result is resolved to
+# an absolute path.
+_cao_home_raw = os.environ.get("CAO_HOME_DIR", "").strip()
+CAO_HOME_DIR = (
+    Path(_cao_home_raw).expanduser().resolve()
+    if _cao_home_raw
+    else Path.home() / ".aws" / "cli-agent-orchestrator"
+)
+
+# Ensure the base directory exists with owner-only permissions. When relocated
+# outside ~/.aws there is no parent permission umbrella protecting the DB,
+# memory, agent-store, and terminal logs from other local users.
+CAO_HOME_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+try:
+    os.chmod(CAO_HOME_DIR, 0o700)
+except OSError:
+    pass  # best-effort: may fail on read-only mounts or non-owned dirs
 
 # Managed environment variable file
 CAO_ENV_FILE = CAO_HOME_DIR / ".env"
@@ -60,23 +123,81 @@ DB_DIR = CAO_HOME_DIR / "db"
 # Log file directory structure
 LOG_DIR = CAO_HOME_DIR / "logs"
 TERMINAL_LOG_DIR = LOG_DIR / "terminal"  # Per-terminal log files for pipe-pane output
-TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True)
+TERMINAL_LOG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 # FIFO directory for event-driven terminal output streaming
 FIFO_DIR = CAO_HOME_DIR / "fifos"  # Named pipes for tmux pipe-pane streaming
-FIFO_DIR.mkdir(parents=True, exist_ok=True)
+FIFO_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 # =============================================================================
 # Event-Driven State Detection Configuration
 # =============================================================================
-# Rolling buffer size for state detection (8KB)
-# Keeps trailing 8KB of terminal output for pattern matching
-STATE_BUFFER_MAX = 8192
+# The rolling per-terminal raw-output buffer StatusMonitor keeps for raw-path
+# status detection and GET /terminals/{id}/output (mode=full) is a server
+# tuning value, not a fixed constant -- see settings_service.py's
+# ``_SERVER_DEFAULTS["state_buffer_max"]`` / ``get_server_settings()``.
 
 # Max events buffered per subscriber queue before dropping. Claude's TUI startup
 # can emit thousands of small chunks in a short burst, so keep this comfortably
 # above the old 1024 default while still bounded.
 EVENT_BUS_MAX_QUEUE_SIZE = _env_int("CAO_EVENT_BUS_MAX_QUEUE_SIZE", 16384)
+
+# ---- pipe-pane liveness watchdog (issue #388) -------------------------------
+# tmux's own pipe-pane forwarder can silently stop delivering bytes to the FIFO
+# after a burst of alternate-screen redraws — the pane keeps rendering (visible
+# via capture-pane) but the piped copy freezes, so the FIFO reader, the
+# StatusMonitor buffer, and GET /terminals/{id}/output all stall on stale
+# content indefinitely (pane_pipe still reports 1; nothing errors). The
+# FifoManager watchdog compares tmux's live pane content against whether the
+# FIFO delivered any bytes in the same window: pane advanced + FIFO silent =
+# a stalled forwarder, which it re-arms (stop_pipe_pane then pipe_pane — a bare
+# re-pipe would just toggle the already-"piped" pane OFF).
+PIPE_LIVENESS_CHECK_INTERVAL_S = _env_positive_float("CAO_PIPE_LIVENESS_CHECK_INTERVAL_S", 4.0)
+# Lines of live pane content compared to decide whether the pane advanced. A
+# tail is enough: a stall diverges the visible screen, and comparing only the
+# tail keeps each check to one cheap capture-pane call.
+PIPE_LIVENESS_TAIL_LINES = _env_int("CAO_PIPE_LIVENESS_TAIL_LINES", 80)
+# Consecutive diverging checks (pane advanced, FIFO delivered nothing) before
+# re-arming. Default 2, not 1: a single diverging check can be a false
+# positive on a healthy-but-bursty pipe (a burst lands just before the check
+# boundary and the reader hasn't drained it yet) and the immediate
+# stop-then-start re-arm loses any bytes produced in that gap. Requiring two
+# consecutive diverging checks absorbs that race at the cost of one extra
+# interval of recovery latency on a genuine stall.
+PIPE_LIVENESS_STALL_CHECKS = _env_int("CAO_PIPE_LIVENESS_STALL_CHECKS", 2)
+# Consecutive re-arm *failures* (rearm() itself raising) before the watchdog
+# gives up on a terminal and drops its enrollment, instead of retrying forever
+# with a WARNING/exception log every failure.
+PIPE_LIVENESS_MAX_REARM_FAILURES = _env_int("CAO_PIPE_LIVENESS_MAX_REARM_FAILURES", 5)
+# Cold-start stall deadline (harness-control#93): the divergence check above
+# can ONLY ever catch a pipe that WAS delivering and then went stale — it
+# requires a change from an established "healthy" baseline. A pipe that has
+# been dead since the terminal was created never establishes one: if the
+# shell renders its prompt once and then sits idle (the common case), every
+# check sees the identical content as the last, "diverged_from_baseline" is
+# always False, and the watchdog can wait forever without ever re-arming —
+# meanwhile wait_for_shell() times out (60s default) waiting for a FIFO
+# buffer that was never going to fill. This is a separate, positive check:
+# has the FIFO delivered ANYTHING at all since the terminal was registered?
+# If not, and this much time has passed, and the live pane already has real
+# content (ruling out "still genuinely booting, nothing to show yet"), the
+# forwarder never started forwarding in the first place — re-arm immediately
+# rather than waiting on a divergence that will never arrive. Deliberately
+# much shorter than PIPE_LIVENESS_CHECK_INTERVAL_S's steady-state cadence:
+# this is a one-shot "did it ever start" deadline, not a recurring poll.
+PIPE_LIVENESS_COLD_START_GRACE_S = _env_float("CAO_PIPE_LIVENESS_COLD_START_GRACE_S", 3.0)
+# Cap on cold-start re-arm ATTEMPTS (not exceptions — rearm() succeeding but the
+# pipe still never delivering counts here too), separate from
+# PIPE_LIVENESS_MAX_REARM_FAILURES (which only counts rearm() raising). Without
+# this, a terminal whose pipe is genuinely, permanently dead (not just racing a
+# one-time attach timing gap) would re-trigger the cold-start check every grace
+# period forever: a successful rearm() doesn't mark the FIFO as having
+# delivered — only the reader thread pulling a real byte off it does — so
+# "still False after grace period" stays true and the same terminal gets
+# re-armed and replayed indefinitely, an unbounded stop/start + replay loop.
+# After this many attempts, give up loudly and drop the terminal from the
+# watchdog, exactly like the rearm()-exception path already does.
+PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS = _env_int("CAO_PIPE_LIVENESS_MAX_COLD_START_ATTEMPTS", 5)
 
 # pyte-rendered status detection. When enabled, the StatusMonitor feeds each
 # terminal's output through a pyte terminal emulator and runs detection against
@@ -95,10 +216,18 @@ EVENT_BUS_MAX_QUEUE_SIZE = _env_int("CAO_EVENT_BUS_MAX_QUEUE_SIZE", 16384)
 # unaffected. Set CAO_PYTE_STATUS=false to fall back to the raw-stream path.
 CAO_PYTE_STATUS = os.environ.get("CAO_PYTE_STATUS", "true").lower() == "true"
 
-# pyte screen geometry — mirror the tmux pane size (clients/tmux.py x=220 y=50)
-# so the rendered viewport matches what the agent's TUI actually drew.
-PYTE_SCREEN_COLS = 220
-PYTE_SCREEN_ROWS = 50
+# pyte screen geometry. CAO's tmux client creates panes at 220x50, but when a
+# user ATTACHES a terminal larger than that, tmux resizes the panes to the
+# client size and the agent's TUI redraws to fill it. The pyte composite must be
+# at least as large as any attached terminal, or the bottom-anchored input box
+# (────/❯/────) renders BELOW the composite and get_status_from_screen never
+# sees the idle/ready prompt → init/turn detection times out (observed live with
+# a 215x62 terminal: the ❯ box landed on row ~60, off a 50-row pyte screen).
+# Oversize generously so no realistic terminal clips; extra blank rows/cols are
+# harmless (get_status_from_screen filters blank lines and anchors on the bottom
+# non-blank rows). See also clients/tmux.py default pane size.
+PYTE_SCREEN_COLS = 400
+PYTE_SCREEN_ROWS = 200
 
 # Quiescence debounce for rendered-screen detection (seconds). Detection runs on
 # two edges: the RISING edge (output resumes after quiet → likely PROCESSING)
@@ -161,6 +290,32 @@ LOCAL_AGENT_STORE_DIR = CAO_HOME_DIR / "agent-store"
 # Local skill store for installed CAO skills
 SKILLS_DIR = CAO_HOME_DIR / "skills"
 
+# Confinement root for graph-layer sink exports (Issue #348, B3). Every graph
+# sink writes ONLY under this directory: ``dest`` is treated as a path
+# relative to this root and joined via ``safe_join_under_base`` (realpath
+# containment), so no export can escape it. Override with the
+# ``CAO_GRAPH_EXPORT_ROOT`` env var — resolved at CALL time by
+# ``graph_export_root()`` (below) so tests and operators can point it at a
+# scratch directory without re-importing. Default lives under CAO_HOME_DIR,
+# mirroring the KIRO_AGENTS_DIR env-override convention; never /tmp or cwd.
+GRAPH_EXPORT_ROOT_DEFAULT = CAO_HOME_DIR / "graph-exports"
+
+
+def graph_export_root() -> Path:
+    """Resolve the graph-export confinement root (env-overridable at call time).
+
+    Reads ``CAO_GRAPH_EXPORT_ROOT`` on each call so a monkeypatched/exported
+    value takes effect without a module reload; falls back to
+    ``GRAPH_EXPORT_ROOT_DEFAULT`` (``~/.aws/cli-agent-orchestrator/
+    graph-exports``). The directory need not exist yet — sinks create it under
+    the confined join.
+    """
+    return Path(os.environ.get("CAO_GRAPH_EXPORT_ROOT", str(GRAPH_EXPORT_ROOT_DEFAULT)))
+
+
+# OpenTelemetry service.name for CAO's spans/metrics.
+OTEL_SERVICE_NAME = "cao"
+
 # Provider-specific agent directories
 KIRO_AGENTS_DIR = Path(os.environ.get("CAO_AGENTS_DIR", str(Path.home() / ".kiro" / "agents")))
 COPILOT_AGENTS_DIR = Path.home() / ".copilot" / "agents"  # Copilot custom agents
@@ -207,6 +362,9 @@ CORS_ORIGINS = [
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    # Secondary Vite dev-server port (used when :5173 is already taken).
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
 ] + _split_env_list("CAO_CORS_ORIGINS")
 
 
@@ -369,6 +527,12 @@ WORKFLOW_MAX_SPEC_BYTES = 256 * 1024
 WORKFLOW_OUTPUT_SCHEMA_MAX_DEPTH = 8
 WORKFLOW_MAX_INPUTS = 64
 
+# Max size (bytes) of the compact-JSON resolved inputs map delivered to a script
+# run via the CAO_WORKFLOW_INPUTS spawn-env key. Enforced at the run route, on
+# the RESOLVED map, BEFORE any journal write or registry registration (ADR-5) —
+# never inside _build_env. An oversized payload is rejected as ValueError -> 400.
+WORKFLOW_INPUTS_MAX_BYTES = 32768
+
 # Units (from units-generation) whose constructs are EXECUTABLE in the current
 # Bolt. Empty in Bolt 1: the run engine (N5) is not shipped, so every
 # non-sequential mode and every loop/conditional construct tags as reserved.
@@ -440,8 +604,9 @@ WORKFLOW_RUN_REQUEST_TIMEOUT = (WORKFLOW_STEP_TIMEOUT + 120.0) * 12 + 180.0  # =
 SCRIPT_LINT_DISALLOWED_IMPORT_PREFIXES = frozenset({"cli_agent_orchestrator"})
 
 # Modules whose import earns a nondeterminism WARNING (U1-A3, Q3=A): resume
-# replays journaled calls and requires deterministic re-execution. Import-level
-# only — no call-site analysis. A warning never fails a script (FR-1.7).
+# re-executes the frozen script, including completed ``run_step`` calls, so
+# deterministic control flow keeps repeated work predictable. Import-level only
+# — no call-site analysis. A warning never fails a script (FR-1.7).
 SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "time", "datetime"})
 
 # Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,
@@ -458,3 +623,28 @@ WORKFLOW_ENV_ALLOWLIST = frozenset(
 # changes — do not simplify away as duplicate validation (the effective
 # accepted length is 64 via WORKFLOW_NAME_RE; this cap is the outer fence).
 WORKFLOW_ENV_VALUE_MAX_LEN = 256
+
+# Model-ID validation for the explicit per-call ``model`` override on
+# handoff/assign (issue reported via PR #501 review). The override reaches a
+# provider's own launch-command builder (e.g. Codex/Kimi's ``--model
+# <value>``) which is shlex-quoted before delivery, so classic word-splitting
+# injection is not reachable -- but a control character or newline surviving
+# quoting into the command string is still a delivery hazard (this codebase
+# already treats that class of input as one: claude_code.py escapes newlines
+# in system_prompt to prevent tmux paste-buffer chunking, and bash's own
+# bracketed-paste-safety is called out in tmux.py). No allowlist is needed
+# (unlike WORKFLOW_ENV_ALLOWLIST's fixed key set) since a model id is
+# free-form per-provider, but a conservative charset covers every real model
+# id across all nine providers, including OpenCode's "vendor/model" form.
+MODEL_ID_RE = r"^[A-Za-z0-9._:/-]+$"
+MODEL_ID_MAX_LEN = 128
+
+# Script-runner subprocess lifecycle (Bolt 3, U4/C1). Wall-clock bound + grace,
+# output ring-buffer cap, engine-owned scratch root for resume materialization.
+WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
+# INVARIANT: WORKFLOW_SCRIPT_TIMEOUT + WORKFLOW_SCRIPT_TERM_GRACE must be
+# <= WORKFLOW_RUN_REQUEST_TIMEOUT (= 8820.0), so the blocking POST socket outlives
+# the reap+grace envelope (tech-stack-decisions B3 fix). 8700 + 5 = 8705 <= 8820.
+WORKFLOW_SCRIPT_TIMEOUT = 8700.0
+WORKFLOW_SCRIPT_LOG_CAP = 256 * 1024  # per-stream tail cap, bytes (BR-24/25, Q7=A)
+WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 (BR-30)

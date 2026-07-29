@@ -282,6 +282,9 @@ class TestGetStatus:
         assert provider.get_status(output) == TerminalStatus.WAITING_USER_ANSWER
 
     def test_empty_output_returns_unknown(self):
+        # native=None always falls through (no dispatch-timing guess); on tmux
+        # the live-read fallback is a pass-through, so an empty buffer hits
+        # Cursor's own no-output default directly.
         provider = make_provider()
         assert provider.get_status("") == TerminalStatus.UNKNOWN
 
@@ -766,6 +769,38 @@ class TestBuildCommand:
         assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
+    def test_mcp_resolves_bundled_command_in_manifest(self, mock_load):
+        # Wiring guard: the bare cao-mcp-server command must be rewritten to
+        # a PATH-independent invocation in the written plugin manifest. A
+        # refactor that drops the resolve_mcp_server_config call fails this.
+        import json
+        from pathlib import Path
+
+        profile = MagicMock()
+        profile.model = None
+        profile.system_prompt = None
+        profile.mcpServers = {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}}
+        mock_load.return_value = profile
+        provider = make_provider(agent_profile="developer")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        # NOTE: mcp_resolution and cursor_cli import the SAME shutil module
+        # object, so a blanket which->None would break the provider's own
+        # cursor-binary lookup (stubbed by the autouse fixture). Only the
+        # cao-mcp-server lookup may miss.
+        which_cursor_keeps_working = lambda name: (
+            None if name == "cao-mcp-server" else "/usr/local/bin/cursor-agent"
+        )
+        with (
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", side_effect=which_cursor_keeps_working),
+        ):
+            cmd = provider._build_cursor_command()
+        m = re.search(r"--plugin-dir\s+(\S+)", cmd)
+        assert m is not None
+        manifest = json.loads((Path(m.group(1)) / "plugin.json").read_text(encoding="utf-8"))
+        assert manifest["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
+
+    @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_mcp_preserves_existing_cao_terminal_id(self, mock_load):
         # The constructor's terminal_id must NOT override an
         # explicit preset (matches the prior --mcp behaviour).
@@ -1187,6 +1222,50 @@ class TestMiscInterface:
         # no-op (idempotent).
         assert provider._tmp_paths == []
         provider.cleanup()  # should not raise
+
+    def test_cao_tmp_dir_fallback_follows_cao_home_dir(self, tmp_path, monkeypatch):
+        # When CAO_TMP_DIR is unset, _cao_tmp_dir() must fall back to
+        # <CAO_HOME_DIR>/tmp. Since cursor_cli binds CAO_HOME_DIR at its own
+        # import time, we must reload both constants and cursor_cli.
+        import importlib
+        import os
+
+        original_value = os.environ.get("CAO_HOME_DIR")
+        override = tmp_path / "cao-home"
+        monkeypatch.setenv("CAO_HOME_DIR", str(override))
+        monkeypatch.delenv("CAO_TMP_DIR", raising=False)
+
+        import cli_agent_orchestrator.constants as constants_module
+
+        importlib.reload(constants_module)
+
+        import cli_agent_orchestrator.providers.cursor_cli as cursor_module
+
+        importlib.reload(cursor_module)
+
+        try:
+            provider = make_provider()
+            result = provider._cao_tmp_dir()
+            resolved_override = override.resolve()
+            assert result == resolved_override / "tmp"
+            assert result.is_dir()
+        finally:
+            # Restore module state so the reload doesn't leak into later tests.
+            if original_value is not None:
+                monkeypatch.setenv("CAO_HOME_DIR", original_value)
+            else:
+                monkeypatch.delenv("CAO_HOME_DIR", raising=False)
+            importlib.reload(constants_module)
+            importlib.reload(cursor_module)
+
+    def test_cao_tmp_dir_env_override_wins(self, tmp_path, monkeypatch):
+        # CAO_TMP_DIR takes precedence over the CAO_HOME_DIR-derived fallback.
+        explicit_tmp = tmp_path / "explicit-tmp"
+        monkeypatch.setenv("CAO_TMP_DIR", str(explicit_tmp))
+        provider = make_provider()
+        result = provider._cao_tmp_dir()
+        assert result == explicit_tmp
+        assert result.is_dir()
 
     def test_paste_enter_count_is_one(self):
         assert make_provider().paste_enter_count == 1

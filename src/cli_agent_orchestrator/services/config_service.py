@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 class AgentsConfig(BaseModel):
     dirs: Dict[str, str] = Field(default_factory=dict)
     extra_dirs: List[str] = Field(default_factory=list)
+    disabled_dirs: List[str] = Field(default_factory=list)
     roles: Dict[str, List[str]] = Field(default_factory=dict)
 
 
@@ -64,6 +65,7 @@ class MemoryConfig(BaseModel):
     compile_mode: str = "llm"
     flush_threshold: float = 0.85
     compile_timeout_s: float = 120.0
+    lint_enabled: bool = True
 
 
 class TerminalConfig(BaseModel):
@@ -137,6 +139,7 @@ LEGACY_CONFIG_FILE = CAO_HOME_DIR / "config.json"
 _LEGACY_KEY_MAP: Dict[str, Tuple[str, ...]] = {
     "agents.dirs": ("agent_dirs",),
     "agents.extra_dirs": ("extra_agent_dirs",),
+    "agents.disabled_dirs": ("disabled_agent_dirs",),
     "agents.roles": ("roles",),
     "skills.extra_dirs": ("extra_skill_dirs",),
 }
@@ -175,6 +178,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_CORS_ORIGINS": ("network.cors_origins", "list", []),
     "CAO_WS_ALLOWED_CLIENTS": ("network.ws_allowed_clients", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
+    "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
     "CAO_MCP_REQUEST_TIMEOUT": ("server.mcp_request_timeout", "int", 30),
@@ -185,6 +189,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         "int",
         20,
     ),
+    "CAO_STATE_BUFFER_MAX": ("server.state_buffer_max", "int", 32768),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -310,6 +315,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
         return settings_service.get_agent_dirs()
     if path == "agents.extra_dirs":
         return settings_service.get_extra_agent_dirs()
+    if path == "agents.disabled_dirs":
+        return settings_service.get_disabled_agent_dirs()
     if path == "agents.roles":
         data = settings_service._load()
         # Nested format: {"agents": {"roles": {...}}}
@@ -325,6 +332,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "enabled":
             return settings_service.is_memory_enabled()
+        if key == "lint_enabled":
+            return settings_service.is_memory_lint_enabled()
         if key == "compile_mode":
             return settings_service.get_compile_mode()
         if key == "compile_timeout_s":
@@ -346,6 +355,11 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     """
     if override is not None:
         return override
+
+    if path == "memory.lint_enabled":
+        from cli_agent_orchestrator.services import settings_service
+
+        return settings_service.is_memory_lint_enabled()
 
     env_name = _PATH_TO_ENV.get(path)
     if env_name is not None:
@@ -386,6 +400,8 @@ def _set_value(path: str, value: Any) -> Any:
 
     if path == "agents.extra_dirs":
         return settings_service.set_extra_agent_dirs(value)
+    if path == "agents.disabled_dirs":
+        return settings_service.set_disabled_agent_dirs(value)
     if path == "skills.extra_dirs":
         return settings_service.set_extra_skill_dirs(value)
     if path.startswith("agents.dirs."):
@@ -428,6 +444,7 @@ _ALL_PATHS = sorted(
     | {
         "agents.dirs",
         "agents.extra_dirs",
+        "agents.disabled_dirs",
         "agents.roles",
         "skills.extra_dirs",
         "server.mcp_request_timeout",
@@ -435,6 +452,7 @@ _ALL_PATHS = sorted(
         "server.provider_init_timeout",
         "server.startup_prompt_handler_timeout",
         "memory.enabled",
+        "memory.lint_enabled",
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
@@ -481,6 +499,7 @@ class ConfigService:
             agents=AgentsConfig(
                 dirs=_get_value("agents.dirs", default={}),
                 extra_dirs=_get_value("agents.extra_dirs", default=[]),
+                disabled_dirs=_get_value("agents.disabled_dirs", default=[]),
                 roles=_get_value("agents.roles", default={}),
             ),
             skills=SkillsConfig(extra_dirs=_get_value("skills.extra_dirs", default=[])),
@@ -496,6 +515,7 @@ class ConfigService:
             ),
             memory=MemoryConfig(
                 enabled=_get_value("memory.enabled", default=True),
+                lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
                 compile_timeout_s=_get_value("memory.compile_timeout_s", default=120.0),

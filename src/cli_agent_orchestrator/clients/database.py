@@ -130,6 +130,29 @@ class ProjectAliasModel(Base):
     created_at = Column(DateTime(timezone=True), default=_utcnow)
 
 
+class WorkflowOutcomeModel(Base):
+    """SQLAlchemy model for workflow outcome records (self-learning Phase 1).
+
+    One row per reported outcome of a unit of agent work (a workflow step,
+    a package conversion, a review round). Outcomes are the raw signal the
+    retrospector agent distills into memory lessons — they carry short
+    labels and notes, never transcripts or file contents.
+    """
+
+    __tablename__ = "workflow_outcomes"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_name = Column(String, nullable=False)
+    workflow_name = Column(String, nullable=True)  # optional grouping label
+    task_label = Column(String, nullable=False)  # e.g. "convert package X"
+    agent_profile = Column(String, nullable=True)  # profile that did the work
+    source_terminal_id = Column(String, nullable=True)
+    success = Column(Boolean, nullable=False)
+    score = Column(Integer, nullable=True)  # optional 0-100 metric
+    friction_notes = Column(Text, nullable=False, default="")  # short, content-free
+    created_at = Column(DateTime(timezone=True), default=_utcnow)
+
+
 class FlowModel(Base):
     """SQLAlchemy model for flow metadata."""
 
@@ -181,6 +204,7 @@ def init_db() -> None:
     _migrate_workflow_index()
     _migrate_workflow_run()
     _migrate_workflow_run_step()
+    _migrate_workflow_outcome_indexes()
 
 
 def _restrict_db_file_permissions() -> None:
@@ -337,7 +361,7 @@ def _migrate_add_related_keys() -> None:
 
 
 def _migrate_workflow_index() -> None:
-    """Create the derived ``workflow_index`` table if missing (issue #312, N2).
+    """Create/upgrade the derived ``workflow_index`` table (issue #312, N2).
 
     The table is a **derived, non-authoritative** projection of the workflow
     spec YAML files on disk (B2-BR-2): it can be dropped and rebuilt
@@ -348,6 +372,15 @@ def _migrate_workflow_index() -> None:
     mirrors the existing ``_migrate_memory_indexes`` pattern. Failure is logged
     at debug and never propagated (a missing index table is recoverable: the
     next ``list`` rebuilds it).
+
+    U5 additively widens ``step_count`` to nullable: script-tier rows carry
+    NULL (step count is run-time-determined, unknowable at index time), while
+    YAML rows keep populating an int. ``CREATE TABLE IF NOT EXISTS`` only
+    covers fresh DBs — on a pre-U5 DB the column already exists as NOT NULL,
+    and SQLite cannot ``ALTER COLUMN`` to relax a NOT NULL constraint in
+    place. Same drop/rebuild precedent as ``_migrate_project_aliases_schema``:
+    the table is fully derived, so dropping it is safe — the next ``list``
+    rebuilds it from the workflow files on disk.
     """
     import sqlite3
 
@@ -355,12 +388,26 @@ def _migrate_workflow_index() -> None:
 
     try:
         with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            row = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_index'"
+            ).fetchone()
+            if row is not None:
+                cols = conn.execute("PRAGMA table_info(workflow_index)").fetchall()
+                # PRAGMA row: (cid, name, type, notnull, dflt_value, pk).
+                step_count_col = next((c for c in cols if c[1] == "step_count"), None)
+                if step_count_col is not None and step_count_col[3]:  # notnull flag set
+                    conn.execute("DROP TABLE workflow_index")
+                    conn.commit()
+                    logger.info(
+                        "Migration: rebuilt workflow_index with nullable step_count "
+                        "(dropped legacy table; rebuilt from workflow files on next list)"
+                    )
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_index ("
                 "name TEXT PRIMARY KEY, "
                 "source_path TEXT NOT NULL, "
                 "mode TEXT NOT NULL, "
-                "step_count INTEGER NOT NULL, "
+                "step_count INTEGER, "  # nullable: script-tier rows carry NULL
                 "description TEXT NOT NULL DEFAULT '', "
                 "indexed_at TEXT NOT NULL"
                 ")"
@@ -469,6 +516,33 @@ def _migrate_workflow_run_step() -> None:
                 logger.info("Migration: added call_fingerprint column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
+
+
+def _migrate_workflow_outcome_indexes() -> None:
+    """Add indexes on workflow_outcomes for retrospector queries.
+
+    The table itself is created by ``Base.metadata.create_all`` (it ships in
+    the model, so fresh and existing DBs both get it). Retrospection filters
+    by session and by agent profile over a recency window — index both.
+    Idempotent, self-connecting, failure logged at debug — mirrors
+    ``_migrate_memory_indexes``.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outcome_session "
+                "ON workflow_outcomes (session_name, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_outcome_agent "
+                "ON workflow_outcomes (agent_profile, created_at)"
+            )
+    except Exception as e:
+        logger.debug(f"workflow_outcomes index migration skipped: {e}")
 
 
 def _migrate_terminals_schema() -> None:

@@ -1,17 +1,23 @@
 ---
 name: stepfunction-agent
 description: Trigger and monitor AWS Step Functions executions
+tags:
+  - aws
+  - stepfunctions
+  - state-machine
+  - workflow
+  - execution
+capabilities:
+  - "start Step Functions state machine executions"
+  - "poll execution status until completion"
 allowedTools:
   - execute_bash
   - fs_read
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 ---
 
 # Step Functions Agent

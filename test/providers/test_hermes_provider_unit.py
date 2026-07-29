@@ -242,6 +242,24 @@ class TestHermesBuildCommand:
         assert "--model deepseek-v4-flash-free" in command
 
     @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
+    def test_explicit_model_override_wins_over_profile_model(self, mock_load):
+        mock_profile = self._profile("test-worker")
+        mock_profile.model = "deepseek-v4-flash-free"
+        mock_load.return_value = mock_profile
+
+        provider = HermesProvider("tid", "sess", "win", "developer", model="fable-5")
+        command = provider._build_hermes_command()
+
+        assert "--model fable-5" in command
+        assert "--model deepseek-v4-flash-free" not in command
+
+    def test_explicit_model_override_applies_with_no_agent_profile(self):
+        provider = HermesProvider("tid", "sess", "win", None, model="fable-5")
+        command = provider._build_hermes_command()
+
+        assert "--model fable-5" in command
+
+    @patch("cli_agent_orchestrator.providers.hermes.load_agent_profile")
     def test_build_command_quotes_profile_with_spaces_or_shell_metacharacters(self, mock_load):
         mock_load.return_value = self._profile("test worker; rm -rf /")
 
@@ -429,6 +447,9 @@ class TestHermesStatusDetection:
         assert provider.get_status("Error: failed\n") == TerminalStatus.ERROR
 
     def test_get_status_empty_output(self):
+        # native=None always falls through (no dispatch-timing guess); on tmux
+        # the live-read fallback is a pass-through, so an empty buffer hits
+        # Hermes's own no-output default (ERROR) directly.
         provider = HermesProvider("tid", "sess", "win", None)
         assert provider.get_status("") == TerminalStatus.ERROR
 

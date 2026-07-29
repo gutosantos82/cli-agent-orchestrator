@@ -21,8 +21,10 @@ or ``None`` "success". The caller (engine) maps the raised exception to its 3x
 retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
 """
 
+import asyncio
 import logging
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -38,9 +40,18 @@ logger = logging.getLogger(__name__)
 # system prompt as the first turn and reach COMPLETED without a bare IDLE.
 _READY_STATES = {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
 
+# Working states that prove the agent picked up the prompt (used to gate the
+# post-input IDLE-as-done signal below).
+_WORKING_STATES = {TerminalStatus.PROCESSING, TerminalStatus.WAITING_USER_ANSWER}
+
 # Generous readiness timeout: provider init (shell warm-up + CLI startup + MCP
 # registration + auth) can take ~15-45s. Matches the handoff caller's 120s.
 DEFAULT_READY_TIMEOUT = 120.0
+
+# Poll cadence for the post-input completion wait, and the number of consecutive
+# IDLE reads required before a post-input IDLE is accepted as "done" (issue #409a).
+_COMPLETION_POLL_INTERVAL = 1.0
+_IDLE_STABLE_POLLS = 3
 
 
 class StepExecutionError(Exception):
@@ -71,6 +82,121 @@ class StepExecutionError(Exception):
         self.terminal_id = terminal_id
 
 
+class StepCancelledError(Exception):
+    """The in-flight step wait was interrupted by a cancellation signal (#409b).
+
+    Distinct from ``StepExecutionError``: a cancellation is NOT a run-failure and
+    must NOT be retried. The engine converts it into run-level CANCELLED
+    convergence instead of consuming a retry attempt. ``terminal_id`` carries the
+    live terminal (already best-effort torn down by ``run_agent_step`` when it
+    owned it) so the caller can reconcile if needed.
+    """
+
+    def __init__(self, terminal_id: Optional[str] = None) -> None:
+        super().__init__("step wait interrupted by cancellation")
+        self.terminal_id = terminal_id
+
+
+async def _wait_for_completion(
+    terminal_id: str,
+    timeout: float,
+    cancel_event: Optional["asyncio.Event"] = None,
+) -> None:
+    """Wait for a post-input step to settle, polling ``status_monitor`` (issue #409).
+
+    Called strictly AFTER the prompt has been sent, so IDLE here can never be the
+    pre-input readiness IDLE the caller already waited past.
+
+    Completion signals (issue #409a):
+
+    - ``COMPLETED`` — definitive done marker; returns immediately (unchanged).
+    - ``IDLE`` — accepted as done ONLY after the agent was observed working (a
+      ``PROCESSING`` / ``WAITING_USER_ANSWER`` read) AND IDLE then persists for
+      ``_IDLE_STABLE_POLLS`` consecutive polls. This is the codex-style case where
+      a provider legitimately settles back to its idle prompt after answering and
+      never emits a ``COMPLETED`` marker — requiring ``COMPLETED`` alone hung the
+      step until timeout and left the whole run stuck ``running``. Gating on
+      observed-working is what keeps the idle-right-after-send window (before the
+      agent picks up the prompt) from returning early with empty output; it mirrors
+      the CLI-side ``poll_until_done`` heuristic exactly.
+
+    Interruptibility (issue #409b): if ``cancel_event`` fires mid-wait, raises
+    ``StepCancelledError`` PROMPTLY (it does not wait out the poll interval) so an
+    in-flight — possibly hung — step becomes cancellable instead of being observed
+    only at the next step boundary.
+
+    Raises:
+        StepExecutionError(kind="error"): the terminal reached ``ERROR``.
+        StepExecutionError(kind="timeout"): no completion signal within ``timeout``.
+        StepCancelledError: ``cancel_event`` fired while waiting.
+    """
+    deadline = time.monotonic() + timeout
+    observed_working = False
+    consecutive_idle = 0
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise StepCancelledError(terminal_id=terminal_id)
+
+        current = status_monitor.get_status(terminal_id)
+        if current == TerminalStatus.ERROR:
+            raise StepExecutionError(
+                f"terminal {terminal_id} reached ERROR status",
+                kind="error",
+                terminal_id=terminal_id,
+            )
+        if current == TerminalStatus.COMPLETED:
+            return
+        if current == TerminalStatus.IDLE:
+            # Post-input IDLE only counts once the agent has actually started
+            # working — otherwise the idle-before-processing window right after
+            # the send would settle immediately with empty/partial output.
+            if observed_working:
+                consecutive_idle += 1
+                if consecutive_idle >= _IDLE_STABLE_POLLS:
+                    logger.info(
+                        "step on terminal %s settled IDLE post-input "
+                        "(observed working; %d consecutive idle polls) — done",
+                        terminal_id,
+                        consecutive_idle,
+                    )
+                    return
+        elif current in _WORKING_STATES:
+            observed_working = True
+            consecutive_idle = 0
+        else:
+            # UNKNOWN or any other non-ready status: not evidence of work and not
+            # a stable idle — reset the idle streak but do not flip observed_working.
+            consecutive_idle = 0
+
+        if time.monotonic() >= deadline:
+            # Defensive: a terminal that flipped to ERROR right at the deadline is
+            # a crash, not a slow run (preserve the kind="error" vs "timeout" split).
+            if status_monitor.get_status(terminal_id) == TerminalStatus.ERROR:
+                raise StepExecutionError(
+                    f"terminal {terminal_id} reached ERROR status",
+                    kind="error",
+                    terminal_id=terminal_id,
+                )
+            raise StepExecutionError(
+                f"step on terminal {terminal_id} did not complete within {timeout}s",
+                kind="timeout",
+                terminal_id=terminal_id,
+            )
+
+        # Sleep one poll interval, but wake IMMEDIATELY if cancel fires so the
+        # cancel latency is not bounded below by the poll cadence (#409b).
+        if cancel_event is not None:
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=_COMPLETION_POLL_INTERVAL)
+            except asyncio.TimeoutError:
+                pass  # normal poll cadence — re-loop and re-check status
+            else:
+                raise StepCancelledError(terminal_id=terminal_id)
+        else:
+            await asyncio.sleep(_COMPLETION_POLL_INTERVAL)
+
+
 async def run_agent_step(
     provider: str,
     agent: str,
@@ -85,6 +211,9 @@ async def run_agent_step(
     allowed_tools: Optional[list[str]] = None,
     registry: Optional[PluginRegistry] = None,
     env_vars: Optional[dict[str, str]] = None,
+    on_terminal_created: Optional[Callable[[str], None]] = None,
+    cancel_event: Optional[asyncio.Event] = None,
+    model: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -118,10 +247,15 @@ async def run_agent_step(
         ready_timeout: Max seconds to wait for a freshly created terminal to be
             ready to accept input.
         working_directory: Optional working directory for a freshly created
-            terminal (ignored when reusing a terminal).
+            terminal (ignored when reusing a terminal). When None and
+            ``caller_id`` is set, the worker inherits the caller's pane CWD
+            via ``get_working_directory()`` (best-effort; falls back to the
+            server default on failure).
         caller_id: Terminal ID of the supervisor creating this terminal, recorded
-            so send_message can route callbacks structurally (issue #284). None
-            for operator-launched / engine steps with no supervisor.
+            so ``send_message`` can route callbacks structurally (issue #284).
+            Also used to inherit the working directory when
+            ``working_directory`` is None (best-effort). None for
+            operator-launched / engine steps with no supervisor.
         allowed_tools: Resolved allowed-tools list for the freshly created
             terminal (handoff inheritance). None lets ``create_terminal`` derive
             them from the agent profile.
@@ -137,6 +271,30 @@ async def run_agent_step(
             the substrate creates a fresh session per step, so the per-step env is
             injected cleanly (no stale step_id from a shared session). Default None
             = behavior unchanged (the handoff caller passes nothing).
+        on_terminal_created: Optional callback invoked with the ``terminal_id``
+            IMMEDIATELY after a freshly created terminal exists (before the
+            readiness wait / input). U4's script-tier orphan sweep (BR-31) uses
+            this to record the live terminal into the shared ``ScriptRunRecord``
+            ``step_states`` map AT terminal-creation time — so a subprocess that
+            crashes/times out while a run-step call is mid-flight still leaves the
+            in-flight terminal visible to ``_reconcile_orphans``. Not called for a
+            reused terminal (the caller already owns it). A callback exception is
+            logged and swallowed — recording a terminal for the sweep must never
+            fail the step. Default None = behavior unchanged.
+        cancel_event: Optional ``asyncio.Event`` the engine sets to interrupt an
+            in-flight completion wait (issue #409b). When set mid-wait, the step
+            wait is abandoned promptly (not at the next natural boundary) and a
+            ``StepCancelledError`` is raised — after tearing down a terminal this
+            call created. This is what makes a hung run cancellable: the run whose
+            provider never emits a completion signal is exactly the run that could
+            not otherwise be killed. Default None = no cancellation seam (the
+            handoff caller passes nothing) — behavior unchanged.
+        model: Explicit per-call model override for a freshly created
+            terminal (ignored when reusing a terminal), forwarded to
+            ``terminal_service.create_terminal``. Lets a handoff caller pin
+            a specific model for this one worker without a dedicated agent
+            profile. Default None = behavior unchanged (profile.model, if
+            any, still applies).
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -145,6 +303,8 @@ async def run_agent_step(
         StepExecutionError: readiness/completion wait timed out (``kind="timeout"``)
             or the terminal reached ``TerminalStatus.ERROR`` (``kind="error"``).
             ``terminal_id`` carries the live terminal so the caller can clean up.
+        StepCancelledError: ``cancel_event`` fired during the completion wait
+            (issue #409b) — a cancellation, NOT a run-failure (do not retry).
         ValueError / TimeoutError: propagated from ``terminal_service`` (e.g.
             terminal-create failure, unknown terminal) — surfaced, never swallowed.
     """
@@ -152,6 +312,35 @@ async def run_agent_step(
     terminal_id = reuse_terminal_id
 
     if created_here:
+        # Inherit working directory from supervisor when not explicitly set.
+        # Without this, a handoff worker starts in the cao-server process CWD
+        # instead of the supervisor's project directory. Best-effort: if
+        # resolution fails, fall back to the server default.
+        #
+        # caller_id is not authenticated/authorized (arrives via HTTP body);
+        # this is consistent with its existing use for callback routing (#284).
+        # The resolved path still passes _resolve_and_validate_working_directory
+        # so risk is confined to inheriting a real existing pane's CWD in a
+        # single-user trust model.
+        if working_directory is None and caller_id is not None:
+            try:
+                resolved = await asyncio.to_thread(
+                    terminal_service.get_working_directory, caller_id
+                )
+                if resolved:
+                    working_directory = resolved
+            except asyncio.CancelledError:
+                raise
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 — CWD inheritance is best-effort; step must not fail on it
+                logger.warning(
+                    "run_agent_step: failed to resolve working directory from "
+                    "caller %r, falling back to server default: %r",
+                    caller_id,
+                    exc,
+                )
+
         # When no session_name is supplied we must CREATE a fresh tmux session
         # (new_session=True): create_terminal auto-names it. Leaving the default
         # new_session=False here would auto-generate a name and then immediately
@@ -172,8 +361,27 @@ async def run_agent_step(
             allowed_tools=allowed_tools,
             caller_id=caller_id,
             env_vars=env_vars,
+            model=model,
         )
         terminal_id = terminal.id
+
+        # BR-31: make the just-created terminal visible to U4's orphan sweep
+        # BEFORE the readiness wait / input send — the dangerous edge is a
+        # subprocess that dies while this call is mid-flight, between create and
+        # the journal write. Recording it now (into the shared record's
+        # step_states) closes that window. Best-effort: a callback failure must
+        # never turn a live step into a failure.
+        if on_terminal_created is not None:
+            try:
+                on_terminal_created(terminal_id)
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 — sweep bookkeeping is best-effort; step must not fail on it
+                logger.warning(
+                    "run_agent_step: on_terminal_created callback failed for terminal %s: %s",
+                    terminal_id,
+                    exc,
+                )
 
         # Secondary in-process readiness wait: provider.initialize() can return a
         # false-positive on the shell prompt before the CLI is truly ready, so we
@@ -191,44 +399,36 @@ async def run_agent_step(
 
     assert terminal_id is not None  # for type-checkers: set in both branches
 
-    # Send the prompt (sync). Any failure raises and propagates.
-    terminal_service.send_input(terminal_id, prompt)
+    # Send the prompt. send_input is synchronous tmux I/O (bracketed paste +
+    # key sends); run it off the event loop so a slow tmux call cannot freeze
+    # the whole server for other requests (same hazard as issue #382, which was
+    # only fixed for DELETE /sessions). Any failure raises and propagates.
+    await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
 
     # Wait for completion — IN-PROCESS poll of status_monitor (NOT the
     # HTTP-polling wait_until_terminal_status, which would reintroduce the
-    # self-loopback the single-seam rule forbids). False => timeout => raise.
-    completed = await wait_until_status(terminal_id, TerminalStatus.COMPLETED, timeout=timeout)
-    if not completed:
-        # Distinguish a hard ERROR end-state (worker crashed) from a plain
-        # timeout (worker ran long): the caller must be able to tell them apart
-        # rather than reporting a 5s crash as a 600s timeout.
-        current = status_monitor.get_status(terminal_id)
-        if current == TerminalStatus.ERROR:
-            raise StepExecutionError(
-                f"terminal {terminal_id} reached ERROR status",
-                kind="error",
-                terminal_id=terminal_id,
-            )
-        raise StepExecutionError(
-            f"step on terminal {terminal_id} did not complete within {timeout}s",
-            kind="timeout",
-            terminal_id=terminal_id,
-        )
-
-    # A terminal can reach a transient ERROR state that wait_until_status would
-    # not see as COMPLETED, but defensively re-check before claiming success.
-    final_status = status_monitor.get_status(terminal_id)
-    if final_status == TerminalStatus.ERROR:
-        raise StepExecutionError(
-            f"terminal {terminal_id} reached ERROR status",
-            kind="error",
-            terminal_id=terminal_id,
-        )
+    # self-loopback the single-seam rule forbids). Accepts a post-input IDLE as a
+    # completion signal alongside COMPLETED (issue #409a) and is interruptible via
+    # ``cancel_event`` (issue #409b). Raises StepExecutionError on timeout/ERROR,
+    # or StepCancelledError if cancellation fires mid-wait.
+    try:
+        await _wait_for_completion(terminal_id, timeout, cancel_event)
+    except StepCancelledError:
+        # A cancellation is NOT a run-failure. Tear down a terminal this call
+        # created (best-effort — never let cleanup mask the cancellation), then
+        # re-raise so the engine converges the run to CANCELLED without retrying.
+        if created_here:
+            await _best_effort_teardown(terminal_id, registry)
+        raise
 
     # Extract the last agent message via the provider-specific path (mirrors
     # how the handoff caller obtained output: get_output in LAST mode runs the
-    # provider's extract_last_message_from_script under the hood).
-    last_message = terminal_service.get_output(terminal_id, OutputMode.LAST)
+    # provider's extract_last_message_from_script under the hood). This does a
+    # blocking tmux capture-pane plus regex extraction over the scrollback —
+    # potentially seconds for a large transcript — so run it off the loop.
+    last_message = await asyncio.to_thread(
+        terminal_service.get_output, terminal_id, OutputMode.LAST
+    )
 
     result = AgentStepResult(
         terminal_id=terminal_id,
@@ -237,34 +437,42 @@ async def run_agent_step(
     )
 
     if teardown and created_here:
-        # Best-effort teardown, exit-then-delete (mirrors the old handoff
-        # lifecycle): first send the provider's graceful exit command, THEN
-        # delete. A failure in either step must not turn a successful step into
-        # a failure (the work is done and already captured). Log it; never
-        # swallow silently.
-        try:
-            # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude
-            # Code, C-d for others). Skipped implicitly for reused terminals
-            # because this whole block is guarded on created_here.
-            terminal_service.exit_terminal_cli(terminal_id)
-        except (
-            Exception
-        ) as exc:  # noqa: BLE001 — graceful exit is best-effort; step already succeeded
-            logger.warning(
-                "run_agent_step: failed to send graceful exit to terminal %s "
-                "before teardown: %s",
-                terminal_id,
-                exc,
-            )
-        try:
-            # Thread the registry so post_kill_terminal plugin hooks dispatch
-            # (parity with the DELETE endpoint); None = no hooks (engine path).
-            terminal_service.delete_terminal(terminal_id, registry=registry)
-        except Exception as exc:  # noqa: BLE001 — teardown is best-effort; step already succeeded
-            logger.warning(
-                "run_agent_step: failed to tear down terminal %s after success: %s",
-                terminal_id,
-                exc,
-            )
+        await _best_effort_teardown(terminal_id, registry)
 
     return result
+
+
+async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegistry]) -> None:
+    """Exit-then-delete a terminal this call created — best-effort (never raises).
+
+    Mirrors the old handoff lifecycle: send the provider's graceful exit command
+    first, THEN delete. A failure in either step is logged and swallowed — it must
+    never turn a settled step (success OR cancellation) into a failure. Shared by
+    the success teardown and the cancellation path (issue #409b) so a cancelled
+    step reclaims its terminal exactly the way a successful one does.
+    """
+    try:
+        # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude Code,
+        # C-d for others). Off the loop: exit_terminal_cli is blocking tmux I/O.
+        await asyncio.to_thread(terminal_service.exit_terminal_cli, terminal_id)
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 — graceful exit is best-effort; the step already settled
+        logger.warning(
+            "run_agent_step: failed to send graceful exit to terminal %s " "before teardown: %s",
+            terminal_id,
+            exc,
+        )
+    try:
+        # Thread the registry so post_kill_terminal plugin hooks dispatch
+        # (parity with the DELETE endpoint); None = no hooks (engine path).
+        # Off the loop: delete_terminal does blocking tmux kills, a full-history
+        # scrollback snapshot, and DB writes — the exact teardown that wedged the
+        # server in issue #382.
+        await asyncio.to_thread(terminal_service.delete_terminal, terminal_id, registry=registry)
+    except Exception as exc:  # noqa: BLE001 — teardown is best-effort; the step already settled
+        logger.warning(
+            "run_agent_step: failed to tear down terminal %s after settle: %s",
+            terminal_id,
+            exc,
+        )

@@ -12,6 +12,7 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -75,8 +76,47 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
 TUI_PROGRESS_PATTERN = r"•.*\(\d+s\s*•\s*esc to interrupt\)"
 
-# Workspace trust/approval prompt shown when Codex opens a new directory
+# Workspace trust/approval prompt shown when Codex opens a new directory.
+# Two known variants:
+#   v0.98+: "allow Codex to work in this folder"
+#   v0.130+ (git worktree): "Do you trust the contents of this directory?"
+# Both indicate the TUI is blocked waiting for user input.
 TRUST_PROMPT_PATTERN = r"allow Codex to work in this folder"
+TRUST_PROMPT_PATTERN_V2 = r"Do you trust the contents of this directory\?"
+TRUST_PROMPT_FOOTER = r"Press enter to continue"
+
+# Startup "Update available!" dialog. Codex shows this at startup when a newer
+# release exists, with a numbered menu whose cursor default is option 1:
+#   ✨ Update available! 0.142.5 -> 0.144.5
+#   1. Update now (runs npm install -g @openai/codex)
+#   2. Skip
+#   3. Skip until next version
+#   Press enter to continue
+# A blind Enter would run a GLOBAL npm install that swaps the codex binary under
+# every other running CAO worker. We suppress with -c check_for_update_on_startup=false
+# at launch AND detect+dismiss with '3'+Enter as defense-in-depth.
+UPDATE_DIALOG_PATTERN = r"Update available!\s+\S+\s+->\s+\S+"
+UPDATE_DIALOG_MENU_PATTERN = r"Skip until next version"
+UPDATE_DIALOG_FOOTER = TRUST_PROMPT_FOOTER
+STARTUP_PROMPT_BOTTOM_LINES = 15
+STARTUP_ACTIVITY_PATTERN = r"^\s*•[^\S\n]+\S"
+STARTUP_BLOCKING_INPUT_PATTERN = (
+    r"(?:Command Approval Required|\[[aA]\]\s+Accept\b|"
+    r"\[[dD]\]\s+Decline\b|Press enter to continue)"
+)
+STARTUP_IDLE_PLACEHOLDER_PATTERN = (
+    rf"^\s*{IDLE_PROMPT_PATTERN}[^\S\n]+(?:"
+    r"Explain this codebase|"
+    r"Summarize recent commits|"
+    r"Implement \{feature\}|"
+    r"Find and fix a bug in @filename|"
+    r"Write tests for @filename|"
+    r"Improve documentation in @filename|"
+    r"Run /review on my current changes|"
+    r"Use /skills to list available skills"
+    r")\s*$"
+)
+
 # Codex welcome banner indicating normal startup (no trust prompt)
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 
@@ -148,27 +188,94 @@ def _toml_scalar(value: Any) -> str:
     return f'"{escaped}"'
 
 
+# codexConfig keys are dotted CONFIG PATHS ("features.fast_mode") — dots are
+# the path separator and intentional. MCP server names and env keys are single
+# TOML BARE KEYS: a dot there would silently create a NESTED table
+# (mcp_servers.my.srv.command → mcp_servers['my']['srv'], not
+# mcp_servers['my.srv']), so codex would never find the server.
 _CODEX_CONFIG_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
+_CODEX_BARE_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_config_key(key: Any, *, source: str, allow_dots: bool = False) -> str:
+    """Validate a key that is interpolated into a Codex ``-c`` override path.
+
+    Spaces, ``=``, quotes, or control characters are rejected so a
+    misconfigured profile fails fast with a clear error instead of silently
+    emitting a malformed ``-c`` override (an unescaped quote or newline in the
+    KEY half would corrupt the TOML the same way an unescaped value would).
+
+    ``allow_dots=True`` permits dotted config paths (codexConfig keys like
+    ``features.fast_mode``). MCP server names and env keys must be single
+    TOML bare keys: a dot there would nest the entry under the wrong TOML
+    table (see pattern comment above). ``source`` names the profile field
+    for the error message.
+    """
+    if allow_dots:
+        pattern = _CODEX_CONFIG_KEY_PATTERN
+        expected = "a dotted config path over [A-Za-z0-9_.-] (e.g. 'features.fast_mode')"
+    else:
+        pattern = _CODEX_BARE_KEY_PATTERN
+        expected = (
+            "a single TOML bare key over [A-Za-z0-9_-] (no dots -- a dot "
+            "would nest the entry under the wrong TOML table)"
+        )
+    # fullmatch, not match: with ``$`` alone, re.match accepts a TRAILING
+    # newline ("srv\n" passes ^...$), which is exactly the bug class this
+    # validation exists to close.
+    if not isinstance(key, str) or not pattern.fullmatch(key):
+        raise ValueError(f"Invalid {source} key {key!r}: must be {expected}")
+    return key
 
 
 def _toml_override(key: str, value: Any) -> str:
     """Build one ``key=<toml-scalar>`` Codex ``-c`` override, validating the key.
 
-    Keys must be non-empty dotted config paths over ``[A-Za-z0-9_.-]`` (e.g.
-    ``features.fast_mode``); spaces, ``=``, quotes, or control characters are
-    rejected so a misconfigured profile fails fast instead of silently emitting
-    a malformed ``-c`` override. Value-serialization failures from
-    :func:`_toml_scalar` are re-raised with the offending key for context.
+    Key validation is delegated to :func:`_validate_config_key`.
+    Value-serialization failures from :func:`_toml_scalar` are re-raised with
+    the offending key for context.
     """
-    if not isinstance(key, str) or not _CODEX_CONFIG_KEY_PATTERN.match(key):
-        raise ValueError(
-            f"Invalid codexConfig key {key!r}: must be a dotted config path over "
-            "[A-Za-z0-9_.-] (e.g. 'features.fast_mode')"
-        )
+    _validate_config_key(key, source="codexConfig", allow_dots=True)
     try:
         return f"{key}={_toml_scalar(value)}"
     except TypeError as exc:
         raise TypeError(f"codexConfig key '{key}': {exc}") from exc
+
+
+def _has_update_dialog_in_bottom(clean_output: str) -> bool:
+    """Return True when Codex's update-available dialog is active in the bottom region."""
+    bottom = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+    return (
+        re.search(UPDATE_DIALOG_PATTERN, bottom) is not None
+        and re.search(UPDATE_DIALOG_MENU_PATTERN, bottom) is not None
+        and re.search(UPDATE_DIALOG_FOOTER, bottom) is not None
+    )
+
+
+def _has_startup_idle_composer(clean_output: str) -> bool:
+    """Return True when the bottom of the pane shows Codex's idle composer."""
+    all_lines = clean_output.splitlines()
+    tail_lines = all_lines[-STARTUP_PROMPT_BOTTOM_LINES:]
+    tail_output = "\n".join(tail_lines)
+
+    if re.search(STARTUP_ACTIVITY_PATTERN, tail_output, re.MULTILINE):
+        return False
+    if re.search(WAITING_PROMPT_PATTERN, tail_output, re.IGNORECASE | re.MULTILINE):
+        return False
+    if re.search(STARTUP_BLOCKING_INPUT_PATTERN, tail_output, re.IGNORECASE):
+        return False
+
+    legacy_tail = all_lines[-IDLE_PROMPT_TAIL_LINES:]
+    if any(re.match(IDLE_PROMPT_STRICT_PATTERN, line) for line in legacy_tail):
+        return True
+
+    # Codex 0.145 renders placeholder text inside the idle composer instead of
+    # an empty prompt. Match only known placeholder copy and require its status
+    # footer below it so typed drafts and ordinary output are not treated as ready.
+    for index in range(len(tail_lines) - 1, -1, -1):
+        if re.match(STARTUP_IDLE_PLACEHOLDER_PATTERN, tail_lines[index]):
+            return any(re.search(TUI_FOOTER_PATTERN, line) for line in tail_lines[index + 1 :])
+    return False
 
 
 def _find_assistant_marker(text: str) -> Optional[re.Match[str]]:
@@ -209,11 +316,14 @@ class CodexProvider(BaseProvider):
         agent_profile: Optional[str] = None,
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
+        model: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        # Explicit per-call override for profile.model, see _build_codex_command.
+        self._model = model
 
     def _build_codex_command(self) -> str:
         """Build Codex command with agent profile if provided.
@@ -243,10 +353,14 @@ class CodexProvider(BaseProvider):
             command_parts = ["codex", "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
-        if profile is not None:
-            if profile.model:
-                command_parts.extend(["--model", profile.model])
+        # self._model is an explicit per-call override (handoff/assign's own
+        # `model` parameter) and wins over the profile's own static model
+        # field when both are given; applies even with no profile at all.
+        resolved_model = self._model or (profile.model if profile else None)
+        if resolved_model:
+            command_parts.extend(["--model", resolved_model])
 
+        if profile is not None:
             system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
             system_prompt = self._apply_skill_prompt(system_prompt)
 
@@ -266,28 +380,42 @@ class CodexProvider(BaseProvider):
                 # Escape backslashes, double quotes, and newlines for TOML basic string.
                 # Newlines must become literal \n to prevent tmux send_keys from
                 # splitting the command across multiple lines.
-                escaped_prompt = (
-                    system_prompt.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                command_parts.extend(
+                    ["-c", f"developer_instructions={_toml_scalar(system_prompt)}"]
                 )
-                command_parts.extend(["-c", f'developer_instructions="{escaped_prompt}"'])
 
             # Add MCP servers via -c config overrides (per-session, no global config changes).
             # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
             if profile.mcpServers:
                 for server_name, server_config in profile.mcpServers.items():
+                    # Codex-only validation: the server name becomes part of
+                    # the -c override PATH (a TOML dotted path), so it must be
+                    # a single bare key — a quote/newline would corrupt the
+                    # TOML and a dot would nest the server under the wrong
+                    # table. Other providers write JSON configs where any
+                    # string key is valid, so they don't need this.
+                    _validate_config_key(server_name, source="mcpServers name")
                     prefix = f"mcp_servers.{server_name}"
                     if isinstance(server_config, dict):
-                        cfg = server_config
+                        cfg = dict(server_config)
                     else:
                         cfg = server_config.model_dump(exclude_none=True)
+                    # Resolve the bundled cao-mcp-server console script to a
+                    # PATH-independent invocation.
+                    cfg = resolve_mcp_server_config(cfg)
                     if "command" in cfg:
-                        command_parts.extend(["-c", f'{prefix}.command="{cfg["command"]}"'])
+                        command_parts.extend(
+                            ["-c", f"{prefix}.command={_toml_scalar(cfg['command'])}"]
+                        )
                     if "args" in cfg:
-                        args_toml = "[" + ", ".join(f'"{a}"' for a in cfg["args"]) + "]"
+                        args_toml = "[" + ", ".join(_toml_scalar(a) for a in cfg["args"]) + "]"
                         command_parts.extend(["-c", f"{prefix}.args={args_toml}"])
                     if "env" in cfg and cfg["env"]:
                         for env_key, env_val in cfg["env"].items():
-                            command_parts.extend(["-c", f'{prefix}.env.{env_key}="{env_val}"'])
+                            _validate_config_key(env_key, source="mcpServers env")
+                            command_parts.extend(
+                                ["-c", f"{prefix}.env.{env_key}={_toml_scalar(str(env_val))}"]
+                            )
                     # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                     # can identify the current session for handoff/assign operations.
                     # Codex does not forward env vars to MCP subprocesses by default;
@@ -295,7 +423,7 @@ class CodexProvider(BaseProvider):
                     env_vars = cfg.get("env_vars", [])
                     if "CAO_TERMINAL_ID" not in env_vars:
                         env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
-                    env_vars_toml = "[" + ", ".join(f'"{v}"' for v in env_vars) + "]"
+                    env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
                     command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
                     # Set a generous tool timeout for MCP calls like handoff, which
                     # create a new terminal, initialize the provider, send a message,
@@ -318,41 +446,110 @@ class CodexProvider(BaseProvider):
                 for key, value in profile.codexConfig.items():
                     command_parts.extend(["-c", _toml_override(key, value)])
 
+        # Suppress the startup update dialog at the source. Placed last so it
+        # wins even if a profile sets check_for_update_on_startup=true.
+        command_parts.extend(["-c", "check_for_update_on_startup=false"])
+
         return shlex.join(command_parts)
 
     async def _handle_trust_prompt(self, timeout: float = 20.0) -> None:
-        """Auto-accept the workspace trust prompt if it appears.
+        """Dismiss startup prompts that block readiness.
 
-        Codex shows a folder approval dialog when opening a new directory.
-        This sends Enter to accept the default option (allow Codex to work).
-        CAO assumes the user trusts the working directory since they confirmed
-        workspace access during the launch command.
+        Handles two classes of blocking dialog in a single poll loop:
+
+        1. Workspace trust prompt (two variants):
+             v0.98+: "allow Codex to work in this folder"
+             v0.130+ (git worktree): "Do you trust the contents of this directory?"
+           Dismissed with Enter (default = allow).
+
+        2. Update-available dialog (defense-in-depth; normally suppressed via
+           -c check_for_update_on_startup=false at launch):
+             "Update available! X -> Y" with numbered menu.
+           Dismissed with '3'+Enter ("Skip until next version"). A blind Enter
+           would select "1. Update now" (global npm install).
         """
         start_time = time.time()
+        trust_dismissed = False
+        update_dismissed = False
         while time.time() - start_time < timeout:
             output = get_backend().get_history(self.session_name, self.window_name)
             if not output:
                 await asyncio.sleep(1.0)
                 continue
 
-            # Clean ANSI codes for reliable text matching
-            clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+            clean_output = strip_terminal_escapes(re.sub(ANSI_CODE_PATTERN, "", output))
 
-            if re.search(TRUST_PROMPT_PATTERN, clean_output):
+            if not trust_dismissed and re.search(TRUST_PROMPT_PATTERN, clean_output):
                 from cli_agent_orchestrator.services.status_monitor import status_monitor
 
-                logger.info("Codex workspace trust prompt detected, auto-accepting")
+                logger.info("Codex workspace trust prompt (v1) detected, auto-accepting")
                 status_monitor.notify_input_sent(self.terminal_id)
                 get_backend().send_special_key(self.session_name, self.window_name, "Enter")
-                return
+                trust_dismissed = True
+                await asyncio.sleep(1.0)
+                continue
 
-            # Check if Codex has fully started (welcome banner visible)
-            if re.search(CODEX_WELCOME_PATTERN, clean_output):
-                logger.info("Codex started without trust prompt")
+            bottom_region = "\n".join(clean_output.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+
+            if (
+                not trust_dismissed
+                and re.search(TRUST_PROMPT_PATTERN_V2, bottom_region)
+                and re.search(TRUST_PROMPT_FOOTER, bottom_region)
+            ):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info("Codex workspace trust prompt (v2) detected, auto-accepting")
+                status_monitor.notify_input_sent(self.terminal_id)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                trust_dismissed = True
+                await asyncio.sleep(1.0)
+                continue
+
+            if not update_dismissed and _has_update_dialog_in_bottom(clean_output):
+                from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                logger.info(
+                    "Codex update-available dialog detected, selecting " "'Skip until next version'"
+                )
+                status_monitor.notify_input_sent(self.terminal_id)
+                get_backend().send_keys(self.session_name, self.window_name, "3", enter_count=0)
+                # TUI rendering latency: '3' highlights the menu item, Enter confirms.
+                await asyncio.sleep(0.3)
+                get_backend().send_special_key(self.session_name, self.window_name, "Enter")
+                update_dismissed = True
+                await asyncio.sleep(1.0)
+                continue
+
+            # Exit when the bottom region shows the idle composer prompt AND no
+            # dialog is active. The welcome banner alone is insufficient — it
+            # renders as normal startup chrome BEFORE a late update dialog appears.
+            has_idle = _has_startup_idle_composer(clean_output)
+            has_dialog = (
+                re.search(TRUST_PROMPT_PATTERN, bottom_region)
+                or (
+                    re.search(TRUST_PROMPT_PATTERN_V2, bottom_region)
+                    and re.search(TRUST_PROMPT_FOOTER, bottom_region)
+                )
+                or _has_update_dialog_in_bottom(clean_output)
+            )
+            if has_idle and not has_dialog:
+                logger.info("Codex started — idle prompt visible, no blocking dialog")
                 return
 
             await asyncio.sleep(1.0)
-        logger.warning("Codex trust prompt handler timed out")
+
+        pane_tail = ""
+        try:
+            output = get_backend().get_history(self.session_name, self.window_name)
+            if output:
+                pane_tail = "\n".join(output.splitlines()[-10:])
+        except Exception:
+            pass
+        logger.error(
+            "Codex startup prompt handler timed out — no prompt or welcome banner detected. "
+            "Pane tail:\n%s",
+            pane_tail,
+        )
 
     async def initialize(self) -> bool:
         """Initialize Codex provider by starting codex command."""
@@ -361,6 +558,12 @@ class CodexProvider(BaseProvider):
         init_timeout = get_server_settings()["provider_init_timeout"]
         if not await wait_for_shell(self.terminal_id, timeout=init_timeout):
             raise TimeoutError(f"Shell initialization timed out after {init_timeout}s")
+
+        # Capture the shell process name before launching codex — used later to
+        # detect when codex has exited and the pane is back to a bare shell.
+        self.shell_baseline = get_backend().get_pane_current_command(
+            self.session_name, self.window_name
+        )
 
         # Send a warm-up command before launching codex.
         # Codex exits immediately in freshly-created tmux sessions where the shell
@@ -398,12 +601,27 @@ class CodexProvider(BaseProvider):
     def get_status(self, output: str) -> TerminalStatus:
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
+
+        # Detect when the codex process has exited and the pane is back to a
+        # bare shell. The pane's current command will revert to the shell
+        # (e.g. "zsh") that was running before we launched codex. Returning
+        # ERROR prevents the inbox service from typing a queued message into
+        # the shell — which would execute it as arbitrary commands.
+        if self._initialized and self.shell_baseline:
+            current_cmd = get_backend().get_pane_current_command(
+                self.session_name, self.window_name
+            )
+            if current_cmd == self.shell_baseline:
+                return TerminalStatus.ERROR
 
         # Strip the RAW pipe-pane escapes (cursor positioning, in-place redraws),
         # not just SGR colour codes — otherwise cursor sequences survive and the
@@ -442,6 +660,23 @@ class CodexProvider(BaseProvider):
         # Check trust prompt early — the trust menu uses › which matches the idle prompt
         # pattern, and PROCESSING_PATTERN matches "running" in "You are running Codex in..."
         if re.search(TRUST_PROMPT_PATTERN, clean_output):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # V2 trust dialog ("Do you trust the contents of this directory?" / "Press enter
+        # to continue"). Only classify as WAITING when BOTH the question AND the footer
+        # appear in the bottom region — avoids false positives if the question text
+        # appears in scrollback from a previous model response.
+        bottom_region = "\n".join(clean_output.splitlines()[-15:])
+        if re.search(TRUST_PROMPT_PATTERN_V2, bottom_region) and re.search(
+            TRUST_PROMPT_FOOTER, bottom_region
+        ):
+            return TerminalStatus.WAITING_USER_ANSWER
+
+        # Update-available dialog. Bottom-anchored like trust-v2 to avoid false
+        # positives from scrollback. Never let this fall through to IDLE/COMPLETED
+        # where a queued message or blind Enter could select "Update now".
+        # Eager inbox delivery is not a vector: accepts_input_while_processing=False.
+        if _has_update_dialog_in_bottom(clean_output):
             return TerminalStatus.WAITING_USER_ANSWER
 
         # Check bottom of captured output for idle prompt.
@@ -495,7 +730,7 @@ class CodexProvider(BaseProvider):
             # No user-message marker in the cleaned buffer. Two cases:
             # - Fresh init: no assistant content either → IDLE.
             # - Long-running response: the › user marker has been evicted from
-            #   the 8KB rolling buffer by the time the response settles, but an
+            #   the rolling state buffer by the time the response settles, but an
             #   assistant bullet is still visible. Without this branch we'd
             #   return IDLE forever and ``wait_for_status(completed)`` in the
             #   e2e tests would time out.
@@ -520,7 +755,15 @@ class CodexProvider(BaseProvider):
         the end of that line and the next empty idle prompt.
         Fallback: use assistant marker based extraction when no user message is found.
         """
-        clean_output = re.sub(ANSI_CODE_PATTERN, "", script_output)
+        # Strip ALL terminal escape sequences, not just SGR colour codes. The
+        # narrow ANSI_CODE_PATTERN (``\x1b[...m``) leaves cursor-movement (H),
+        # erase (K), and scroll CSI sequences in place; codex's TUI emits those
+        # heavily, so an SGR-only strip returned raw escape garbage
+        # (``[49;2H[K[38;2;...m``) as the "response", failing extraction. Use
+        # the shared strip which also normalises \r and column-1 cursor moves to
+        # newlines — this is fed a tmux capture-pane render (already laid out),
+        # so the line-based extraction below still anchors correctly.
+        clean_output = strip_terminal_escapes(script_output)
 
         # Primary: find last user message, extract response between it and idle prompt.
         # Exclude the Codex TUI footer from user-message matching when detected.

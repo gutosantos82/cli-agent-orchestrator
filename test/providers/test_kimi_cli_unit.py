@@ -109,6 +109,7 @@ class TestKimiCliProviderInitialization:
         mock_profile.model = None
         mock_profile.system_prompt = "You are a helpful assistant"
         mock_profile.mcpServers = None
+        mock_profile.provider_init_timeout = None
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
@@ -153,6 +154,7 @@ class TestKimiCliProviderInitialization:
                 "args": ["-y", "cao-mcp-server"],
             }
         }
+        mock_profile.provider_init_timeout = None
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="developer")
@@ -241,7 +243,7 @@ class TestKimiCliProviderStatusDetection:
         )
 
     def test_get_status_unknown_empty(self):
-        """Test UNKNOWN on empty output."""
+        """Empty output -> UNKNOWN (native=None always falls through, no guess)."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider.get_status("") == TerminalStatus.UNKNOWN
 
@@ -600,6 +602,31 @@ class TestKimiCliProviderBuildCommand:
         assert "--config" not in command
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_resolves_bundled_mcp_command(self, mock_load, tmp_path):
+        """The bare cao-mcp-server command is resolved to a PATH-independent
+        invocation in the emitted --mcp-config JSON (wiring guard: a refactor
+        that drops the resolve_mcp_server_config call must fail this test)."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {
+            "cao-mcp-server": {"type": "stdio", "command": "cao-mcp-server", "args": []}
+        }
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
+        MOD = "cli_agent_orchestrator.utils.mcp_resolution"
+        with (
+            patch("cli_agent_orchestrator.providers.kimi_cli.Path.home", return_value=tmp_path),
+            patch(f"{MOD}._sibling_script", return_value="/venv/bin/cao-mcp-server"),
+            patch(f"{MOD}.shutil.which", return_value=None),
+        ):
+            command = provider._build_kimi_command()
+
+        assert "/venv/bin/cao-mcp-server" in command
+        provider.cleanup()
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_creates_agent_yaml(self, mock_load):
         """Test that agent YAML and system prompt files are created correctly."""
         mock_profile = MagicMock()
@@ -918,6 +945,32 @@ class TestKimiCliProviderModelFlag:
         command = provider._build_kimi_command()
 
         assert "--model" not in command
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_explicit_model_override_wins_over_profile_model(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = "kimi-k2-turbo"
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider("term-1", "sess", "win", "agent", model="fable-5")
+        command = provider._build_kimi_command()
+
+        assert "--model fable-5" in command
+        assert "--model kimi-k2-turbo" not in command
+
+    def test_explicit_model_override_applies_with_no_agent_profile(self):
+        """Regression: PR #501 review -- model resolution used to live
+        entirely inside `if self._agent_profile is not None:`, so an
+        override passed with agent_profile=None (unreachable through
+        handoff/assign today, but inconsistent with codex/hermes's own
+        no-profile-still-applies shape) was silently dropped."""
+        provider = KimiCliProvider("term-1", "sess", "win", None, model="fable-5")
+        command = provider._build_kimi_command()
+
+        assert "--model fable-5" in command
+        provider.cleanup()
 
 
 class TestKimiCliProviderMisc:

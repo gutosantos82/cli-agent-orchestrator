@@ -155,7 +155,14 @@ class TerminalBackend(ABC):
             window_name: Target window
             keys: Text to send
             enter_count: Number of Enter keys to send after the text
-            force_bracketed_paste: If True, wrap in bracketed paste sequences
+            force_bracketed_paste: If True, request bracketed-paste delivery.
+                The herdr backend wraps content in \\x1b[200~...\\x1b[201~
+                itself (it writes raw bytes to the pty, no sanitization). The
+                tmux backend hand-crafts the same wrap on tmux < 3.7 but must
+                delegate to ``paste-buffer -p`` on >= 3.7, where pasted
+                buffers are vis(3)-sanitized and raw ESC bytes would arrive
+                as literal "^[[200~" (issue #413); -p emits markers only when
+                the pane enabled DECSET 2004.
             submit_delay: Seconds to wait after pasting before sending Enter, so
                 a TUI (e.g. Claude Code's Ink renderer) finishes processing the
                 paste before submission. Backends without a paste step may ignore.
@@ -235,6 +242,25 @@ class TerminalBackend(ABC):
 
         Args:
             session_name: Session to attach to
+        """
+        ...
+
+    @abstractmethod
+    def prepare_web_attach(self, session_name: str, window_name: str) -> List[str]:
+        """Prepare a browser PTY attachment and return its subprocess argv.
+
+        Backends may perform routing work before returning, such as focusing a
+        Herdr workspace/tab. The caller owns the PTY and subprocess lifecycle.
+
+        Args:
+            session_name: Target session
+            window_name: Target window
+
+        Returns:
+            Subprocess argv for the interactive backend client
+
+        Raises:
+            TerminalBackendError: If the backend cannot prepare the attachment
         """
         ...
 

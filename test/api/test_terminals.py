@@ -193,6 +193,91 @@ class TestTerminalCreationWithWorkingDirectory:
             assert call_kwargs.get("caller_id") == "dcba8765"
             assert response.json()["caller_id"] == "dcba8765"
 
+    def test_create_terminal_passes_model(self, client):
+        """model query param threads through to the service -- explicit
+        per-call model override for MCP handoff/assign."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="claude_code",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "claude_code",
+                    "agent_profile": "analyst",
+                    "model": "fable-5",
+                },
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("model") == "fable-5"
+
+    def test_create_terminal_omitted_model_forwards_none(self, client):
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock(
+                return_value=Terminal(
+                    id="abcd5678",
+                    name="test-window",
+                    session_name="test-session",
+                    provider="kiro_cli",
+                    agent_profile="analyst",
+                )
+            )
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+            )
+
+            assert response.status_code == 201
+            call_kwargs = mock_svc.create_terminal.call_args.kwargs
+            assert call_kwargs.get("model") is None
+
+    def test_create_terminal_rejects_malformed_model(self, client):
+        """PR #501 review: a malformed model (control char/newline/shell
+        metacharacter) must 400 at the request boundary rather than either
+        reaching terminal_service unvalidated or -- if it later raised
+        ValueError there -- being mismapped to a misleading 404 (this
+        endpoint's ValueError handler means "session/window not found")."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "analyst",
+                    "model": "fable-5\nrm -rf /",
+                },
+            )
+
+            assert response.status_code == 400
+            mock_svc.create_terminal.assert_not_called()
+
     def test_create_terminal_rejects_malformed_caller_id(self, client):
         """caller_id is validated against the TerminalId pattern — IDs arrive
         from agent input and must not be persisted unvalidated."""
@@ -246,6 +331,29 @@ class TestTerminalCreationWithWorkingDirectory:
             assert response.status_code == 201
             call_kwargs = mock_svc.create_terminal.call_args.kwargs
             assert call_kwargs.get("working_directory") == "/session/path"
+
+    def test_create_terminal_rejects_initial_message_without_defer_init(self, client):
+        """initial_message is only delivered on the deferred-init path; sending
+        it with defer_init=false must 400 rather than silently drop the payload."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.resolve_provider",
+                side_effect=lambda _, fallback_provider: fallback_provider,
+            ),
+            patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc,
+        ):
+            mock_svc.create_terminal = AsyncMock()
+
+            response = client.post(
+                "/sessions/test-session/terminals",
+                params={"provider": "kiro_cli", "agent_profile": "analyst"},
+                json={"initial_message": "do work"},
+            )
+
+            assert response.status_code == 400
+            assert "defer_init=true" in response.json()["detail"]
+            # The payload was rejected before reaching the service.
+            mock_svc.create_terminal.assert_not_called()
 
 
 class TestExitTerminalEndpoint:
@@ -590,6 +698,15 @@ class TestWebSocketSubprocessTerm:
             captured["kwargs"] = kwargs
             raise _StopHere("captured Popen args")
 
+        backend = MagicMock()
+        backend.prepare_web_attach.return_value = [
+            "tmux",
+            "-u",
+            "attach-session",
+            "-t",
+            "cao-s:w",
+        ]
+
         with (
             patch.dict("os.environ", {"TERM": "dumb", "HOME": "/root"}, clear=True),
             patch.object(
@@ -597,6 +714,7 @@ class TestWebSocketSubprocessTerm:
                 "get_terminal_metadata",
                 return_value={"tmux_session": "cao-s", "tmux_window": "w"},
             ),
+            patch.object(main_module, "get_backend", return_value=backend),
             patch.object(main_module.subprocess, "Popen", side_effect=capture_and_stop),
             patch.object(main_module.pty, "openpty", return_value=(100, 101)),
             patch.object(main_module.fcntl, "ioctl"),
@@ -612,6 +730,72 @@ class TestWebSocketSubprocessTerm:
             "the parent's broken TERM (issue #150)"
         )
         assert passed_env["TERM"] == "xterm-256color"
+
+    @pytest.mark.asyncio
+    async def test_websocket_uses_configured_backend_attach_command(self):
+        """Herdr-backed terminals must not be attached through tmux."""
+        from cli_agent_orchestrator.api import main as main_module
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        backend = MagicMock()
+        backend.prepare_web_attach.return_value = ["herdr", "--session", "cao"]
+
+        captured: Dict[str, object] = {}
+
+        def capture_and_stop(*args, **kwargs):
+            captured["args"] = args
+            raise _StopHere("captured Popen args")
+
+        with (
+            patch.object(
+                main_module,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-s", "tmux_window": "w"},
+            ),
+            patch.object(main_module, "get_backend", return_value=backend),
+            patch.object(main_module.subprocess, "Popen", side_effect=capture_and_stop),
+            patch.object(main_module.pty, "openpty", return_value=(100, 101)),
+            patch.object(main_module.fcntl, "ioctl"),
+            patch.object(main_module.fcntl, "fcntl"),
+            patch.object(main_module.os, "close"),
+        ):
+            with pytest.raises(_StopHere):
+                await main_module.terminal_ws(ws, "abcd1234")
+
+        backend.prepare_web_attach.assert_called_once_with("cao-s", "w")
+        assert captured["args"][0] == ["herdr", "--session", "cao"]
+
+    @pytest.mark.asyncio
+    async def test_websocket_closes_safely_when_backend_attach_fails(self):
+        """Backend attach errors close safely before allocating a PTY."""
+        from cli_agent_orchestrator.api import main as main_module
+        from cli_agent_orchestrator.backends import TerminalBackendError
+
+        ws = MagicMock()
+        ws.client = MagicMock(host="127.0.0.1")
+        ws.accept = AsyncMock()
+        ws.close = AsyncMock()
+
+        backend = MagicMock()
+        backend.prepare_web_attach.side_effect = TerminalBackendError("sensitive backend detail")
+
+        with (
+            patch.object(
+                main_module,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-s", "tmux_window": "w"},
+            ),
+            patch.object(main_module, "get_backend", return_value=backend),
+            patch.object(main_module.pty, "openpty") as mock_openpty,
+        ):
+            await main_module.terminal_ws(ws, "abcd1234")
+
+        ws.close.assert_awaited_once_with(code=4004, reason="Failed to attach terminal")
+        mock_openpty.assert_not_called()
 
 
 class _StopHere(Exception):

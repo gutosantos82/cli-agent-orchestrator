@@ -17,7 +17,9 @@ Terminal Workflow:
 4. delete_terminal() → Cleans up provider, database record, and logging
 """
 
+import asyncio
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -25,6 +27,9 @@ from enum import Enum
 from typing import Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.clients.database import (
+    create_inbox_message,
+)
 from cli_agent_orchestrator.clients.database import create_terminal as db_create_terminal
 from cli_agent_orchestrator.clients.database import delete_terminal as db_delete_terminal
 from cli_agent_orchestrator.clients.database import (
@@ -32,7 +37,12 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_shell_command,
 )
-from cli_agent_orchestrator.constants import FIFO_DIR, SESSION_PREFIX, TERMINAL_LOG_DIR
+from cli_agent_orchestrator.constants import (
+    FIFO_DIR,
+    PIPE_LIVENESS_TAIL_LINES,
+    SESSION_PREFIX,
+    TERMINAL_LOG_DIR,
+)
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalStatus
@@ -59,6 +69,7 @@ from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
     generate_window_name,
+    wait_until_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,6 +77,12 @@ logger = logging.getLogger(__name__)
 # Track terminals that have already received memory injection (first message only).
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
+
+# Strong references to in-flight deferred-init background tasks. asyncio keeps
+# only a WEAK reference to tasks from loop.create_task, so without this a
+# deferred provider.initialize() + input-send task could be GC'd mid-run,
+# silently leaving a worker uninitialized. Tasks drop themselves on completion.
+_deferred_init_tasks: set = set()
 
 
 class TerminalInputBlockedError(Exception):
@@ -139,6 +156,10 @@ async def create_terminal(
     registry: PluginRegistry | None = None,
     env_vars: Optional[dict[str, str]] = None,
     caller_id: Optional[str] = None,
+    defer_init: bool = False,
+    initial_message: Optional[str] = None,
+    initial_message_orchestration_type: Optional[OrchestrationType] = None,
+    model: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -159,12 +180,20 @@ async def create_terminal(
             ``new_session=True``, these are stored on the session record and
             inherited by every worker spawned later in the same session. On
             ``new_session=False``, the persisted session vars are merged in
-            automatically; the explicit ``env_vars`` argument is ignored to
-            keep the per-session view consistent. See issue #248.
+            automatically and the explicit ``env_vars`` argument is merged on
+            top, winning on key conflict — per-step vars (e.g. workflow
+            routing ids) must reach the window even inside an existing
+            session. See issues #248 and #408.
         caller_id: Terminal ID of the supervisor that created this terminal
             via handoff/assign. Recorded so send_message can route callbacks
             structurally instead of parsing IDs out of message text (issue #284).
             None for operator-launched terminals.
+        model: Explicit per-call model override, forwarded to the provider
+            (where supported -- see each provider's own __init__) ahead of
+            the agent profile's own static `model` field. Lets a caller
+            (e.g. MCP handoff/assign's own `model` parameter) pin a specific
+            model for one worker without needing a dedicated agent profile.
+            None = behavior unchanged (profile.model, if any, still applies).
 
     Returns:
         Terminal object with all metadata populated
@@ -174,6 +203,14 @@ async def create_terminal(
         TimeoutError: If provider initialization times out
     """
     session_created = False  # tracks whether THIS call created the tmux session
+    # harness-control#186: tracks whether THIS call created a new WINDOW in an
+    # already-existing session (the `new_session=False` branch below — what
+    # every MCP spawn/assign-into-existing-session call does). Independent of
+    # `session_created` above: on failure, the cleanup path already tears
+    # down the whole session (window included) when THIS call created a brand
+    # new one, but had no equivalent for a window added to a session that
+    # already existed — see the `except` block.
+    window_created = False
     try:
         # Step 1: Generate unique identifiers
         terminal_id = generate_terminal_id()
@@ -216,13 +253,18 @@ async def create_terminal(
             # Add window to existing session
             if not get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' not found")
+            # Merge explicit per-step env_vars over the persisted session env
+            # (per-step wins on conflict): workflow routing ids like
+            # CAO_WORKFLOW_RUN_ID must reach the window even when it joins an
+            # existing session (issue #408).
             window_name = get_backend().create_window(
                 session_name,
                 window_name,
                 terminal_id,
                 working_directory,
-                extra_env=get_session_env(session_name),
+                extra_env={**get_session_env(session_name), **(env_vars or {})},
             )
+            window_created = True  # only set after successful creation
 
         # Step 3: Load the profile once for allowed tool resolution before
         # provider initialization. The skill catalog is computed only for
@@ -277,14 +319,28 @@ async def create_terminal(
         # socket events and their pipe_pane is a no-op, so skip the FIFO there and
         # rely on the herdr inbox registration below.
         if not get_backend().supports_event_inbox():
-            # Reader must exist BEFORE pipe-pane starts so it captures from the start.
-            fifo_manager.create_reader(terminal_id)
+            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
+
+            # Reader must exist BEFORE pipe-pane starts so it captures from the
+            # start. Enroll it in the pipe-pane liveness watchdog (issue #388):
+            # supply a probe for tmux's live pane content and a re-arm that
+            # re-attaches a stalled forwarder. The re-arm does stop-then-start,
+            # NOT a bare pipe_pane() — a stalled pane still reports pane_pipe=1,
+            # so the backend's ``pipe-pane -o`` toggle would just switch the
+            # dead pipe OFF instead of restarting it.
+            def _probe_pane(s=session_name, w=window_name) -> str:
+                return get_backend().get_history(s, w, tail_lines=PIPE_LIVENESS_TAIL_LINES)
+
+            def _rearm_pipe(s=session_name, w=window_name, p=str(fifo_path)) -> None:
+                get_backend().stop_pipe_pane(s, w)
+                get_backend().pipe_pane(s, w, p)
+
+            fifo_manager.create_reader(terminal_id, pane_probe=_probe_pane, rearm=_rearm_pipe)
 
             # Configure pipe-pane to stream output to the FIFO. This enables
             # real-time event-driven processing via StatusMonitor and LogWriter
             # (LogWriter writes TERMINAL_LOG_DIR/{id}.log from the FIFO). A pane
             # has a single pipe-pane target, so we pipe ONLY to the FIFO.
-            fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
             get_backend().pipe_pane(session_name, window_name, str(fifo_path))
 
             # Nudge the shell so it re-renders its prompt AFTER pipe-pane attaches.
@@ -308,18 +364,42 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             skill_prompt=skill_prompt,
-            model=profile.model if profile else None,
+            model=model or (profile.model if profile else None),
         )
-        await provider_instance.initialize()
 
-        # Persist shell_command baseline if the provider captured one
-        shell_command = provider_instance.shell_baseline
-        if not isinstance(shell_command, str):
-            shell_command = None
-        if shell_command:
-            update_terminal_shell_command(terminal_id, shell_command)
+        # Deferred-init path: return fast so callers (e.g. MCP assign) do not
+        # block on `provider.initialize()`. The remaining initialize + input
+        # send runs as a background task, so two concurrent assigns can each
+        # kick off their init in parallel. Kiro-cli 2.11's per-tool client
+        # timeout (~120s observed) previously cancelled assign RPCs when init
+        # took long enough to push the round-trip past that cap; deferring init
+        # keeps the tool call under 2s.
+        if defer_init:
+            shell_command = None  # unknown until initialize() runs
+            _schedule_deferred_init(
+                provider_instance,
+                terminal_id,
+                initial_message,
+                initial_message_orchestration_type,
+                registry,
+            )
+        else:
+            await provider_instance.initialize()
 
-        # Build and return the Terminal object
+            # Persist shell_command baseline if the provider captured one
+            shell_command = provider_instance.shell_baseline
+            if not isinstance(shell_command, str):
+                shell_command = None
+            if shell_command:
+                update_terminal_shell_command(terminal_id, shell_command)
+
+        # Build and return the Terminal object. In the deferred-init path the
+        # provider is still initializing on a background task, so the terminal
+        # is NOT ready for input yet — report UNKNOWN (not IDLE) so a client
+        # can't mistake it for ready and send input early. Callers poll
+        # GET /terminals/{id} for the live status once init completes. The
+        # synchronous path has already reached IDLE by here.
+        initial_status = TerminalStatus.UNKNOWN if defer_init else TerminalStatus.IDLE
         terminal = Terminal(
             id=terminal_id,
             name=window_name,
@@ -329,7 +409,7 @@ async def create_terminal(
             caller_id=caller_id,
             allowed_tools=allowed_tools,
             shell_command=shell_command,
-            status=TerminalStatus.IDLE,
+            status=initial_status,
             last_active=datetime.now(),
         )
 
@@ -373,6 +453,16 @@ async def create_terminal(
             provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
+        # Roll back the DB terminal row so a failed create does not leave an
+        # orphan record: the stale row would still be listed for the session
+        # and report UNKNOWN status even though nothing is running. Idempotent
+        # (DELETE ... WHERE id = ?), so it is a no-op when the failure happened
+        # before the row was written. Runs regardless of session_created so a
+        # pre-existing session keeps its live terminals but loses the dead row.
+        try:
+            db_delete_terminal(terminal_id)
+        except Exception:
+            pass  # Ignore cleanup errors
         if session_created and session_name:
             try:
                 get_backend().kill_session(session_name)
@@ -382,7 +472,365 @@ async def create_terminal(
             # secrets don't linger in memory or bleed into a future reuse
             # of the same name.
             clear_session_env(session_name)
+        elif window_created and session_name and window_name:
+            # harness-control#186: a window added to an ALREADY-EXISTING session
+            # (new_session=False -- every MCP spawn/assign-into-existing-session
+            # call) has no session-level teardown to fall back on above, since
+            # `session_created` is False and the pre-existing session must stay
+            # up. Live-reproduced without this: a provider init timeout here
+            # (e.g. "Claude Code initialization timed out after 60s") rolls back
+            # the DB row and stops the FIFO/provider/status-monitor above, but
+            # the tmux WINDOW itself — the actual pane, still running whatever
+            # shell/process the provider left behind — was never torn down.
+            # Result: the caller (the spawning agent's MCP tool call) gets a
+            # hard error back, AND a permanently orphaned window is left behind:
+            # invisible to this terminal's own list/tree (the DB row is gone),
+            # never cleaned up, sitting there indefinitely.
+            try:
+                get_backend().kill_window(session_name, window_name)
+            except Exception:
+                pass  # Ignore cleanup errors
         raise
+
+
+def _notify_caller_of_deferred_failure(
+    terminal_id: str,
+    message: str,
+    registry: "PluginRegistry | None",
+    delete_worker: bool,
+) -> None:
+    """Make a deferred-init failure observable to the supervisor that assigned
+    the worker, then optionally tear the worker down.
+
+    Runs in a worker thread (blocking DB + tmux I/O). The supervisor is the
+    worker's ``caller_id``; we enqueue a PENDING inbox message to it so the
+    failure surfaces as the supervisor's next input instead of leaving it to
+    wait forever on a callback that will never come. Every step is best-effort
+    and independently guarded — a failure to notify must not prevent teardown,
+    and a failure to tear down must not crash the background task.
+    """
+    caller_id = None
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if metadata:
+            caller_id = metadata.get("caller_id")
+    except Exception as exc:  # noqa: BLE001 — notification is best-effort
+        logger.warning(
+            "Deferred-init failure notify: could not read metadata for %s: %s",
+            terminal_id,
+            exc,
+        )
+
+    if caller_id:
+        try:
+            create_inbox_message(sender_id=terminal_id, receiver_id=caller_id, message=message)
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            logger.warning(
+                "Deferred-init failure notify: could not enqueue inbox message to "
+                "caller %s for worker %s: %s",
+                caller_id,
+                terminal_id,
+                exc,
+            )
+    else:
+        logger.warning(
+            "Deferred-init failure for %s has no caller_id to notify; failure is " "log-only.",
+            terminal_id,
+        )
+
+    if delete_worker:
+        try:
+            # Pass registry so post_kill_terminal hooks fire — parity with the
+            # DELETE endpoint and agent_step teardown.
+            delete_terminal(terminal_id, registry=registry)
+        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
+            logger.warning(
+                "Deferred-init failure: teardown of worker %s failed (zombie "
+                "window may remain): %s",
+                terminal_id,
+                exc,
+            )
+
+
+# --- deferred-init submit verification ----------------------------------------
+# send_input delivers via paste-buffer → fixed sleep → Enter (clients/tmux.py).
+# That fixed sleep only guesses when the TUI is input-ready; when it guesses
+# wrong the Enter (or the whole paste) is dropped and the message sits
+# unsubmitted in the prompt box. In the deferred-init path nobody blocks on
+# completion, so a dropped submit leaves the worker IDLE forever with the task
+# never started and NO exception raised — the supervisor then waits on a
+# callback that can never arrive. Confirm the worker actually began processing
+# and re-submit if it did not.
+_DEFERRED_SUBMIT_CONFIRM_TIMEOUT = 8.0  # per-attempt wait for the PROCESSING edge
+_DEFERRED_SUBMIT_MAX_RESUBMITS = 3
+# Statuses proving the worker accepted the task (left the ready IDLE state).
+# WAITING_USER_ANSWER counts: the worker consumed the input and is now asking.
+_DEFERRED_STARTED_STATUSES = {
+    TerminalStatus.PROCESSING,
+    TerminalStatus.COMPLETED,
+    TerminalStatus.WAITING_USER_ANSWER,
+}
+
+
+def _worker_is_started_direct(terminal_id: str, provider) -> bool:
+    """Direct visible-screen status check bypassing the event-driven status cache.
+
+    The deferred-init retry loop polls ``status_monitor.get_status()`` which
+    returns the **cached** status updated only by the event-driven pipeline
+    (pyte screener at rising-edge/quiescence edges). When that lags behind
+    reality the cached status stays IDLE even though the worker already
+    transitioned to PROCESSING.
+
+    This function does a live ``capture-pane`` to grab the visible screen
+    (not the 8 KB rolling buffer, which is too small to reliably hold the
+    footer) and calls ``provider.get_status()`` directly, catching the real
+    state so the retry loop doesn't re-deliver into a working terminal.
+
+    Only providers that set ``supports_direct_status_probe = True`` should
+    be passed to this function; the ``get_status()`` contract for other
+    providers (e.g. kiro_cli, antigravity_cli, cursor_cli) relies on
+    dispatch bookkeeping and cannot distinguish IDLE from COMPLETED on a
+    rendered capture-pane snapshot.
+    """
+    try:
+        metadata = get_terminal_metadata(terminal_id)
+        if not metadata:
+            return False
+        session_name = metadata.get("tmux_session")
+        window_name = metadata.get("tmux_window")
+        if not session_name or not window_name:
+            return False
+        output = get_backend().get_history(session_name, window_name, tail_lines=200)
+        status = provider.get_status(output)
+    except Exception:
+        logger.debug(
+            "Direct status probe for %s failed (falling through to cached path)",
+            terminal_id,
+            exc_info=True,
+        )
+        return False
+    return status in _DEFERRED_STARTED_STATUSES
+
+
+def _message_visible_in_box(terminal_id: str, message: str) -> bool:
+    """True when the delivered message is still sitting in the input box.
+
+    Decides the resubmit action: if our text is there the paste landed and only
+    the Enter was dropped (send a bare Enter); if it is absent the paste itself
+    was dropped (re-deliver the full message). Guessing wrong the other way must
+    be avoided — a bare Enter into an EMPTY box would submit a blank prompt and
+    the real task would be lost. Collapse to [a-z0-9] so wrapping / whitespace /
+    unicode punctuation in the rendered box can't defeat the match.
+    """
+    probe = re.sub(r"[^a-z0-9]", "", message.lower())[:24]
+    if len(probe) < 8:
+        # Too short to match reliably — treat as "not shown" so we re-deliver
+        # in full rather than risk a blank submit.
+        return False
+    try:
+        rendered = get_output(terminal_id)
+    except Exception:
+        return False
+    return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+
+async def _confirm_worker_started_or_resubmit(
+    terminal_id: str,
+    message: str,
+    registry: "PluginRegistry | None",
+    sender_id: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+    provider=None,
+) -> bool:
+    """Confirm a deferred-init worker began processing; re-submit if not.
+
+    Returns True once the terminal reaches a started status, False if it is
+    still stuck at IDLE after all resubmit attempts. Blocking tmux/DB I/O runs
+    off the loop via to_thread so concurrent deferred inits aren't frozen.
+    """
+    if await wait_until_status(
+        terminal_id,
+        _DEFERRED_STARTED_STATUSES,
+        timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+        polling_interval=0.5,
+    ):
+        return True
+
+    for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
+        # The cached status_monitor status is event-driven (pyte screener at
+        # rising-edge/quiescence only) and can lag behind reality. Before
+        # re-delivering, do a direct capture-pane / visible-screen check via
+        # the provider to catch cases where the worker IS processing but the
+        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
+        # footer appearing between pyte detection edges). Only providers that
+        # opt in via ``supports_direct_status_probe = True`` take this path.
+        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
+            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
+                return True
+
+        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
+            logger.warning(
+                "Deferred assign to %s unsubmitted (Enter swallowed); "
+                "re-submitting via Enter (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
+        else:
+            logger.warning(
+                "Deferred assign to %s not accepted (paste dropped); "
+                "re-delivering message (attempt %d)",
+                terminal_id,
+                attempt,
+            )
+            await asyncio.to_thread(
+                send_input,
+                terminal_id,
+                message,
+                registry=registry,
+                sender_id=sender_id,
+                orchestration_type=orchestration_type,
+            )
+        if await wait_until_status(
+            terminal_id,
+            _DEFERRED_STARTED_STATUSES,
+            timeout=_DEFERRED_SUBMIT_CONFIRM_TIMEOUT,
+            polling_interval=0.5,
+        ):
+            return True
+
+    return False
+
+
+def _schedule_deferred_init(
+    provider_instance,
+    terminal_id: str,
+    initial_message: Optional[str],
+    orchestration_type: Optional[OrchestrationType],
+    registry: PluginRegistry | None,
+) -> None:
+    """Kick off provider.initialize() in the background and, on success,
+    deliver the initial message via send_input.
+
+    Runs as an asyncio task on the running event loop so it doesn't block
+    the caller. Because assign() has already returned success=True by the
+    time this runs, a failure here must be made OBSERVABLE to the supervisor
+    rather than silently swallowed — otherwise the supervisor waits forever
+    on a callback that can never arrive and a later inspect 404s. On failure
+    we notify the caller's inbox (best-effort) and then tear the worker down.
+
+    ``TerminalInputBlockedError`` (the worker is parked on a WAITING_USER_ANSWER
+    prompt right after init) is NOT a teardown case: the worker is alive and
+    answerable via answer_user_prompt, so we leave it in place and only log.
+    """
+
+    async def _run() -> None:
+        caller_id: Optional[str] = None
+        try:
+            await provider_instance.initialize()
+            shell_command = provider_instance.shell_baseline
+            if isinstance(shell_command, str) and shell_command:
+                update_terminal_shell_command(terminal_id, shell_command)
+            if initial_message:
+                # For assign/handoff the sender is the CALLER (the supervisor),
+                # not this MCP server. But the deferred path is used only via
+                # /assign, and _assign_impl on the MCP-server side already
+                # embedded the callback instructions into initial_message.
+                # We still pass sender_id=caller_id if present in DB metadata
+                # so plugin events see it.
+                metadata = await asyncio.to_thread(get_terminal_metadata, terminal_id)
+                if metadata:
+                    caller_id = metadata.get("caller_id")
+                # send_input is blocking tmux I/O — off the loop so it can't
+                # freeze the server for concurrent requests.
+                await asyncio.to_thread(
+                    send_input,
+                    terminal_id,
+                    initial_message,
+                    registry=registry,
+                    sender_id=caller_id,
+                    orchestration_type=orchestration_type,
+                )
+                # Delivery can be silently dropped (Enter swallowed / paste lost)
+                # when the TUI isn't input-ready. Confirm the worker actually
+                # started and re-submit if not; if it never starts, surface the
+                # failure so the supervisor re-routes instead of waiting forever.
+                started = await _confirm_worker_started_or_resubmit(
+                    terminal_id,
+                    initial_message,
+                    registry,
+                    caller_id,
+                    orchestration_type,
+                    provider=provider_instance,
+                )
+                if not started:
+                    logger.error(
+                        "Deferred init for %s: worker never started after "
+                        "resubmits; task not delivered — notifying caller and "
+                        "tearing down.",
+                        terminal_id,
+                    )
+                    await asyncio.to_thread(
+                        _notify_caller_of_deferred_failure,
+                        terminal_id,
+                        (
+                            f"Worker {terminal_id} received the assigned task but "
+                            f"never started processing (input not accepted after "
+                            f"retries). It has been deleted — re-assign the task."
+                        ),
+                        registry,
+                        True,  # delete_worker
+                    )
+                    return
+        except TerminalInputBlockedError as e:
+            # The worker initialized but is parked on an interactive prompt
+            # (WAITING_USER_ANSWER). It is alive and can be driven via
+            # answer_user_prompt — do NOT delete it. Just surface the state to
+            # the supervisor so it knows delivery is pending on a prompt.
+            logger.warning(
+                "Deferred init for terminal %s: worker is waiting on a user "
+                "prompt; task not yet delivered. Leaving worker alive for "
+                "answer_user_prompt. (%s)",
+                terminal_id,
+                e,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} is waiting on an interactive prompt; the "
+                f"assigned task has not been delivered yet. Use answer_user_prompt "
+                f"to unblock it, then it will receive the task.",
+                registry,
+                delete_worker=False,
+            )
+        except Exception as e:
+            # exc_info=True preserves the traceback for debugging; {e!r} avoids
+            # newline/control-character injection into logs and the inbox message
+            # (the exception text can contain provider-supplied content).
+            logger.error(
+                "Deferred init for terminal %s failed: %r. "
+                "Notifying caller and tearing down worker.",
+                terminal_id,
+                e,
+                exc_info=True,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id} failed to initialize: {e!r}. It has been "
+                f"deleted — re-assign the task or report the failure.",
+                registry,
+                delete_worker=True,
+            )
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.error(f"Deferred init for {terminal_id}: no running event loop; init skipped")
+        return
+    task = loop.create_task(_run())
+    _deferred_init_tasks.add(task)
+    task.add_done_callback(_deferred_init_tasks.discard)
 
 
 def get_terminal(terminal_id: str) -> Dict:
@@ -464,18 +912,30 @@ def send_input(
             if isinstance(orchestration_type, OrchestrationType)
             else str(orchestration_type or "")
         )
-        if (
-            provider
-            and provider.blocks_orchestrated_input_while_waiting_user_answer is True
-            and orchestration_value
-            in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
-            and status_monitor.get_status(terminal_id) == TerminalStatus.WAITING_USER_ANSWER
-        ):
-            raise TerminalInputBlockedError(
-                f"Terminal {terminal_id} is waiting for a user answer. "
-                "Use answer_user_prompt to submit a selection or approval before "
-                f"sending {orchestration_value} input."
-            )
+
+        if provider:
+            current_status = status_monitor.get_status(terminal_id)
+
+            # Guard: refuse to type into a terminal whose provider process has
+            # exited. Without this check, queued messages would be pasted into
+            # a bare shell and executed as arbitrary commands.
+            if current_status == TerminalStatus.ERROR:
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} provider is in ERROR state "
+                    "(provider process may have exited). Refusing to deliver input."
+                )
+
+            if (
+                provider.blocks_orchestrated_input_while_waiting_user_answer is True
+                and orchestration_value
+                in {OrchestrationType.ASSIGN.value, OrchestrationType.HANDOFF.value}
+                and current_status == TerminalStatus.WAITING_USER_ANSWER
+            ):
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} is waiting for a user answer. "
+                    "Use answer_user_prompt to submit a selection or approval before "
+                    f"sending {orchestration_value} input."
+                )
 
         # Inject memory context into the very first user message after init.
         # Phase 1 wires injection inline for every provider. The Kiro
@@ -498,6 +958,20 @@ def send_input(
         # working on the new message.
         status_monitor.notify_input_sent(terminal_id)
 
+        # Clear ONLY the rolling byte buffer BEFORE sending keys, so stale idle
+        # prompts from BEFORE the input can't trigger a false COMPLETED
+        # (kiro-cli 2.11's TUI keeps the "ask a question" placeholder in the raw
+        # buffer, which combined with input_received=True would return COMPLETED
+        # within seconds of send_input). Clearing here — not after send_keys —
+        # avoids a race: send_keys includes a submit-delay sleep during which
+        # the agent can begin emitting output; a post-send_keys clear would wipe
+        # that newly-emitted first chunk of the turn (lost from
+        # GET /terminals/{id}/output?mode=full and from early detection). This
+        # uses clear_rolling_buffer (byte-only), which preserves the sticky-latch
+        # arm set by notify_input_sent above; reset_buffer would wipe the arm and
+        # latch-block the IDLE→PROCESSING transition for the whole turn.
+        status_monitor.clear_rolling_buffer(terminal_id)
+
         get_backend().send_keys(
             metadata["tmux_session"],
             metadata["tmux_window"],
@@ -517,17 +991,33 @@ def send_input(
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
         if registry is not None and sender_id is not None and orchestration_type is not None:
-            dispatch_plugin_event(
-                registry,
-                "post_send_message",
-                PostSendMessageEvent(
-                    session_id=metadata["tmux_session"],
-                    sender=sender_id,
-                    receiver=terminal_id,
-                    message=original_message,
-                    orchestration_type=orchestration_type,
-                ),
+            # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
+            # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
+            # count it, and propagate the active trace context into the plugin
+            # event so downstream consumers can continue the trace.
+            from cli_agent_orchestrator.telemetry import (
+                execute_tool_span,
+                inject_traceparent,
+                record_orchestration_dispatch,
             )
+
+            with execute_tool_span(
+                f"send_message:{orchestration_value}",
+                conversation_id=metadata["tmux_session"],
+            ):
+                record_orchestration_dispatch(orchestration_value)
+                dispatch_plugin_event(
+                    registry,
+                    "post_send_message",
+                    PostSendMessageEvent(
+                        session_id=metadata["tmux_session"],
+                        sender=sender_id,
+                        receiver=terminal_id,
+                        message=original_message,
+                        orchestration_type=orchestration_type,
+                        traceparent=inject_traceparent(),
+                    ),
+                )
         return True
 
     except Exception as e:
@@ -603,8 +1093,9 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
 
     ``FULL`` mode returns the StatusMonitor rolling buffer (the streamed output
     accumulated from the FIFO pipeline), which is bounded to the most recent
-    ``STATE_BUFFER_MAX`` bytes (8KB); it falls back to a tmux history capture
-    only when that buffer is empty. This is a deliberate trade-off in the
+    ``state_buffer_max`` bytes (server setting, see settings_service.py; 32KB
+    default); it falls back to a tmux history capture only when that buffer
+    is empty. This is a deliberate trade-off in the
     event-driven architecture (instant, no tmux call) — it is *not* unbounded
     scrollback, so very long sessions are truncated to the tail. Use the
     on-disk ``{id}.log`` (LogWriter) or the delete-time ``{id}.scrollback``

@@ -2,14 +2,25 @@
 name: developer
 description: Developer Agent in a multi-agent system
 role: developer  # @builtin, fs_*, execute_bash, @cao-mcp-server. For fine-grained control, see docs/tool-restrictions.md
+tags:
+  - coding
+  - implementation
+  - python
+  - api
+  - pytest
+  - testing
+  - documentation
+  - technical-writing
+  - docx
+capabilities:
+  - implement Python APIs and application code
+  - write pytest unit and integration tests
+  - create and edit technical documentation and DOCX documents
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 ---
 
 # DEVELOPER AGENT

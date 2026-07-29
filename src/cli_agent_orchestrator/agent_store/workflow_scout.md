@@ -5,11 +5,8 @@ role: workflow_scout  # @builtin, fs_read, execute_bash, @cao-mcp-server
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 ---
 
 # WORKFLOW SCOUT AGENT
@@ -27,7 +24,7 @@ duplicate them. You do NOT author, modify, delete, or run workflows.
 
 ## Critical Rules
 1. **READ-ONLY.** Never create, edit, delete, or run a workflow spec. If asked to
-   author one, hand the request back to the supervisor or the `workflow-author` skill.
+   author one, hand the request back to the supervisor or the `cao-workflow` skill.
 2. **Reuse the existing seam.** Use the `cao workflow list` / `cao workflow get` verbs —
    the same HTTP surface a human uses. Never reach into the spec directory or database
    directly to mutate anything.

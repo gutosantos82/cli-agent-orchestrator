@@ -1,17 +1,24 @@
 ---
 name: cloudwatch-logs-agent
 description: Search CloudWatch Logs for execution traces and error patterns
+tags:
+  - aws
+  - cloudwatch
+  - logs
+  - search
+  - errors
+  - verification
+capabilities:
+  - "search CloudWatch log groups for execution IDs"
+  - "analyze log events for success or error patterns"
 allowedTools:
   - execute_bash
   - fs_read
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 ---
 
 # CloudWatch Logs Agent

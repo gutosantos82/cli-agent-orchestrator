@@ -12,11 +12,13 @@ from cli_agent_orchestrator.cli.commands.install import install
 from cli_agent_orchestrator.cli.commands.launch import launch
 from cli_agent_orchestrator.cli.commands.mcp_server import mcp_server
 from cli_agent_orchestrator.cli.commands.memory import memory
+from cli_agent_orchestrator.cli.commands.profile import profile
 from cli_agent_orchestrator.cli.commands.schedule import flow, schedule
 from cli_agent_orchestrator.cli.commands.session import session
 from cli_agent_orchestrator.cli.commands.shutdown import shutdown
 from cli_agent_orchestrator.cli.commands.skills import skills
 from cli_agent_orchestrator.cli.commands.terminal import terminal
+from cli_agent_orchestrator.cli.commands.update import update
 from cli_agent_orchestrator.cli.commands.workflow import workflow
 
 try:
@@ -32,6 +34,7 @@ def cli():
 
 
 # Register commands
+cli.add_command(profile)
 cli.add_command(launch)
 cli.add_command(config)
 cli.add_command(init)
@@ -47,6 +50,7 @@ cli.add_command(skills)
 cli.add_command(session)
 cli.add_command(terminal)
 cli.add_command(workflow)
+cli.add_command(update)
 
 
 if __name__ == "__main__":

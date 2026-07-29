@@ -1,17 +1,24 @@
 ---
 name: sqs-dlq-check-agent
 description: Inspect a Dead Letter Queue for failed messages
+tags:
+  - aws
+  - sqs
+  - dlq
+  - dead-letter-queue
+  - failures
+  - monitoring
+capabilities:
+  - "check a dead letter queue for failed messages"
+  - "inspect DLQ message contents and counts"
 allowedTools:
   - execute_bash
   - fs_read
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 ---
 
 # SQS DLQ Check Agent

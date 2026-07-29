@@ -1,17 +1,23 @@
 ---
 name: sqs-monitor-agent
 description: Poll an SQS queue until all messages are consumed
+tags:
+  - aws
+  - sqs
+  - queue
+  - monitoring
+  - polling
+capabilities:
+  - "poll an SQS queue until messages are consumed"
+  - "report queue depth over time"
 allowedTools:
   - execute_bash
   - fs_read
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 ---
 
 # SQS Monitor Agent

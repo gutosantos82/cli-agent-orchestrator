@@ -71,9 +71,22 @@ class StepRow:
 
 
 def _connect() -> sqlite3.Connection:
-    """Open a connection to the shared SQLite file (self-connecting, like B2)."""
+    """Open a connection to the shared SQLite file (self-connecting, like B2).
+
+    Ensures the ``workflow_run`` / ``workflow_run_step`` tables exist first
+    (idempotent ``CREATE TABLE IF NOT EXISTS`` via the shared migrators) so a
+    read/write here never races ``init_db()`` — a process that never went
+    through the FastAPI lifespan (e.g. a test that instantiates the app
+    without entering it as a context manager) still finds its schema.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        _migrate_workflow_run,
+        _migrate_workflow_run_step,
+    )
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
+    _migrate_workflow_run()
+    _migrate_workflow_run_step()
     return sqlite3.connect(str(DATABASE_FILE))
 
 
@@ -88,6 +101,8 @@ def insert_run(
     inputs_json: str,
     state: str,
     started_at: str,
+    tier: str = "yaml",
+    generation: str = "1",
 ) -> None:
     """INSERT the ``workflow_run`` row at ``start_run`` (lifecycle table, E1).
 
@@ -96,14 +111,30 @@ def insert_run(
     (a resume never calls this — it only UPDATEs). The engine both pre-checks the
     journal in ``start_run`` and wraps this call best-effort, so a lost race
     logs instead of clobbering history.
+
+    U4 addition (issue #312, script-tier runner, C1): optional ``tier`` /
+    ``generation`` kwargs (additive, INV-1 — YAML callers are byte-identical and
+    default to ``tier='yaml'``/``generation='1'``, the migration defaults). A
+    script run passes ``tier='script'`` in ONE write so a script row is never
+    journaled with a transient ``tier='yaml'`` window that would break tier
+    dispatch / resumability (code-generation-plan CONTRADICTION #4).
     """
     with _connect() as conn:
         conn.execute(
             "INSERT INTO workflow_run "
             "(run_id, workflow_name, spec_snapshot, inputs_json, state, "
-            " current_step_id, started_at, finished_at) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL)",
-            (run_id, workflow_name, spec_snapshot, inputs_json, state, started_at),
+            " current_step_id, started_at, finished_at, tier, generation) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+            (
+                run_id,
+                workflow_name,
+                spec_snapshot,
+                inputs_json,
+                state,
+                started_at,
+                tier,
+                generation,
+            ),
         )
 
 
@@ -261,7 +292,8 @@ def append_step(
 
     Called at the RUNNING insert for a script call — ``call_fingerprint`` is
     known BEFORE execution (``sha256(provider || agent || prompt)``, ADR-5) so a
-    later resume's ``lookup_replay`` (A2) has something to compare against. The
+    future caller of the reserved ``lookup_replay`` primitive has a stable value
+    to compare. The
     completion transition (RUNNING -> COMPLETED/FAILED) reuses the base
     ``update_step`` UNCHANGED (INV-1); this function is the sole write path for
     ``call_fingerprint`` (VR-4).
@@ -288,6 +320,9 @@ def append_step(
 
 def lookup_replay(run_id: str, step_id: str, call_fingerprint: str) -> Optional[StepRow]:
     """Decide replay-from-journal vs execute-fresh for a script call (A2, the M3 core).
+
+    This is a reserved journal primitive. The current run-step route does not call
+    it, so script resume re-executes completed calls rather than replaying them.
 
     Three-way outcome (DR-1/DR-2/DR-3/DR-4, business-rules.md):
 

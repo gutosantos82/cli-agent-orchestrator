@@ -13,6 +13,7 @@ from cli_agent_orchestrator.constants import TERMINALS_RUN_STEP_ROUTE
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 
 _RUN_STEP = "cli_agent_orchestrator.api.main.run_agent_step"
+_CHECK_GENERATION = "cli_agent_orchestrator.services.workflow_service.check_generation"
 
 _ALL_KEYS = {
     "CAO_WORKFLOW_RUN_ID": "run-abc123",
@@ -35,7 +36,13 @@ def _ok_result():
 
 class TestForwarding:
     def test_all_three_allowlisted_keys_forward_to_run_agent_step(self, client):
-        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run:
+        # RUN_ID + GENERATION are both present, so the F1 fence fires — mock it
+        # to a pass-through so this test stays focused on forwarding, not the
+        # fence (which has its own TestGenerationFence coverage).
+        with (
+            patch(_CHECK_GENERATION, return_value=None),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=_ALL_KEYS))
         assert resp.status_code == 200
         # BR-14: forwarded verbatim — no rewriting, no defaults, no merging.
@@ -49,9 +56,13 @@ class TestForwarding:
         assert m_run.await_args.kwargs["env_vars"] is None
 
     def test_run_id_with_generation_but_no_step_id_is_allowed(self, client):
-        # BR-7: RUN_ID without STEP_ID is a valid run-row-level call.
+        # BR-7: RUN_ID without STEP_ID is a valid run-row-level call. The pair is
+        # present, so the fence fires too — mocked to a pass-through here.
         env = {"CAO_WORKFLOW_RUN_ID": "run-abc", "CAO_WORKFLOW_GENERATION": "1"}
-        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())):
+        with (
+            patch(_CHECK_GENERATION, return_value=None),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())),
+        ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env))
         assert resp.status_code == 200
 
@@ -61,7 +72,10 @@ class TestForwarding:
             "CAO_WORKFLOW_RUN_ID": "r" * 64,
             "CAO_WORKFLOW_GENERATION": "g" * 64,
         }
-        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())):
+        with (
+            patch(_CHECK_GENERATION, return_value=None),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())),
+        ):
             resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env))
         assert resp.status_code == 200
 
@@ -191,3 +205,153 @@ class TestSentinelNeverEchoed:
         )
         assert resp.status_code == 422
         assert "SENTINELzzz" not in resp.text
+
+
+class TestGenerationFence:
+    """F1: the run-step handler checks the generation fence BEFORE dispatch,
+    whenever env_vars carries BOTH CAO_WORKFLOW_RUN_ID and
+    CAO_WORKFLOW_GENERATION."""
+
+    _ENV = {"CAO_WORKFLOW_RUN_ID": "run-fence", "CAO_WORKFLOW_GENERATION": "2"}
+
+    def test_stale_generation_is_409(self, client):
+        from cli_agent_orchestrator.services.workflow_service import StaleGenerationError
+
+        with (
+            patch(
+                _CHECK_GENERATION,
+                side_effect=StaleGenerationError("run 'run-fence': stale generation"),
+            ) as m_check,
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=self._ENV))
+        assert resp.status_code == 409
+        assert "run-fence" in resp.text
+        m_check.assert_called_once_with("run-fence", "2")
+        m_run.assert_not_awaited()  # fence fired BEFORE dispatch
+
+    def test_current_generation_passes_through(self, client):
+        with (
+            patch(_CHECK_GENERATION, return_value=None) as m_check,
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=self._ENV))
+        assert resp.status_code == 200
+        m_check.assert_called_once_with("run-fence", "2")
+        m_run.assert_awaited_once()
+
+    def test_unknown_run_id_is_404(self, client):
+        with (
+            patch(_CHECK_GENERATION, side_effect=KeyError("unknown run_id 'run-fence'")),
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=self._ENV))
+        assert resp.status_code == 404
+        m_run.assert_not_awaited()
+
+    def test_env_vars_without_the_pair_never_calls_fence(self, client):
+        # RUN_ID alone (no GENERATION) — invalid per BR-6/BR-7's cross-field rule,
+        # so this never reaches the fence; asserted separately below with a valid
+        # env shape that simply omits the pair (absent env_vars entirely).
+        with (
+            patch(_CHECK_GENERATION) as m_check,
+            patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())) as m_run,
+        ):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+        assert resp.status_code == 200
+        m_check.assert_not_called()
+        m_run.assert_awaited_once()
+
+
+class TestScriptStepCompletion:
+    """Bug 2: a script-tier run-step call must transition its shared
+    ScriptRunRecord step RUNNING -> COMPLETED (success) or -> FAILED (crash),
+    end-to-end through the run_step endpoint. Without it a completed script run
+    reports every step frozen at running/attempts=0/output=null."""
+
+    _ENV = {
+        "CAO_WORKFLOW_RUN_ID": "run-step-done",
+        "CAO_WORKFLOW_STEP_ID": "s1",
+        "CAO_WORKFLOW_GENERATION": "1",
+    }
+
+    def _register_script_record(self, run_id):
+        from cli_agent_orchestrator.models.workflow_runtime import RunState
+        from cli_agent_orchestrator.services import workflow_service
+        from cli_agent_orchestrator.services.script_runner import ScriptRunRecord
+
+        record = ScriptRunRecord(
+            run_id=run_id,
+            workflow_name="wf",
+            state=RunState.RUNNING,
+            cancelled=False,
+            current_step_id=None,
+            step_states={},
+            process=None,
+            generation="1",
+            started_at="2026-07-10T00:00:00Z",
+            finished_at=None,
+            tier="script",
+        )
+        workflow_service.run_registry[run_id] = record
+        return record
+
+    def test_success_transitions_step_to_completed(self, client):
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.services import workflow_service
+
+        record = self._register_script_record("run-step-done")
+        try:
+            with (
+                patch(_CHECK_GENERATION, return_value=None),
+                patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())),
+            ):
+                resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=self._ENV))
+            assert resp.status_code == 200
+            st = record.step_states["s1"]
+            assert st.state == StepState.COMPLETED
+            assert st.attempts == 1
+        finally:
+            workflow_service.run_registry.pop("run-step-done", None)
+
+    def test_crash_transitions_step_to_failed(self, client):
+        from cli_agent_orchestrator.models.workflow import StepState
+        from cli_agent_orchestrator.services import workflow_service
+        from cli_agent_orchestrator.services.agent_step import StepExecutionError
+
+        env = dict(self._ENV, CAO_WORKFLOW_RUN_ID="run-step-fail")
+        record = self._register_script_record("run-step-fail")
+        try:
+            with (
+                patch(_CHECK_GENERATION, return_value=None),
+                patch(
+                    _RUN_STEP,
+                    new=AsyncMock(
+                        side_effect=StepExecutionError(
+                            "terminal t1 reached ERROR status",
+                            kind="error",
+                            terminal_id="t1",
+                        )
+                    ),
+                ),
+            ):
+                resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body(env_vars=env))
+            assert resp.status_code == 502  # kind=error -> 502
+            st = record.step_states["s1"]
+            assert st.state == StepState.FAILED
+            assert st.error is not None
+            assert st.terminal_id == "t1"
+        finally:
+            workflow_service.run_registry.pop("run-step-fail", None)
+
+    def test_non_script_caller_no_step_state_side_effect(self, client):
+        """A plain handoff call (no run/step env) must not create any script
+        step state — the completion path is a strict no-op for it."""
+        from cli_agent_orchestrator.services import workflow_service
+
+        before = dict(workflow_service.run_registry)
+        with patch(_RUN_STEP, new=AsyncMock(return_value=_ok_result())):
+            resp = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+        assert resp.status_code == 200
+        # Registry untouched — no phantom record/step created.
+        assert dict(workflow_service.run_registry) == before

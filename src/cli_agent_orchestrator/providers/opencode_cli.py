@@ -104,6 +104,20 @@ class OpenCodeCliProvider(BaseProvider):
         return 1
 
     @property
+    def paste_submit_delay(self) -> float:
+        """OpenCode's TUI can swallow an Enter sent too soon after the bracketed-paste
+        end marker. 1.0s (matching kiro_cli) is conservative and avoids the
+        deferred-init "never started processing" race (see #479)."""
+        return 1.0
+
+    # Opt-in for the deferred-init direct status probe (capture-pane bypass).
+    # OpenCode's get_status() detector is line-oriented and works correctly on a
+    # rendered capture-pane snapshot. Providers whose get_status() relies on
+    # dispatch bookkeeping (e.g. kiro_cli, antigravity_cli, cursor_cli) must NOT
+    # set this flag — their COMPLETED/IDLE split is not screen-detectable.
+    supports_direct_status_probe = True
+
+    @property
     def extraction_tail_lines(self) -> int:
         """Capture extra scrollback for extraction (belt-and-braces).
 
@@ -195,10 +209,13 @@ class OpenCodeCliProvider(BaseProvider):
         """
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
 

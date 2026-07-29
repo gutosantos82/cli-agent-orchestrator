@@ -71,10 +71,12 @@ from pathlib import Path
 from typing import Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
@@ -504,6 +506,9 @@ class CursorCliProvider(BaseProvider):
                 servers[server_name] = dict(server_config)
             else:
                 servers[server_name] = server_config.model_dump(exclude_none=True)
+            # Resolve the bundled cao-mcp-server console script to a
+            # PATH-independent invocation.
+            servers[server_name] = resolve_mcp_server_config(servers[server_name])
             env = servers[server_name].get("env", {})
             if "CAO_TERMINAL_ID" not in env:
                 env["CAO_TERMINAL_ID"] = self.terminal_id
@@ -527,16 +532,13 @@ class CursorCliProvider(BaseProvider):
 
         Honours the ``CAO_TMP_DIR`` env var so tests can redirect
         temp output to ``/tmp/cao_test`` instead of polluting the
-        user's ``~/.aws/cli-agent-orchestrator/tmp``. Defaults to
-        ``~/.aws/cli-agent-orchestrator/tmp`` for production.
+        user's CAO data dir. Defaults to ``<CAO_HOME_DIR>/tmp`` (i.e.
+        ``~/.aws/cli-agent-orchestrator/tmp`` unless ``CAO_HOME_DIR`` is
+        overridden), matching where the other providers write temp files.
         """
         import os
 
-        cao_tmp = Path(
-            os.environ.get(
-                "CAO_TMP_DIR", str(Path.home() / ".aws" / "cli-agent-orchestrator" / "tmp")
-            )
-        )
+        cao_tmp = Path(os.environ.get("CAO_TMP_DIR", str(CAO_HOME_DIR / "tmp")))
         cao_tmp.mkdir(parents=True, exist_ok=True)
         return cao_tmp
 
@@ -622,17 +624,21 @@ class CursorCliProvider(BaseProvider):
         7. UNKNOWN — fallback when no marker matches.
 
         Args:
-            output: Raw terminal output (rolling buffer, up to ~8KB).
+            output: Raw terminal output (rolling buffer, up to ``state_buffer_max``
+                bytes -- server setting, 32KB default).
 
         Returns:
             Current TerminalStatus.
         """
         # Native status (herdr): trust the backend's agent state when available;
         # on herdr the buffer is never fed, so buffer parsing can't leave UNKNOWN.
-        native = self._resolve_native_status()
+        native = self._resolve_native_status(output)
         if native is not None:
             return native
 
+        # herdr never pushes a buffer (pipe_pane is a no-op there); read live
+        # pane content instead of falling through to "no output" on every call.
+        output = self._resolve_buffer(output)
         if not output:
             return TerminalStatus.UNKNOWN
 
@@ -666,12 +672,12 @@ class CursorCliProvider(BaseProvider):
         #
         # We check the *tail* of the buffer (last ~1KB) so a long
         # response that scrolls older processing markers out of the
-        # rolling 8KB window does not flip us back to IDLE during
-        # processing. The 1KB window is well below the 8KB buffer
-        # cap, and the input-box line is rendered in the last few
-        # hundred bytes on every Cursor TUI frame, so the indicator
-        # is always present in the tail whenever the agent is
-        # working.
+        # rolling state-buffer window does not flip us back to IDLE
+        # during processing. The 1KB window is well below the buffer
+        # cap (``state_buffer_max``, server setting, 32KB default),
+        # and the input-box line is rendered in the last few hundred
+        # bytes on every Cursor TUI frame, so the indicator is always
+        # present in the tail whenever the agent is working.
         TUI_TAIL_WINDOW = 1024
         tail = clean[-TUI_TAIL_WINDOW:]
         processing_indicator_in_tail = (

@@ -1,17 +1,22 @@
 ---
 name: dynamodb-query-agent
 description: Query DynamoDB tables by partition key
+tags:
+  - aws
+  - dynamodb
+  - query
+  - read
+capabilities:
+  - "query DynamoDB tables by partition key"
+  - "inspect item attributes and counts"
 allowedTools:
   - execute_bash
   - fs_read
 mcpServers:
   cao-mcp-server:
     type: stdio
-    command: uvx
-    args:
-      - "--from"
-      - "git+https://github.com/awslabs/cli-agent-orchestrator.git@main"
-      - "cao-mcp-server"
+    command: cao-mcp-server
+    args: []
 ---
 
 # DynamoDB Query Agent
