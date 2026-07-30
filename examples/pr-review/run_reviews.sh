@@ -21,6 +21,8 @@ LIMIT=10
 MAX_PARALLEL=3
 DATA_DIR="pr-review-data"
 REFRESH_META_ONLY=0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -365,8 +367,27 @@ fi
 if [[ "$launched" -gt 0 ]] && [[ "${CAO_PRR_RETROSPECT:-1}" = "1" ]]; then
   if curl -sf -m 5 "http://127.0.0.1:9889/outcomes" >/dev/null 2>&1; then
     echo "Dispatching retrospector for this batch…"
+    # `retrospector` is a BUILT-IN profile: it appears in `cao profile list` but
+    # `cao launch` does NOT materialize the provider-side agent JSON for built-ins.
+    # Without ~/.kiro/agents/retrospector.json, kiro-cli logs "no agent with name
+    # retrospector found. Falling back to user specified default" and renders a
+    # prompt with no "[profile]" prefix — so CAO's profile-derived idle pattern
+    # never matches, the terminal never reaches IDLE, and create_terminal fails
+    # after provider_init_timeout (60s). Install it first; idempotent and cheap.
+    if [[ ! -f "$HOME/.kiro/agents/retrospector.json" ]]; then
+      retro_md="$REPO_ROOT/src/cli_agent_orchestrator/agent_store/retrospector.md"
+      if [[ -f "$retro_md" ]]; then
+        echo "  installing built-in retrospector profile for kiro_cli…"
+        cao install "$retro_md" >/dev/null 2>&1 \
+          || echo "  (retrospector install failed — launch will likely time out)"
+      else
+        echo "  (built-in retrospector.md not found at $retro_md)"
+      fi
+    fi
+    # Capture launch output: swallowing it is what hid the real failure for a week.
+    retro_log="$DATA_DIR/retro-launch.log"
     if cao launch --agents retrospector --provider kiro_cli --yolo --headless \
-         --session-name "prr-retro" >/dev/null 2>&1; then
+         --session-name "prr-retro" >"$retro_log" 2>&1; then
       sleep 12
       deliver_task "cao-prr-retro" \
         "Retrospect on workflow pr-review — the review batch that just finished. Agents involved: pr_review_supervisor, correctness_reviewer, security_reviewer, tests_reviewer, conventions_reviewer, consistency_reviewer, conversation_reviewer, vision_reviewer, verifier. Read the recorded outcomes, store only lessons that would change what an agent does next time, then reply with your one-line summary." \
@@ -383,7 +404,8 @@ if [[ "$launched" -gt 0 ]] && [[ "${CAO_PRR_RETROSPECT:-1}" = "1" ]]; then
         echo "  retrospection complete — review lessons with: cao memory list"
       fi
     else
-      echo "  (retrospector launch failed — skipping retrospection)"
+      echo "  (retrospector launch failed — skipping retrospection; see $retro_log)"
+      sed 's/^/    | /' "$retro_log" 2>/dev/null | tail -5
     fi
   else
     echo "Learning disabled (/outcomes unavailable) — skipping retrospection."

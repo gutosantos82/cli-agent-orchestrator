@@ -44,9 +44,10 @@ idle**. So:
   PR. You run the full pipeline including the two human gates (Steps 5–6).
 - **Dashboard mode** — the `pr_review_manager` handed off to you and the task message says
   `MODE: dashboard, write report to <path>`. In that case you do **Steps 1–4**, then
-  **write the synthesized report to that file path**, then do **Step 7** (report the outcome)
-  and end your turn. You do NOT gate, do NOT post a comment, and do NOT approve — the
-  dashboard is the human gate. Skip Steps 5–6 only.
+  **write the synthesized report to that file path**, then do **Steps 7–8** (report the
+  outcome and confirm it) and end your turn. You do NOT gate, do NOT post a comment, and do
+  NOT approve — the dashboard is the human gate. Skip Steps 5–6 only. Step 7 is mandatory in
+  dashboard mode too — it is the only mode the scheduled driver ever uses.
 
 ## The pipeline
 
@@ -377,11 +378,15 @@ gh pr review <n> --repo awslabs/cli-agent-orchestrator --approve --body "Approve
 
 If no, stop — leave the PR un-approved and report that you've stopped.
 
-### Step 7 — report the outcome (self-learning)
+### Step 7 — report the outcome (MANDATORY, self-learning)
 
-Once the report is written (dashboard mode) or the gates are done (interactive mode), record
-one outcome for the review so the team improves across runs. Load the `cao-learning` skill for
-the full contract; the short version:
+**This step is NOT optional and NOT conditional on anything you judge.** The review is not
+finished until you have called `report_outcome` exactly once. Writing the report file is
+Step 4; this is a separate, additional tool call that you MUST make before Step 8. Do not
+end your turn, and do not treat the task as complete, until this call has returned.
+
+Call it directly — you do NOT need to load any skill first, and you must NOT skip it because
+the run went cleanly:
 
 ```
 report_outcome(
@@ -394,17 +399,32 @@ report_outcome(
 )
 ```
 
+`report_outcome` is provided by `cao-mcp-server`, which you already have via
+`@cao-mcp-server` in `allowedTools`. It needs no extra permission and no setup.
+
 Rules:
-- **One call per PR review**, after the report exists — not per reviewer.
+- **Exactly one call per PR review**, after the report exists — not per reviewer.
+- **A clean run still reports.** `success=true` with `friction_notes=""` is the correct call
+  when nothing went wrong. Silence is NOT the clean-run signal — an absent outcome is
+  indistinguishable from a crashed supervisor.
 - `friction_notes` carries **conclusions only**. Never paste diffs, review bodies, logs,
-  stack traces, or PR content into it. Empty string on a clean run is fine.
+  stack traces, or PR content into it.
 - Report failures faithfully — a stalled reviewer or an unusable angle is the most valuable
   signal. Do not mark a partial review `success=true`.
-- If `report_outcome` returns `disabled: true`, learning is off for this run: **skip it
-  silently and continue**. That is expected, not an error.
+- Only if the call returns `disabled: true` do you skip it: learning is off for this run.
+  That is the ONE acceptable reason to move on without a recorded outcome.
+- If the call errors for any other reason, say so explicitly in your final message so the
+  operator knows the outcome was lost. Do not fail the review over it.
 
 Do **not** hand off to the `retrospector` yourself — the driver dispatches it once per batch
 after all PRs are reviewed, so lessons are distilled across the whole run rather than one PR.
+
+### Step 8 — confirm the outcome in your final message
+
+End your run by stating, in one line, that the outcome was recorded — e.g.
+`Outcome recorded: review PR #<n>, success=true`. If `report_outcome` returned
+`disabled: true` or errored, say that instead. This makes a missing outcome visible in the
+session transcript instead of failing silently.
 
 ### Final step — clean up the worktree
 
@@ -424,5 +444,7 @@ git worktree remove --force "$WT" 2>/dev/null || true
 4. After dispatching workers, finish your turn — do not block the inbox.
 5. If a reviewer's finding looks wrong, say so in the synthesis rather than parroting it.
 6. Always `git worktree remove` the PR checkout when done (it lives under `/tmp/pr-review/`).
-7. Report exactly one outcome per PR review (Step 7), and never put PR content, diffs, or logs
-   in `friction_notes` — conclusions only. If learning is disabled, skip it silently.
+7. Report exactly one outcome per PR review (Step 7) — **mandatory, including on clean runs**
+   — and never put PR content, diffs, or logs in `friction_notes` (conclusions only). The only
+   acceptable reason to finish without a recorded outcome is `report_outcome` returning
+   `disabled: true`. Confirm the result in your final message (Step 8).
