@@ -24,6 +24,20 @@ REFRESH_META_ONLY=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Forward the learning flag into agent sessions as an ENV VAR rather than relying on
+# settings.json. Under Amazon's agent sandboxing the agent gets a synthetic ~/.aws and
+# CANNOT read ~/.aws/cli-agent-orchestrator/settings.json; is_learning_enabled() then
+# fails closed, so report_outcome answers "learning-disabled" even though cao-server
+# (reading the real file) has it enabled. Verified: with an unreadable CAO home,
+# is_learning_enabled() is False, but False -> True once CAO_MEMORY_LEARNING_ENABLED=true
+# is set, because the env var takes precedence over settings.json.
+# Only forwarded when the SERVER reports learning actually on (GET /outcomes 200), so we
+# never assert a capability the backend has disabled.
+LEARNING_ENV=""
+if curl -sf -m 5 "http://127.0.0.1:9889/outcomes" >/dev/null 2>&1; then
+  LEARNING_ENV="--env CAO_MEMORY_LEARNING_ENABLED=true"
+fi
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --limit) LIMIT="$2"; shift 2 ;;
@@ -329,7 +343,7 @@ for i in "${!PRS[@]}"; do
   # fans out to the five reviewers, writes the report, then goes idle.
   msg="Review PR #$pr. MODE: dashboard, write report to ${DATA_DIR}/reviews/${pr}-${sha}.md"
   if cao launch --agents pr_review_supervisor --provider kiro_cli --yolo --headless \
-       --session-name "prr-${pr}" >/dev/null 2>&1; then
+       $LEARNING_ENV --session-name "prr-${pr}" >/dev/null 2>&1; then
     sleep 12   # let the supervisor finish booting before sending the task
     LAUNCH_SHA[$pr]="$sha"
     deliver_task "cao-prr-${pr}" "$msg" \
@@ -349,6 +363,31 @@ for _ in $(seq 1 80); do
   [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -eq 0 ]] && break
   sleep 30
 done
+# Settle pass. The wait loop above can expire in the seconds between a supervisor
+# finishing its synthesis and the report file appearing on disk — the review
+# SUCCEEDED but this script recorded "#N — no report (head moved or review did not
+# complete)" and skipped its Telegram decision message (observed on #529: loop gave
+# up 05:22:06, report landed 05:23). Poll a little longer for reports we are still
+# missing, reaping any that land, before declaring anything incomplete.
+missing_reports() {
+  local n=0 pr sha
+  for pr in "${!LAUNCH_SHA[@]}"; do
+    sha="${LAUNCH_SHA[$pr]}"
+    [[ -f "$DATA_DIR/reviews/${pr}-${sha}.md" ]] || n=$((n+1))
+  done
+  echo "$n"
+}
+if [[ "$(missing_reports)" -gt 0 ]]; then
+  echo "Settling: $(missing_reports) report(s) not on disk yet — polling ${SETTLE_SECS:-180}s…"
+  settle_end=$((SECONDS + ${SETTLE_SECS:-180}))
+  while [[ $SECONDS -lt $settle_end ]]; do
+    reap_finished
+    [[ "$(missing_reports)" -eq 0 ]] && break
+    sleep 10
+  done
+  reap_finished
+fi
+
 remaining="$(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-' || true)"
 if [[ -n "$remaining" ]]; then
   echo "Still running (no report yet) — may be stalled; inspect with: tmux attach -t <name>"
@@ -364,8 +403,18 @@ fi
 # retrospector reads outcomes via list_outcomes and writes worker-scoped lessons;
 # it never touches GitHub. Instruction promotion stays a separate manual step
 # (`cao memory promote <agent>` — dry-run by default).
+#
+# Ordering matters: retrospection MUST run after the settle pass above, never while
+# a review is still in flight. Dispatched early it reads a stale snapshot and
+# "correctly" concludes there is nothing to learn — observed on #529, where the
+# retrospector started at 05:16, saw no report (it landed 05:23), and reported the
+# session as stalled. If reports are still missing after settling, skip
+# retrospection entirely rather than distil from a half-finished batch.
 if [[ "$launched" -gt 0 ]] && [[ "${CAO_PRR_RETROSPECT:-1}" = "1" ]]; then
-  if curl -sf -m 5 "http://127.0.0.1:9889/outcomes" >/dev/null 2>&1; then
+  if [[ "$(missing_reports)" -gt 0 ]]; then
+    echo "Skipping retrospection — $(missing_reports) review(s) still without a report" \
+         "(retrospecting a partial batch yields stale conclusions)."
+  elif curl -sf -m 5 "http://127.0.0.1:9889/outcomes" >/dev/null 2>&1; then
     echo "Dispatching retrospector for this batch…"
     # `retrospector` is a BUILT-IN profile: it appears in `cao profile list` but
     # `cao launch` does NOT materialize the provider-side agent JSON for built-ins.
@@ -387,7 +436,7 @@ if [[ "$launched" -gt 0 ]] && [[ "${CAO_PRR_RETROSPECT:-1}" = "1" ]]; then
     # Capture launch output: swallowing it is what hid the real failure for a week.
     retro_log="$DATA_DIR/retro-launch.log"
     if cao launch --agents retrospector --provider kiro_cli --yolo --headless \
-         --session-name "prr-retro" >"$retro_log" 2>&1; then
+         $LEARNING_ENV --session-name "prr-retro" >"$retro_log" 2>&1; then
       sleep 12
       deliver_task "cao-prr-retro" \
         "Retrospect on workflow pr-review — the review batch that just finished. Agents involved: pr_review_supervisor, correctness_reviewer, security_reviewer, tests_reviewer, conventions_reviewer, consistency_reviewer, conversation_reviewer, vision_reviewer, verifier. Read the recorded outcomes, store only lessons that would change what an agent does next time, then reply with your one-line summary." \
