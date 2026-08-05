@@ -133,7 +133,9 @@ def classify(pr: str, me: str, maintainers: set[str], card: dict) -> dict:
     # maintainer's "friendly ping" for 7 days while its row looked like ordinary
     # "waiting on author", because the ping is a comment by someone else and does
     # not change author-silence, idle, or verdict state.
-    mentions: list[tuple[str, str]] = []   # (ts, who pinged)
+    # (ts, who pinged, comment kind, comment id) — the id lets us check whether the
+    # ping was acknowledged with a REACTION rather than a reply.
+    mentions: list[tuple[str, str, str, int | None]] = []
     my_comments: list[str] = []
     for c in d.get("comments", []):
         who = (c.get("author") or {}).get("login")
@@ -144,7 +146,16 @@ def classify(pr: str, me: str, maintainers: set[str], card: dict) -> dict:
         if who == me:
             my_comments.append(ts)
         elif f"@{me}" in body:
-            mentions.append((ts, who))
+            # `gh pr view --json comments` gives no numeric id; recover it from the
+            # comment url (…/#issuecomment-<id>) so we can query its reactions.
+            cid = None
+            url = c.get("url") or ""
+            if "issuecomment-" in url:
+                try:
+                    cid = int(url.rsplit("issuecomment-", 1)[1])
+                except ValueError:
+                    cid = None
+            mentions.append((ts, who, "issue", cid))
         if who == author:
             author_ev.append((ts, "comment"))
         else:
@@ -164,13 +175,31 @@ def classify(pr: str, me: str, maintainers: set[str], card: dict) -> dict:
         if who == me:
             my_comments.append(ts)
         elif f"@{me}" in (c.get("body") or ""):
-            mentions.append((ts, who))
+            mentions.append((ts, who, "review", c.get("id")))
     mentions.sort()
     last_mention = mentions[-1] if mentions else None
     # Unanswered only if I have posted NOTHING after the most recent ping. My own
     # reviews count as a response too (a re-review answers a "please re-look" ping).
     my_latest = max(my_comments + [t for t, w, _ in other_ev if w == me], default=None)
     mention_unanswered = bool(last_mention and (not my_latest or my_latest < last_mention[0]))
+    # A REACTION on the ping counts as an acknowledgement. Sometimes there is nothing
+    # to answer — the ping is purely informational ("the ball's back on your side") —
+    # and a 👍 is the honest, low-noise reply. Without this the row nags forever and
+    # the operator learns to ignore the flag, which costs us the real ones.
+    mention_ack_reaction: str | None = None
+    if mention_unanswered and last_mention and last_mention[3]:
+        kind, cid = last_mention[2], last_mention[3]
+        path = ("issues/comments" if kind == "issue" else "pulls/comments")
+        try:
+            reactions = json.loads(sh(
+                ["gh", "api", f"repos/{REPO}/{path}/{cid}/reactions"], timeout=45) or "[]")
+            mine_r = [r for r in reactions
+                      if ((r.get("user") or {}).get("login")) == me]
+            if mine_r:
+                mention_ack_reaction = mine_r[-1].get("content")
+                mention_unanswered = False
+        except Exception:  # noqa: BLE001 — absent reactions must never fail the row
+            pass
 
     author_ev.sort()
     other_ev.sort()
@@ -230,6 +259,7 @@ def classify(pr: str, me: str, maintainers: set[str], card: dict) -> dict:
         "nudges": len(nudges),
         "mentions": len(mentions),
         "mention_unanswered": mention_unanswered,
+        "mention_ack_reaction": mention_ack_reaction,
         "last_mention_by": last_mention[1] if last_mention else None,
         "last_mention_days": days_since(last_mention[0]) if last_mention else None,
         "last_nudge_days": days_since(max(nudges)) if nudges else None,
@@ -286,6 +316,10 @@ def render(rows: list[dict], me: str) -> None:
         flags = []
         if r.get("mention_unanswered"):
             flags.append(f"@YOU-UNANSWERED({r['last_mention_by']},{r['last_mention_days']}d)")
+        elif r.get("mention_ack_reaction"):
+            # Acknowledged by reaction, not a reply — shown so it reads as a deliberate
+            # ack rather than the ping having silently vanished from the report.
+            flags.append(f"@you-ack:{r['mention_ack_reaction']}")
         if r["verdict_stale"]:
             flags.append("STALE-VERDICT")
         if r["sole_reviewer"]:
