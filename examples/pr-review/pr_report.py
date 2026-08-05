@@ -128,16 +128,49 @@ def classify(pr: str, me: str, maintainers: set[str], card: dict) -> dict:
         else:
             other_ev.append((ts, who, f"review:{v.get('state')}"))
             reviews_by_other.append((ts, who, v.get("state") or ""))
+    # Track @mentions of `me` and whether I have said anything SINCE the last one.
+    # An unanswered direct ping is invisible in every other column: #495 sat with a
+    # maintainer's "friendly ping" for 7 days while its row looked like ordinary
+    # "waiting on author", because the ping is a comment by someone else and does
+    # not change author-silence, idle, or verdict state.
+    mentions: list[tuple[str, str]] = []   # (ts, who pinged)
+    my_comments: list[str] = []
     for c in d.get("comments", []):
         who = (c.get("author") or {}).get("login")
         ts = c.get("createdAt")
         if not who or not ts or who in BOTS:
             continue
-        (author_ev if who == author else None)
+        body = c.get("body") or ""
+        if who == me:
+            my_comments.append(ts)
+        elif f"@{me}" in body:
+            mentions.append((ts, who))
         if who == author:
             author_ev.append((ts, "comment"))
         else:
             other_ev.append((ts, who, "comment"))
+    # Review-thread (inline) comments are a separate REST collection that
+    # `gh pr view --json comments` does not return, and pings land there too.
+    try:
+        inline = json.loads(sh(["gh", "api",
+                                f"repos/{REPO}/pulls/{pr}/comments", "--paginate"], timeout=60) or "[]")
+    except Exception:  # noqa: BLE001 — inline pings are a bonus signal, never fatal
+        inline = []
+    for c in inline:
+        who = ((c.get("user") or {}).get("login")) or ""
+        ts = c.get("created_at")
+        if not who or not ts or who in BOTS:
+            continue
+        if who == me:
+            my_comments.append(ts)
+        elif f"@{me}" in (c.get("body") or ""):
+            mentions.append((ts, who))
+    mentions.sort()
+    last_mention = mentions[-1] if mentions else None
+    # Unanswered only if I have posted NOTHING after the most recent ping. My own
+    # reviews count as a response too (a re-review answers a "please re-look" ping).
+    my_latest = max(my_comments + [t for t, w, _ in other_ev if w == me], default=None)
+    mention_unanswered = bool(last_mention and (not my_latest or my_latest < last_mention[0]))
 
     author_ev.sort()
     other_ev.sort()
@@ -195,6 +228,10 @@ def classify(pr: str, me: str, maintainers: set[str], card: dict) -> dict:
         "other_maintainers_reviewed": others_reviewed,
         "sole_reviewer": not others_reviewed,
         "nudges": len(nudges),
+        "mentions": len(mentions),
+        "mention_unanswered": mention_unanswered,
+        "last_mention_by": last_mention[1] if last_mention else None,
+        "last_mention_days": days_since(last_mention[0]) if last_mention else None,
         "last_nudge_days": days_since(max(nudges)) if nudges else None,
         "draft": d["isDraft"],
         "state": d["state"],
@@ -216,14 +253,20 @@ def classify(pr: str, me: str, maintainers: set[str], card: dict) -> dict:
 
 def bucket(r: dict) -> tuple[int, str]:
     if r.get("state") and r["state"] != "OPEN":
-        return (4, "CLOSED / MERGED — no action")
+        return (5, "CLOSED / MERGED — no action")
     if r["draft"]:
-        return (3, "DRAFT — not actionable")
+        return (4, "DRAFT — not actionable")
+    # An unanswered direct @mention outranks everything else that is still open: a
+    # human explicitly asked YOU a question and has had no reply. This is its own
+    # group because such a PR can otherwise sit in "waiting on author" and look
+    # like nobody's move (observed: #495, pinged 2026-07-29, unanswered 7 days).
+    if r.get("mention_unanswered"):
+        return (0, "@YOU MENTIONED, NOT ANSWERED — a human is waiting on your reply")
     if r["ball"] == "US":
-        return (0, "BALL IN OUR COURT — author is waiting on us")
+        return (1, "BALL IN OUR COURT — author is waiting on us")
     if (r["author_silent_days"] or 0) >= 14:
-        return (2, "STALLED ON AUTHOR — feedback delivered, author quiet >=14d")
-    return (1, "WAITING ON AUTHOR — recent, normal")
+        return (3, "STALLED ON AUTHOR — feedback delivered, author quiet >=14d")
+    return (2, "WAITING ON AUTHOR — recent, normal")
 
 
 def render(rows: list[dict], me: str) -> None:
@@ -241,6 +284,8 @@ def render(rows: list[dict], me: str) -> None:
             cur = b
         others = (",".join(r["other_maintainers"])[:20] or "—")
         flags = []
+        if r.get("mention_unanswered"):
+            flags.append(f"@YOU-UNANSWERED({r['last_mention_by']},{r['last_mention_days']}d)")
         if r["verdict_stale"]:
             flags.append("STALE-VERDICT")
         if r["sole_reviewer"]:
