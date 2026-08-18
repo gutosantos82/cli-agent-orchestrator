@@ -31,8 +31,29 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # (reading the real file) has it enabled. Verified: with an unreadable CAO home,
 # is_learning_enabled() is False, but False -> True once CAO_MEMORY_LEARNING_ENABLED=true
 # is set, because the env var takes precedence over settings.json.
+#
 # Only forwarded when the SERVER reports learning actually on (GET /outcomes 200), so we
 # never assert a capability the backend has disabled.
+
+# Preflight: the `cao` CLI must actually work before we claim to launch anything.
+#
+# On 2026-08-16 a verifier ran an editable install (`pip/uv install -e .`) INSIDE a
+# /tmp/pr-review/<pr>-<sha> worktree. That repointed the GLOBAL editable install's
+# .pth at the temp tree; once the worktree was removed, every `cao` invocation died
+# with ModuleNotFoundError. Reviews silently stopped for two days while this script
+# still printed "Launched N review session(s)" and "All reviews complete", because a
+# failed `cao launch` only logged a per-PR note that scrolled past. cao-server kept
+# reporting healthy (a long-lived process that had already imported the module), so
+# nothing external looked wrong. Fail fast and loudly instead.
+if ! cao --version >/dev/null 2>&1; then
+  echo "FATAL: the 'cao' CLI is not runnable — aborting before launching anything." >&2
+  cao --version 2>&1 | sed 's/^/  | /' >&2
+  echo "  Common cause: an editable install run inside a /tmp/pr-review worktree" >&2
+  echo "  repointed the global .pth. Check:" >&2
+  echo "    python3 -c 'import cli_agent_orchestrator as m; print(m.__file__)'" >&2
+  exit 1
+fi
+
 LEARNING_ENV=""
 if curl -sf -m 5 "http://127.0.0.1:9889/outcomes" >/dev/null 2>&1; then
   LEARNING_ENV="--env CAO_MEMORY_LEARNING_ENABLED=true"
@@ -312,6 +333,7 @@ printf '  #%s\n' "${PRS[@]%% *}"
 write_security_summary
 
 launched=0
+launch_failures=0
 for i in "${!PRS[@]}"; do
   entry="${PRS[$i]}"
   pr="${entry%% *}"
@@ -348,12 +370,25 @@ for i in "${!PRS[@]}"; do
     LAUNCH_SHA[$pr]="$sha"
     deliver_task "cao-prr-${pr}" "$msg" \
       || echo "    (delivery for #$pr failed — check 'tmux ls')"
+    launched=$((launched+1))
   else
     echo "    (launch for #$pr failed — check 'tmux ls')"
+    launch_failures=$((launch_failures+1))
   fi
-  launched=$((launched+1))
   sleep 4   # small stagger between PRs
 done
+
+# `launched` used to increment unconditionally, so a run where EVERY launch failed
+# still reported "Launched 7 review session(s) ... All reviews complete" (observed
+# 2026-08-17, when the cao CLI was broken). Count only real launches, and say plainly
+# when none succeeded.
+if [[ "$launch_failures" -gt 0 ]]; then
+  echo "WARNING: $launch_failures launch(es) FAILED this run." >&2
+fi
+if [[ "$launched" -eq 0 ]] && [[ "$launch_failures" -gt 0 ]]; then
+  echo "FATAL: every launch failed — no reviews ran. Check 'cao --version' and 'tmux ls'." >&2
+  exit 1
+fi
 
 echo "Launched $launched review session(s). Waiting for in-flight reviews to finish…"
 # keep reaping + nudging stalled sessions until all produce a report (or we give up)

@@ -165,3 +165,29 @@ to break and couldn't is far stronger evidence than one you never exercised.
   against the PR's own claims independently.
 - Clean up temp files under `/tmp`; never modify the worktree's tracked files. Remember the
   Docker gotchas (container-local venv, run as host uid) or you'll leave root-owned files.
+
+## NEVER install the package — use PYTHONPATH
+
+**Do not run `pip install -e .`, `uv pip install -e .`, `uv sync`, or `uv tool install` —
+inside the worktree or anywhere else.** An editable install rewrites a **global** `.pth`
+file to point at wherever you ran it. Run it inside `/tmp/pr-review/<pr>-<sha>/` and the
+host's `cao` command now resolves the package from that temp tree; when the worktree is
+removed, **every `cao` invocation on the machine dies** with
+`ModuleNotFoundError: No module named 'cli_agent_orchestrator'`.
+
+That is not hypothetical: it happened on 2026-08-16 and silently killed all PR review for
+two days — `cao-server` kept reporting healthy because it had already imported the module,
+so nothing looked broken from outside.
+
+To import the PR's code, point Python at the worktree's `src` instead. It needs no install,
+touches nothing global, and vanishes with the shell:
+
+```bash
+PYTHONPATH="$WT/src" python -m pytest test/... -q --no-cov -p no:cacheprovider
+PYTHONPATH="$WT/src" python -c "from cli_agent_orchestrator.providers.codex import _find_response_marker; ..."
+```
+
+Pin `PYTHONPATH` explicitly rather than relying on the repo venv: without it the venv
+resolves the *installed* package, so you silently test `main`'s code instead of the PR's and
+report a pass that proves nothing. If a test genuinely cannot run without an install, say so
+as ⁇ NOT VERIFIED and explain why — that is a valid result. Breaking the host is not.
