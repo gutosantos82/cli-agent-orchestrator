@@ -301,14 +301,48 @@ write_meta() {
 }
 
 echo "Discovering open PRs on $REPO …"
-# non-draft PRs, newest first, capped at LIMIT. Fetch the full per-PR JSON so we can write
-# metadata without extra calls; emit one compact JSON object per line.
-# In refresh-meta mode, cover ALL open PRs (ignore LIMIT); otherwise cap at LIMIT.
-disc_limit=$LIMIT
-[[ "$REFRESH_META_ONLY" -eq 1 ]] && disc_limit=1000
-mapfile -t PR_JSON < <(gh pr list --repo "$REPO" --state open \
+# Fetch ALL open non-draft PRs (full per-PR JSON so metadata needs no extra calls), then
+# order them so the LIMIT cap cannot starve anyone, and only then truncate.
+#
+# Ordering matters. The old code took `gh pr list`'s newest-first order and truncated to
+# LIMIT immediately. Because ~20 newer PRs already had reports at their current head, the
+# window filled with no-ops and PRs that genuinely needed review but sat below the cut
+# were never launched — observed 2026-08-17..19, where #567/#566/#564 were named as
+# "needing review" by the gate on every run for two days and never once launched. The
+# driver reported the truthful "Launched 0 review session(s)", so nothing looked broken.
+#
+# Fix: partition into needs-review (no report at the current head) and already-reviewed,
+# put needs-review FIRST, and cap after. Newest-first is preserved within each group, so
+# fresh PRs still get fast feedback; the cap now only ever drops work that is already done.
+# In refresh-meta mode, cover ALL open PRs (ignore LIMIT).
+mapfile -t ALL_PR_JSON < <(gh pr list --repo "$REPO" --state open --limit 1000 \
   --json number,isDraft,headRefOid,title,additions,deletions,changedFiles,createdAt,author,labels,statusCheckRollup \
-  --jq '[.[] | select(.isDraft|not)] | .[:'"$disc_limit"'][] | @json')
+  --jq '[.[] | select(.isDraft|not)] | .[] | @json')
+
+_needs_review=()
+_already=()
+for j in "${ALL_PR_JSON[@]}"; do
+  _n="$(jq -r '.number' <<<"$j")"
+  _s="$(jq -r '.headRefOid' <<<"$j")"
+  if [[ -f "$DATA_DIR/reviews/${_n}-${_s}.md" ]]; then
+    _already+=("$j")
+  else
+    _needs_review+=("$j")
+  fi
+done
+if [[ "$REFRESH_META_ONLY" -eq 1 ]]; then
+  PR_JSON=("${ALL_PR_JSON[@]}")
+else
+  PR_JSON=()
+  for j in "${_needs_review[@]}" "${_already[@]}"; do
+    [[ "${#PR_JSON[@]}" -lt "$LIMIT" ]] || break
+    PR_JSON+=("$j")
+  done
+  if [[ "${#_needs_review[@]}" -gt "$LIMIT" ]]; then
+    echo "  note: ${#_needs_review[@]} PRs need review but LIMIT=$LIMIT —" \
+         "$(( ${#_needs_review[@]} - LIMIT )) deferred to the next run (none starved: they sort first)."
+  fi
+fi
 PRS=()
 for j in "${PR_JSON[@]}"; do
   PRS+=("$(jq -r '"\(.number) \(.headRefOid)"' <<<"$j")")
