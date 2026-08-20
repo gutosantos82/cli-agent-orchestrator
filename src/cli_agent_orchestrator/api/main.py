@@ -91,6 +91,7 @@ from cli_agent_orchestrator.models.memory import (
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.plugins import PluginRegistry
+from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilityError,
     KiroPhase0KASError,
@@ -3051,6 +3052,13 @@ async def get_terminal_output(
         # transcript can't stall the whole server.
         output = await asyncio.to_thread(terminal_service.get_output, terminal_id, mode)
         return TerminalOutputResponse(output=output, mode=mode)
+    except OutputExtractionError as e:
+        # Ordered before the ValueError arm it subclasses, same as run_step: the
+        # terminal and the route both resolved -- only the response marker was
+        # missing from the scrollback -- so this is a server-side extraction
+        # failure, not a bad terminal reference. Keep it a 500, not a 404
+        # (issue #570), and a plain-string detail like the run-step arm.
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3296,6 +3304,14 @@ async def run_step(
         # a bad request, not an unknown terminal.
         _settle_step(None, str(e))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except OutputExtractionError as e:
+        # Also ordered before the ValueError arm it subclasses. The terminal and
+        # the route both resolved and the step ran -- only the response marker
+        # was missing -- so this is not a bad terminal reference. 500 per this
+        # endpoint's documented contract above ("any other failure -> 500",
+        # plain-string detail, no ``kind``), not 404 (issue #570).
+        _settle_step(None, str(e))
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
