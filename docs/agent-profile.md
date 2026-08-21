@@ -64,6 +64,10 @@ portable and make profile listings useful.
 - `native_agent` (string): Claude Code native-agent name.
 - `codexProfile` (string): named Codex configuration profile.
 - `codexConfig` (object): inline Codex configuration overrides.
+- `claudeConfig` (object): inline Claude Code launch flags; `{"effort":
+  "<low|medium|high|xhigh>"}` maps to `--effort <level>` and
+  `{"fallback_model": "<model>"}` to `--fallback-model <model>`. The Claude
+  analog of `codexConfig`; the top-level `model` field still maps to `--model`.
 - `hermesProfile` (string): Hermes profile wrapper command.
 - `grokNativeWorkflows` (boolean): explicit Grok Build-native worker/workflow
   opt-in; defaults to `false`.
