@@ -2325,6 +2325,7 @@ async def list_providers_endpoint() -> List[Dict]:
         "antigravity_cli": "agy",
         "omp": "omp",
         "grok_cli": "grok",
+        "mcode": "mcode",
     }
     result = []
     for provider, binary in provider_binaries.items():
