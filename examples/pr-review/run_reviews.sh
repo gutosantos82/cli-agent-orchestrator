@@ -45,6 +45,32 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # failed `cao launch` only logged a per-PR note that scrolled past. cao-server kept
 # reporting healthy (a long-lived process that had already imported the module), so
 # nothing external looked wrong. Fail fast and loudly instead.
+CAO_PTH="$(python3 - <<'PY' 2>/dev/null
+import sysconfig, pathlib
+p = pathlib.Path(sysconfig.get_paths()["purelib"]) / "_editable_impl_cli_agent_orchestrator.pth"
+print(p if p.exists() else "")
+PY
+)"
+
+# Self-heal the hijacked editable install before giving up. A verifier that runs
+# `pip/uv install -e .` inside its /tmp/pr-review/<pr>-<sha> worktree rewrites this
+# GLOBAL .pth to point at the temp tree; once the worktree is cleaned up, every `cao`
+# invocation on the host dies. verifier.md forbids this, but a prompt-level ban is
+# advisory — it was ignored on 2026-08-22 (a #650 worktree) after already happening on
+# 08-16 (#623), so the recovery has to be structural. If the .pth points anywhere that
+# no longer exists, repoint it at this repo. Only ever rewrites a DANGLING pointer, so a
+# deliberate install elsewhere is left alone.
+if [[ -n "$CAO_PTH" ]] && ! cao --version >/dev/null 2>&1; then
+  pth_target="$(head -1 "$CAO_PTH" 2>/dev/null || true)"
+  if [[ -n "$pth_target" && ! -d "$pth_target" ]]; then
+    echo "WARNING: the editable install points at a missing path — self-healing." >&2
+    echo "  was: $pth_target" >&2
+    echo "  now: $REPO_ROOT/src" >&2
+    cp "$CAO_PTH" "/tmp/cao-pth-backup-$(date -u +%Y%m%dT%H%M%SZ).txt" 2>/dev/null || true
+    printf '%s\n' "$REPO_ROOT/src" > "$CAO_PTH" 2>/dev/null || true
+  fi
+fi
+
 if ! cao --version >/dev/null 2>&1; then
   echo "FATAL: the 'cao' CLI is not runnable — aborting before launching anything." >&2
   cao --version 2>&1 | sed 's/^/  | /' >&2
