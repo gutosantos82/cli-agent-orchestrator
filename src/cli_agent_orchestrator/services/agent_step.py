@@ -57,6 +57,20 @@ DEFAULT_READY_TIMEOUT = 120.0
 _COMPLETION_POLL_INTERVAL = 1.0
 _IDLE_STABLE_POLLS = 3
 
+# Delivery verification on the synchronous step path (#562). Readiness cannot
+# prove the TUI will accept input — an OpenCode splash frame carries the same
+# idle footer as a conversation-ready frame — so the paste or its Enter can be
+# dropped right after the send and the worker never sees its task. Wait this
+# long for pickup evidence (any working-state read) before re-delivering, and
+# cap the attempts. The step's own ``timeout`` still bounds everything.
+# 8s mirrors ``_DEFERRED_SUBMIT_CONFIRM_TIMEOUT`` in terminal_service: the
+# same decision helper serves that deferred-init confirm loop, so both paths
+# give the PROCESSING edge the same window before calling a send dropped. It
+# is a consistency number with the sibling path, not a measured provider
+# startup latency — tune them together.
+_PROMPT_PICKUP_GRACE = 8.0
+_PROMPT_REDELIVER_MAX = 3
+
 
 async def _validate_reused_terminal(
     terminal_id: str,
@@ -145,6 +159,8 @@ async def _wait_for_completion(
     terminal_id: str,
     timeout: float,
     cancel_event: Optional["asyncio.Event"] = None,
+    *,
+    prompt: Optional[str] = None,
 ) -> None:
     """Wait for a post-input step to settle, polling ``status_monitor`` (issue #409).
 
@@ -164,6 +180,23 @@ async def _wait_for_completion(
       agent picks up the prompt) from returning early with empty output; it mirrors
       the CLI-side ``poll_until_done`` heuristic exactly.
 
+    Delivery verification (issue #562): readiness cannot prove a TUI will accept
+    input (an OpenCode splash frame carries the same idle footer as a
+    conversation-ready one), so the paste or its Enter can be dropped at send and
+    the worker would sit unprompted for the whole budget. When ``prompt`` is
+    given, a worker that shows NO pickup evidence (any working-state read) within
+    ``_PROMPT_PICKUP_GRACE`` gets the message re-delivered — bare Enter when the
+    text is still visible in the rendered pane, full paste when it vanished and
+    the provider is probe-capable — up to ``_PROMPT_REDELIVER_MAX`` times,
+    reusing the deferred-init confirm loop's decision helper (#479/#496).
+    Redelivery only ever fires while the terminal reads IDLE and was never
+    observed working; once work is seen — or the helper's direct probe confirms
+    the worker is running — the step is an ordinary completion wait: a probe
+    "started" verdict proves delivery, never completion, so the cached-IDLE exit
+    still requires prior work. A redelivery that itself raises is logged and
+    swallowed (a failed recovery attempt is not a step failure) so this wait
+    never escapes with anything but its documented exceptions.
+
     Interruptibility (issue #409b): if ``cancel_event`` fires mid-wait, raises
     ``StepCancelledError`` PROMPTLY (it does not wait out the poll interval) so an
     in-flight — possibly hung — step becomes cancellable instead of being observed
@@ -177,6 +210,13 @@ async def _wait_for_completion(
     deadline = time.monotonic() + timeout
     observed_working = False
     consecutive_idle = 0
+    redeliveries = 0
+    delivery_verified = False
+    # Seeded at entry — i.e. AFTER ``send_input`` returned — so the first
+    # grace window runs from the start of this wait, not from the send. That
+    # reads long, which is the conservative direction: a false "dropped"
+    # verdict only costs a wait, a false "delivered" one burns the budget.
+    last_send = time.monotonic()
 
     while True:
         if cancel_event is not None and cancel_event.is_set():
@@ -227,6 +267,71 @@ async def _wait_for_completion(
                 kind="timeout",
                 terminal_id=terminal_id,
             )
+
+        # Delivery verification (#562): no pickup evidence within the grace
+        # window on a terminal still reading IDLE → the send was most likely
+        # dropped (see module constants). Re-deliver off the loop via the
+        # shared decision helper — #496's direct-probe guard inside it also
+        # catches a worker already running under a lagging cached status.
+        # ``full_resend_requires_probe``: without a probe there is NO reliable
+        # "already working" check for the full re-send branch — the box check
+        # matches the whole rendered pane (see ``_message_visible_in_box``),
+        # and under the pyte screen path a whole turn can process inside one
+        # rising-edge/quiescence burst, leaving the cached status IDLE
+        # throughout while the prompt scrolls off — so a full re-send could
+        # duplicate a task the worker already ran. Probe-capable providers
+        # keep the full re-send; the rest keep the bare-Enter recovery,
+        # which cannot duplicate a task.
+        if (
+            prompt is not None
+            and not delivery_verified
+            and not observed_working
+            and current == TerminalStatus.IDLE
+            and redeliveries < _PROMPT_REDELIVER_MAX
+            and time.monotonic() - last_send >= _PROMPT_PICKUP_GRACE
+        ):
+            redeliveries += 1
+            last_send = time.monotonic()
+            logger.warning(
+                "step on terminal %s shows no pickup %ss after send "
+                "(idle, never working) — re-delivering prompt (attempt %d)",
+                terminal_id,
+                _PROMPT_PICKUP_GRACE,
+                redeliveries,
+            )
+            # A failed redelivery is a failed RECOVERY attempt, not a step
+            # failure: ``redeliver_dropped_message`` performs tmux I/O and can
+            # raise (blocked input, vanished pane). Swallow it and let the
+            # step's own deadline classify the outcome, so this wait keeps
+            # its documented Raises contract (StepExecutionError /
+            # StepCancelledError, never a raw terminal exception).
+            try:
+                already_started = await asyncio.to_thread(
+                    terminal_service.redeliver_dropped_message,
+                    terminal_id,
+                    prompt,
+                    redeliveries,
+                    full_resend_requires_probe=True,
+                )
+            except Exception:
+                logger.warning(
+                    "prompt redelivery to %s failed (attempt %d) — continuing to wait",
+                    terminal_id,
+                    redeliveries,
+                    exc_info=True,
+                )
+                already_started = False
+            if already_started:
+                # Probe saw the worker running: delivery is confirmed, stop
+                # re-sending. That verdict proves delivery only, NOT
+                # completion — the cached IDLE is lagging (#496) — so the
+                # ordinary signals (COMPLETED, or working then stable IDLE)
+                # still gate the exit.
+                delivery_verified = True
+            # else: a re-send was attempted; if it also shows no pickup after
+            # another grace window the loop tries again, up to the cap.
+            consecutive_idle = 0
+            continue
 
         # Sleep one poll interval, but wake IMMEDIATELY if cancel fires so the
         # cancel latency is not bounded below by the poll cadence (#409b).
@@ -604,10 +709,13 @@ async def run_agent_step(
     # HTTP-polling wait_until_terminal_status, which would reintroduce the
     # self-loopback the single-seam rule forbids). Accepts a post-input IDLE as a
     # completion signal alongside COMPLETED (issue #409a) and is interruptible via
-    # ``cancel_event`` (issue #409b). Raises StepExecutionError on timeout/ERROR,
-    # or StepCancelledError if cancellation fires mid-wait.
+    # ``cancel_event`` (issue #409b). ``prompt`` arms the delivery check (#562):
+    # a worker still idle and never working _PROMPT_PICKUP_GRACE after the send
+    # gets the task re-delivered before the budget burns down. Raises
+    # StepExecutionError on timeout/ERROR, or StepCancelledError if cancellation
+    # fires mid-wait.
     try:
-        await _wait_for_completion(terminal_id, timeout, cancel_event)
+        await _wait_for_completion(terminal_id, timeout, cancel_event, prompt=prompt)
     except StepCancelledError:
         # A cancellation is NOT a run-failure. Tear down a terminal this call
         # created (best-effort — never let cleanup mask the cancellation), then

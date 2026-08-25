@@ -1056,7 +1056,14 @@ def _worker_is_started_direct(terminal_id: str, provider) -> bool:
 
 
 def _message_visible_in_box(terminal_id: str, message: str) -> bool:
-    """True when the delivered message is still sitting in the input box.
+    """True when the delivered message is still visible in the rendered pane.
+
+    Despite the name, this matches against ``get_output`` — the whole rendered
+    pane, which includes the transcript above the composer, not just the input
+    box. A prompt echoed in the transcript therefore also reads as "visible",
+    which is safe for the Enter-vs-full-resend decision (both actions are
+    recovery for a worker believed idle) but must not be read as proof the
+    text sits unsubmitted in the composer.
 
     Decides the resubmit action: if our text is there the paste landed and only
     the Enter was dropped (send a bare Enter); if it is absent the paste itself
@@ -1075,6 +1082,96 @@ def _message_visible_in_box(terminal_id: str, message: str) -> bool:
     except Exception:
         return False
     return probe in re.sub(r"[^a-z0-9]", "", rendered.lower())
+
+
+def redeliver_dropped_message(
+    terminal_id: str,
+    message: str,
+    attempt: int,
+    provider=None,
+    *,
+    full_resend_requires_probe: bool = False,
+    registry: "PluginRegistry | None" = None,
+    sender_id: Optional[str] = None,
+    orchestration_type: Optional[OrchestrationType] = None,
+) -> bool:
+    """Re-deliver a message the TUI never accepted (blocking; to_thread it).
+
+    One attempt of the confirm-and-redeliver loop shared by the deferred-init
+    path (#479) and the synchronous step path (#562). First, when the provider
+    opts in via ``supports_direct_status_probe``, a live capture-pane check
+    catches a worker that IS already running but whose cached status lags
+    behind (#496) — returns True (started) without sending anything. A caller
+    that already holds the provider instance passes it; otherwise it is
+    resolved from the registry, best-effort (a resolution failure means no
+    probe, never a failed redelivery). Then the box check picks the
+    redelivery: if the delivered text is still visible in the rendered pane
+    only the Enter was swallowed (send a bare Enter); if it is absent the
+    paste itself was dropped (re-deliver in full). See
+    ``_message_visible_in_box`` for why guessing wrong must be avoided.
+
+    ``full_resend_requires_probe`` gates the full re-send on the provider
+    being probe-capable. Reason: ``_message_visible_in_box`` scans the whole
+    rendered pane, and under the pyte screen path status detection runs only
+    at rising-edge/quiescence — a whole turn can process inside one burst,
+    leaving the cached status IDLE throughout while the prompt scrolls off —
+    so for a provider without a direct status probe there is no way to
+    distinguish "paste dropped" from "worker already ran" — and re-pasting
+    the full message into a working worker silently runs the task twice.
+    When the gate is on and the provider is not probe-capable, the
+    bare-Enter branch (which cannot duplicate a task) is still taken
+    whenever the text is visible; otherwise nothing is sent and False is
+    returned, leaving the caller's own timeout to classify the outcome. The
+    deferred-init path keeps the default (off) because it loops on
+    ``wait_until_status`` for the PROCESSING edge before ever reaching here,
+    and that pre-existing behavior is unchanged by this helper's extraction.
+
+    Returns True when the worker was found already started and nothing was
+    sent; False when a redelivery was attempted (or deliberately skipped).
+    """
+    if provider is None:
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except Exception:
+            provider = None
+    probe_capable = provider is not None and getattr(
+        provider, "supports_direct_status_probe", False
+    )
+    if probe_capable:
+        if _worker_is_started_direct(terminal_id, provider):
+            return True
+    if _message_visible_in_box(terminal_id, message):
+        logger.warning(
+            "Delivery to %s unsubmitted (Enter swallowed); " "re-submitting via Enter (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        send_special_key(terminal_id, "Enter")
+        return False
+    if full_resend_requires_probe and not probe_capable:
+        # No probe → cannot rule out a working worker whose prompt left the
+        # pane; a full re-send could silently duplicate the task. Skip the
+        # re-send and let the caller's own deadline classify the outcome.
+        logger.warning(
+            "Delivery to %s not accepted and provider is not probe-capable; "
+            "skipping full re-send to avoid a duplicate task (attempt %d)",
+            terminal_id,
+            attempt,
+        )
+        return False
+    logger.warning(
+        "Delivery to %s not accepted (paste dropped); " "re-delivering message (attempt %d)",
+        terminal_id,
+        attempt,
+    )
+    send_input(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+    )
+    return False
 
 
 async def _confirm_worker_started_or_resubmit(
@@ -1100,40 +1197,21 @@ async def _confirm_worker_started_or_resubmit(
         return True
 
     for attempt in range(1, _DEFERRED_SUBMIT_MAX_RESUBMITS + 1):
-        # The cached status_monitor status is event-driven (pyte screener at
-        # rising-edge/quiescence only) and can lag behind reality. Before
-        # re-delivering, do a direct capture-pane / visible-screen check via
-        # the provider to catch cases where the worker IS processing but the
-        # cached status hasn't caught up yet (e.g. OpenCode's ``esc interrupt``
-        # footer appearing between pyte detection edges). Only providers that
-        # opt in via ``supports_direct_status_probe = True`` take this path.
-        if provider is not None and getattr(provider, "supports_direct_status_probe", False):
-            if await asyncio.to_thread(_worker_is_started_direct, terminal_id, provider):
-                return True
-
-        if await asyncio.to_thread(_message_visible_in_box, terminal_id, message):
-            logger.warning(
-                "Deferred assign to %s unsubmitted (Enter swallowed); "
-                "re-submitting via Enter (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(send_special_key, terminal_id, "Enter")
-        else:
-            logger.warning(
-                "Deferred assign to %s not accepted (paste dropped); "
-                "re-delivering message (attempt %d)",
-                terminal_id,
-                attempt,
-            )
-            await asyncio.to_thread(
-                send_input,
-                terminal_id,
-                message,
-                registry=registry,
-                sender_id=sender_id,
-                orchestration_type=orchestration_type,
-            )
+        # The redelivery decision (box check + #496's direct-probe guard for
+        # providers that opt in) lives in ``redeliver_dropped_message`` —
+        # shared with the synchronous step path (#562).
+        already_started = await asyncio.to_thread(
+            redeliver_dropped_message,
+            terminal_id,
+            message,
+            attempt,
+            provider,
+            registry=registry,
+            sender_id=sender_id,
+            orchestration_type=orchestration_type,
+        )
+        if already_started:
+            return True
         if await wait_until_status(
             terminal_id,
             _DEFERRED_STARTED_STATUSES,
