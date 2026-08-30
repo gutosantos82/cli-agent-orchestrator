@@ -431,6 +431,52 @@ def is_learning_enabled() -> bool:
         return False
 
 
+def is_workflow_approval_required() -> bool:
+    """Return True when an unapproved script-tier workflow run must be refused (issue #583 FR-8).
+
+    Default is **False**: enforcement is opt-in. A ``plan_id`` does not exist until run start, so a
+    plan that has never run cannot have been approved and its first run is refused by design. Making
+    that the default would break every existing script-tier caller one Bolt before the authoring
+    sequence that presents a plan and takes approval BEFORE running.
+
+    PRECEDENCE IS DELIBERATELY ASYMMETRIC, AND THIS IS NOT AN OVERSIGHT. Every sibling setting here
+    resolves ``CAO_* env var > settings.json > default`` — see :func:`is_memory_enabled`. This one
+    does NOT:
+
+        ``CAO_WORKFLOW_REQUIRE_APPROVAL`` may turn the gate **ON**.
+        Only ``settings.json`` can turn it **OFF**.
+
+    The reason is that this setting is a CONTROL, not a feature toggle. Under the house precedence,
+    anything able to set an environment variable could switch the approval gate off while the
+    operator's settings file still read as configured on — which would make the weakest
+    configuration mechanism in the system the one that decides whether runs are authorised. The
+    asymmetry is monotonic in the safe direction: nothing that merely influences an environment can
+    weaken the gate, while enabling it for a single test or trial stays a one-liner.
+
+    Read failure resolves to the default (disabled) with a warning, which is the ONE place this
+    mechanism is deliberately not fail-closed. Treating an unreadable settings file as "gate on"
+    would refuse every script run in the installation on the strength of a JSON typo. Resolving to
+    disabled makes the unreadable case behave like the unconfigured case, and the asymmetry above
+    bounds the residual: an operator who enabled the gate via the environment is unaffected by a
+    corrupt file.
+    """
+    env = os.environ.get("CAO_WORKFLOW_REQUIRE_APPROVAL")
+    if env is not None and env.strip().lower() in ("1", "true", "yes"):
+        # Enable-only: a falsy env value is NOT consulted, so it cannot override an enabling
+        # settings.json below. Returning early on truthy is what makes the precedence asymmetric.
+        return True
+    try:
+        workflow_settings = _load().get("workflow", {})
+        if not isinstance(workflow_settings, dict):
+            return False
+        return bool(workflow_settings.get("require_approval", False))
+    except Exception as e:
+        logger.warning(
+            "Failed to read workflow.require_approval, defaulting to False (gate disabled): %s", e
+        )
+        return False
+
+
 def is_instruction_promotion_enabled() -> bool:
     """Return True when learned-lesson promotion into profile files is enabled.
 
@@ -502,6 +548,21 @@ def get_compile_timeout_s() -> float:
         return 120.0
 
 
+# Workflow-journal retention/capture settings (issue #504, U7). Namespaced under
+# the "memory" block like ``audit_log_day_cap_bytes``; written through
+# ``set_memory_setting`` and read via ``get_memory_settings().get(<key>, <default>)``.
+# ``workflow_journal_capture_output`` is a bool gate (default False, NFR-SEC-2); the
+# other three are non-negative ints (byte cap / age / count) validated on write.
+_WORKFLOW_JOURNAL_BOOL_KEYS = frozenset({"workflow_journal_capture_output"})
+_WORKFLOW_JOURNAL_INT_KEYS = frozenset(
+    {
+        "workflow_journal_output_cap_bytes",
+        "workflow_journal_retention_days",
+        "workflow_journal_retention_count",
+    }
+)
+
+
 def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
     """Update a single memory setting.
 
@@ -512,6 +573,14 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         ``learning_enabled`` (bool) — workflow self-learning (outcome capture).
         ``instruction_promotion_enabled`` (bool) — learned-lesson promotion
         into agent profile files (requires learning_enabled).
+        ``workflow_journal_capture_output`` (bool) — opt-in workflow output capture
+            (issue #504, U7; default False, NFR-SEC-2).
+        ``workflow_journal_output_cap_bytes`` (int > 0) — per-output byte cap when
+            capture is enabled (U7; default 8192, NFR-SEC-4).
+        ``workflow_journal_retention_days`` (int ≥ 0) — run-age retention bound
+            (U7; default 30, NFR-SEC-3).
+        ``workflow_journal_retention_count`` (int ≥ 0) — most-recent run-count
+            retention bound (U7; default 100, NFR-SEC-3).
     """
     settings = _load()
     memory = settings.get("memory", {})
@@ -541,6 +610,18 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if not (0.0 < fval <= 1.0):
             raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
         memory[key] = fval
+    elif key in _WORKFLOW_JOURNAL_BOOL_KEYS:
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a bool, got {type(value).__name__}")
+        memory[key] = value
+    elif key in _WORKFLOW_JOURNAL_INT_KEYS:
+        # bool is an int subclass — reject it so True/False can't masquerade as 1/0.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{key} must be an int, got {type(value).__name__}")
+        min_value = 1 if key == "workflow_journal_output_cap_bytes" else 0
+        if value < min_value:
+            raise ValueError(f"{key} must be >= {min_value}, got {value}")
+        memory[key] = value
     else:
         raise ValueError(f"Unknown memory setting: {key}")
 
