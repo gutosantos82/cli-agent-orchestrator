@@ -424,15 +424,29 @@ for i in "${!PRS[@]}"; do
   # The supervisor runs in dashboard mode: checks out the PR in an isolated worktree,
   # fans out to the five reviewers, writes the report, then goes idle.
   msg="Review PR #$pr. MODE: dashboard, write report to ${DATA_DIR}/reviews/${pr}-${sha}.md"
+  # Capture the launch output instead of discarding it. Swallowing stderr here cost
+  # real debugging time: on 2026-08-28..31, 8 of 12 runs failed every launch and the
+  # log said only "(launch for #N failed — check 'tmux ls')" — by which time the
+  # session was already gone, so `tmux ls` showed nothing. The actual cause
+  # ("Kiro CLI initialization timed out waiting for the agent prompt") was only
+  # visible in `journalctl -u cao-server`, which the log never points at. Echo the
+  # reason inline so the driver log alone explains the failure.
+  launch_log="$(mktemp "/tmp/cao-prr-launch-${pr}.XXXXXX")"
   if cao launch --agents pr_review_supervisor --provider kiro_cli --yolo --headless \
-       $LEARNING_ENV --session-name "prr-${pr}" >/dev/null 2>&1; then
+       $LEARNING_ENV --session-name "prr-${pr}" >"$launch_log" 2>&1; then
+    rm -f "$launch_log"
     sleep 12   # let the supervisor finish booting before sending the task
     LAUNCH_SHA[$pr]="$sha"
     deliver_task "cao-prr-${pr}" "$msg" \
       || echo "    (delivery for #$pr failed — check 'tmux ls')"
     launched=$((launched+1))
   else
-    echo "    (launch for #$pr failed — check 'tmux ls')"
+    echo "    (launch for #$pr FAILED — reason below)"
+    # Keep it short: the useful line is the error/detail, not the yolo banner.
+    grep -iE "error|timed out|timeout|failed|refused|not found|traceback" "$launch_log" 2>/dev/null \
+      | head -5 | sed 's/^/      | /' \
+      || sed 's/^/      | /' "$launch_log" | tail -5
+    echo "      (full output: $launch_log — also: journalctl -u cao-server --since '-10min')"
     launch_failures=$((launch_failures+1))
   fi
   sleep 4   # small stagger between PRs
@@ -444,9 +458,17 @@ done
 # when none succeeded.
 if [[ "$launch_failures" -gt 0 ]]; then
   echo "WARNING: $launch_failures launch(es) FAILED this run." >&2
+  # Point at what actually diagnoses it. The old advice ("check tmux ls") is useless
+  # after the fact — a failed launch leaves no session to inspect — and
+  # "cao --version" only catches the editable-install class of breakage. The
+  # commonest cause is a provider startup timeout, which lives in the server log.
+  echo "  Per-launch reasons are inline above. If they say 'initialization timed out'," >&2
+  echo "  the provider did not reach its prompt within server.provider_init_timeout" >&2
+  echo "  (settings.json). Confirm with: journalctl -u cao-server --since '-15min' \\" >&2
+  echo "    | grep -i 'timed out waiting for the agent prompt'" >&2
 fi
 if [[ "$launched" -eq 0 ]] && [[ "$launch_failures" -gt 0 ]]; then
-  echo "FATAL: every launch failed — no reviews ran. Check 'cao --version' and 'tmux ls'." >&2
+  echo "FATAL: every launch failed — no reviews ran." >&2
   exit 1
 fi
 
