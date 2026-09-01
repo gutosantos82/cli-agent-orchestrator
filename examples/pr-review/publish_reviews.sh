@@ -138,11 +138,25 @@ for pr in "${args[@]}"; do
   fi
 
   strip_fm "$f" | strip_human_notes | scrub_operator > "/tmp/rev_${pr}.md"
+  # Branch on gh's EXIT STATUS, never on captured output.
+  #
+  # This used to be `posted=$(gh ... && echo ok || echo fail)`, which conflates
+  # the command's stdout with the sentinel. `gh pr comment` prints the new
+  # comment's URL to stdout, so $posted became "<url>\nok" and the `== ok` test
+  # FAILED on a SUCCESSFUL post: the script reported "FAILED to post", skipped
+  # the state.json update, and invited a retry that posted a SECOND copy. That
+  # produced a duplicate comment on #521 (deleted manually) and again on #547.
+  # `gh pr review` happens to write its URL to stderr, so the review path looked
+  # fine and hid the bug — which is exactly why this must not depend on which
+  # stream a given gh subcommand chooses.
+  #
+  # Keep gh's own output visible (it goes to our stdout/stderr as usual) and let
+  # `if` read the exit status directly.
   if [[ "$action" == comment ]]; then
-    posted=$(gh pr comment "$pr" --repo "$REPO" --body-file "/tmp/rev_${pr}.md" && echo ok || echo fail)
+    gh pr comment "$pr" --repo "$REPO" --body-file "/tmp/rev_${pr}.md"
   else
-    posted=$(gh pr review "$pr" --repo "$REPO" "--$action" --body-file "/tmp/rev_${pr}.md" && echo ok || echo fail)
-  fi
+    gh pr review "$pr" --repo "$REPO" "--$action" --body-file "/tmp/rev_${pr}.md"
+  fi && posted=ok || posted=fail
   if [[ "$posted" == ok ]]; then
     echo "#$pr -> POSTED ($act) at ${head:0:7}"
     jq --arg p "$pr" --arg a "$act" --arg s "$head" --arg t "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
