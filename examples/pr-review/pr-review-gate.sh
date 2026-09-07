@@ -49,6 +49,45 @@ mkdir -p "$DATA_DIR/reviews"
 emit() { printf '{"execute": false, "output": {}}\n'; exit 0; }
 
 log() { echo "[pr-review-gate $(date -u +%H:%M:%S)] $*" >&2; }
+# Same message, but into the driver log — the file an operator actually reads.
+# Diagnostics that only reach stderr land in journalctl, which nothing points at.
+logboth() { log "$*"; echo "[pr-review-gate $(date -u +%H:%M:%S)] $*" >> "$DRIVER_LOG"; }
+
+# --- Working-tree sanity: the pipeline reads its code from the LIVE tree ------
+# Every prompt, script, and profile the review team uses is read from this
+# checkout at run time, so anything that changes the checkout changes what the
+# pipeline runs. Two observed incidents, neither of which announced itself:
+#
+#   1. Switching to a branch without examples/pr-review/ made flow_service fail
+#      every minute for ~26h with "Flow file not found" — visible only in
+#      journalctl, which nothing tells you to read.
+#   2. A review agent ran `git checkout <sha>` in the MAIN tree instead of an
+#      isolated worktree, leaving detached HEAD. The tooling vanished and the
+#      scheduled runs did nothing.
+#
+# Case 2 has a nastier variant this guard is really for: a detached HEAD whose
+# commit DOES contain examples/pr-review/. Then the pipeline runs happily
+# against the wrong revision of the supervisor prompts and driver — silently
+# producing reviews from stale logic. Loud beats subtly-wrong, so warn on any
+# unexpected revision rather than only on a missing file.
+#
+# Advisory only: never blocks a run. A genuine operator branch switch is
+# legitimate, and refusing to review would be a worse failure than a noisy log.
+EXPECTED_BRANCH="${CAO_PRR_EXPECTED_BRANCH:-feat/pr-review-team}"
+current_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+if [ "$current_branch" = "HEAD" ]; then
+  logboth "WARNING: repo is in DETACHED HEAD at $(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null)."
+  logboth "  The review team runs the code in this tree, so reviews may come from the wrong"
+  logboth "  revision. Usually an agent ran 'git checkout <sha>' here instead of in a worktree."
+  logboth "  Restore with: git -C $REPO_ROOT checkout $EXPECTED_BRANCH"
+elif [ "$current_branch" != "$EXPECTED_BRANCH" ]; then
+  logboth "WARNING: on branch '$current_branch', expected '$EXPECTED_BRANCH' —"
+  logboth "  reviews will use THIS branch's prompts/driver. Set CAO_PRR_EXPECTED_BRANCH if intended."
+fi
+for required in "$SCRIPT_DIR/run_reviews.sh" "$SCRIPT_DIR/pr-review-run.sh" \
+                "$SCRIPT_DIR/pr_review_supervisor.md"; do
+  [ -f "$required" ] || logboth "WARNING: missing $required — the driver will fail or run degraded."
+done
 
 # --- Reclaim a stale lock (previous driver crashed without releasing) --------
 if [ -d "$LOCKDIR" ]; then
