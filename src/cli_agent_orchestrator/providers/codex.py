@@ -79,7 +79,19 @@ TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left|·\s+[~/])
 # Appears inline with --no-alt-screen when the agent is actively processing.
 # Must be checked before COMPLETED to avoid false positives (the • matches
 # ASSISTANT_PREFIX_PATTERN and the TUI footer › matches idle prompt).
-TUI_PROGRESS_PATTERN = r"•[^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
+#
+# codex-cli 0.153.4 (live acceptance capture, 2026-09-08) alternates the
+# leading glyph between the solid bullet "•" (U+2022) and the hollow bullet
+# "◦" (U+25E6) as the spinner animates -- a frame landing on "◦Applying both
+# edits(52s • esc to interrupt)" previously failed to match (the pattern only
+# accepted "•"), and with --no-alt-screen the composer hint ("» Ask Codex to
+# do anything") plus the model/path footer can be rendered on that SAME line
+# as the spinner (e.g. "•Applying both edits(43s • esc to interrupt)»Ask
+# Codex to do anything gpt-6-astra ultra · ~/path"), with no space required
+# between the bullet and the following text either way. [^\n]* already
+# tolerates zero-or-more characters before the "(", so the only gap was the
+# glyph itself.
+TUI_PROGRESS_PATTERN = r"[•◦][^\n]*\((?:(?:\d+h\s+)?\d+m\s+)?\d+s\s*•\s*esc to interrupt\)"
 
 # Workspace trust/approval prompt shown when Codex opens a new directory.
 # Two known variants:
@@ -858,6 +870,36 @@ class CodexProvider(BaseProvider):
         if profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]
         else:
+            if profile and profile.codexProfile:
+                # The operator asked for containment and is not getting it. Naming a
+                # codexProfile is the ONLY way to keep Codex's sandbox and approval
+                # policy in effect under CAO, and allowed_tools containing "*"
+                # discards it. Silently dropping an explicit safety setting is worse
+                # than not offering one, so say so at the point it happens (#707).
+                logger.warning(
+                    "Terminal %s: profile '%s' sets codexProfile=%r, but allowed_tools "
+                    "contains '*', which forces --yolo and discards it. This worker "
+                    "runs with Codex approvals AND sandbox bypassed. Remove '*' from "
+                    "allowed_tools to keep codexProfile in effect.",
+                    self.terminal_id,
+                    self._agent_profile,
+                    profile.codexProfile,
+                )
+            else:
+                # --yolo is --dangerously-bypass-approvals-and-sandbox, so NOTHING in
+                # ~/.codex/config.toml's [sandbox_*] tables applies to this worker --
+                # including network_access. Operators have relied on that setting as a
+                # containment control (#707); it is inert here. Logged on every default
+                # codex launch because that is exactly when the expectation is set.
+                logger.info(
+                    "Terminal %s: launching codex with --yolo "
+                    "(--dangerously-bypass-approvals-and-sandbox). Codex sandbox "
+                    "settings in ~/.codex/config.toml, including "
+                    "[sandbox_workspace_write].network_access, do NOT apply. Set "
+                    "codexProfile on the agent profile to launch under a named "
+                    "[profiles.<name>] block instead.",
+                    self.terminal_id,
+                )
             command_parts = ["codex", "--yolo"]
         command_parts.extend(["--no-alt-screen", "--disable", "shell_snapshot"])
 
@@ -1407,6 +1449,43 @@ class CodexProvider(BaseProvider):
         if not rows:
             return TerminalStatus.UNKNOWN
         return self.get_status("\n".join(rows))
+
+    def extract_current_composer(self, rendered_pane: str) -> Optional[str]:
+        """Return Codex's bottom composer without admitting transcript prompts."""
+        lines = rendered_pane.splitlines()
+        footer_index = next(
+            (
+                index
+                for index in range(
+                    len(lines) - 1, max(len(lines) - IDLE_PROMPT_TAIL_LINES - 1, -1), -1
+                )
+                if re.search(TUI_FOOTER_PATTERN, lines[index])
+            ),
+            None,
+        )
+        if footer_index is None:
+            return None
+
+        composer_index = next(
+            (
+                index
+                for index in range(footer_index - 1, -1, -1)
+                if re.match(rf"^\s*{IDLE_PROMPT_PATTERN}", lines[index])
+            ),
+            None,
+        )
+        if composer_index is None:
+            return None
+
+        composer_lines = lines[composer_index:footer_index]
+        if not composer_lines:
+            return ""
+        first_composer_line = composer_lines[0]
+        if re.match(IDLE_PROMPT_STRICT_PATTERN, first_composer_line) or re.match(
+            STARTUP_IDLE_PLACEHOLDER_PATTERN, first_composer_line
+        ):
+            return ""
+        return "\n".join(composer_lines).rstrip()
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Codex's final response from terminal output.

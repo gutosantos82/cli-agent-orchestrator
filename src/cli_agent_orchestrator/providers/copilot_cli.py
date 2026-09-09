@@ -173,7 +173,9 @@ class CopilotCliProvider(BaseProvider):
 
         # Apply tool restrictions via --deny-tool flags.
         # --deny-tool takes precedence over --allow-all.
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        # A present-but-empty list is deny-all (same as Grok). A falsy check
+        # used to skip --deny-tool entirely for allowed_tools=[].
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 
             disallowed = get_disallowed_tools("copilot_cli", self._allowed_tools)
@@ -287,7 +289,15 @@ class CopilotCliProvider(BaseProvider):
         likewise blocking. All three are offloaded via ``asyncio.to_thread``
         so building and sending the launch command can't block the shared
         event loop under concurrent session creation. ``status_monitor.
-        get_status`` stays inline -- it is in-memory only, no blocking I/O.
+        get_status`` is offloaded too: it is NOT in-memory only -- for a
+        terminal stuck in PROCESSING it can fork a real tmux capture-pane
+        subprocess (status_monitor.py's stale-PROCESSING fallback), and this
+        provider's own get_status falls back to ``self._history()`` (another
+        capture-pane) when the buffer has no visible text. Copilot init is
+        exactly the regime that trips the fallback -- cached status PROCESSING
+        while the CLI boots, pane quiet during auth/MCP startup -- and this
+        loop polls every second for up to 60s, multiplied by concurrent
+        session creations.
         """
         from cli_agent_orchestrator.services.status_monitor import status_monitor
 
@@ -315,7 +325,7 @@ class CopilotCliProvider(BaseProvider):
         deadline = time.time() + 60.0
         await self._accept_trust_prompts(timeout=10.0)
         while time.time() < deadline:
-            status = status_monitor.get_status(self.terminal_id)
+            status = await asyncio.to_thread(status_monitor.get_status, self.terminal_id)
             if status == TerminalStatus.WAITING_USER_ANSWER:
                 await self._accept_trust_prompts(timeout=5.0)
                 await asyncio.sleep(1.0)

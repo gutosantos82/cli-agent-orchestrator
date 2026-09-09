@@ -4,10 +4,68 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- Profiles tab in the Web UI: browse, search, create (from template with live
+  preview, or from scratch via a schema-driven form), edit, clone, and delete
+  agent profiles over the profile management APIs, with validate-before-save
+  surfacing bounded findings and the truncation-marker contract (#510)
+
+### Fixed
+
+- **enabling `CAO_MEMORY_API_URL` rejected memory keys that work without it.**
+  The `/internal/memory/store` and `/forget` routes validated the wire `key` as
+  the strict `MemoryKey` (`^[a-z0-9-]{1,60}$`), while the MCP tools have always
+  let `MemoryService._sanitize_key` normalise it — so `memory_store(key="Prefer
+  Pytest")` stored `preferpytest` in-process and 422'd through the gateway.
+
+- **an unreadable `settings.json` reported itself as "self-learning is
+  disabled".** `settings_service._load()` gated on `Path.exists()`, which returns
+  False on a `PermissionError` from the parent directory — silently, with no log
+  line — and swallowed every other read error, so a filesystem fault resolved to
+  a configuration message. Learning still fails closed, but `/outcomes` now
+  answers 503 when the file cannot be read, `GET /settings/memory` reports
+  `settings_readable`, and the tools surface it as a plain `error` rather than a
+  `disabled` payload that `skills/cao-learning` instructs agents to skip silently.
+
+- **`report_outcome` and `list_outcomes` opened SQLite in the agent's own
+  process**, so they failed for any agent that does not share a filesystem with
+  cao-server — and unlike the memory tools they have no `CAO_MEMORY_API_URL` path,
+  so configuration could not work around it. Both now call the existing
+  `POST`/`GET /outcomes` routes.
+
+- **the MCP server's terminal lookup did not carry the internal bearer token.**
+  `GET /terminals/{id}` is scope-gated, so with auth enabled it 401'd, the
+  terminal context resolved to `None`, and memory scope silently collapsed to
+  global. A transport or auth failure now propagates instead of being reported as
+  a missing terminal identity.
+
+- **built-in memory plugins created the server's database directory inside every
+  agent process.** They are discovered through `cao.plugins` entry points and that
+  discovery runs at MCP-server import, so their module-level `clients.database`
+  import executed its import-time `DB_DIR.mkdir()` in agents — and failed outright
+  wherever the data dir is unreadable. The import is now lazy.
+
+### Changed
+
+- `list_outcomes` clamps `limit` to 200 client-side; the service already clamped
+  silently, so `limit=500` keeps working rather than becoming a 422.
+
+
 ## [2.5.0] - 2026-08-28
 
 ### Added
 
+- MiniMax Code (`mcode`) provider with per-terminal authentication and profile
+  isolation, model and MCP configuration, multi-turn TUI orchestration,
+  supervisor/worker E2E coverage, and provider documentation (#624)
+- Oh My Pi (`omp`) provider with additive native configuration, profile MCP extension wiring, lifecycle detection, and supervisor/worker orchestration support (#559)
+- Add the official xAI Grok Build CLI as the `grok_cli` provider, including
+  isolated per-terminal MCP configuration, native hard tool restrictions,
+  multi-turn TUI support, orchestration e2e coverage, and provider docs.
 - async run submit, discovery, and live event following (#505) (#525)
 
 - rewrite the cao tui front door in Rust (#547)
@@ -46,6 +104,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - frozen execution manifest, plan approval, and frozen run memory (#583 Bolt 2) (#650)
 
+- Add `cao agent assign|handoff|send-message|status|result|cancel` CLI
+  commands as a fallback for in-session MCP orchestration when a terminal's
+  `cao-mcp-server` connection is unavailable. Same behavior as the
+  `assign`/`handoff`/`send_message`/`delete_terminal` MCP tools, backed by a
+  shared `utils/orchestration` implementation module so neither entry point
+  can drift from the other (#616)
+
 
 ### Changed
 
@@ -60,6 +125,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+
+- `list_sessions` no longer issues one terminal query per tmux session, and both terminal reads now state their oldest-first order instead of inheriting it. The per-session `list_terminals_by_session` call inside ownership enrichment cost a query per session on a path that `GET /sessions` and the fleet snapshot both poll; it is now a single read bounded to the live sessions, so the cost scales with the sessions being listed rather than with the whole terminals table (rows for sessions tmux no longer reports accumulate, because `cleanup_service.cleanup_old_data` only runs at server startup). The ordering half matters because **a session's first terminal is normally its conductor** (index 0 is its oldest surviving row; if the conductor's own terminal is deleted, the oldest remaining worker takes that slot) and five consumers depend on it: `list_sessions` reports the earliest terminal carrying an `agent_profile` or `working_directory` as the session's owner (#497), `cao session status` and `cao session list` label it the Conductor over HTTP, flow recycling decides whether to kill a session by whether it is busy, and the fleet-panel example sends messages to it. That order was previously implicit in SQLite's row layout, so adding an index — the obvious reaction to a slow per-session lookup — could have silently changed which terminal a session advertised as its owner, and ordering by the terminal `id` (a `uuid4` prefix) would have made it a random one outright. Both reads now order by insertion, which is creation order. Swallowed-exception logs on this path also keep their tracebacks, so a database or pane failure is diagnosable from the log instead of only by reproducing it (#629)
 
 - kiro_cli no longer passes `--legacy-ui`, which silently disabled every MCP tool. The flag is mutually exclusive with the `--agent-engine=v2` CAO pins (kiro-cli exits with `Conflicting options: --legacy-ui cannot be used with --agent-engine=v2`), and on its own it implicitly selects the **v1 agent engine, which exposes no MCP tools to the model**. Since CAO's whole orchestration surface (`assign`, `handoff`, `report_outcome`, `list_outcomes`, `store_lesson`) is delivered over MCP, affected agents started cleanly — the MCP server still booted and logged `✓ cao-mcp-server loaded` — and then reported "no such tool" for everything CAO gave them. Observed as a silent 7-day self-learning outage before the flag combination began erroring outright. The startup consent dialog `--legacy-ui` used to suppress is auto-answered after launch instead (#557), so nothing is lost by dropping it. Also removes the `--legacy-ui` retry on startup timeout: a "successful" retry would land on the MCP-less engine, turning a loud timeout into an agent that looks healthy and cannot orchestrate, so initialization now raises. `--legacy-ui` is correspondingly no longer a probed wrapper capability, which additionally unblocks wrappers that do not advertise it
 - tmux listing parse failures are retried once and reported as a distinct condition instead of surfacing as a bare `ValueError` that reads like "session not found" one layer up. libtmux 0.53.1+ zips `parse_output`'s fields with `strict=True`, so any short row (a pane or session vanishing mid-listing, or trailing fields tmux omits) raised `ValueError: zip() argument 2 is shorter than argument 1` — which propagated through `server.sessions`/`window.panes`, blocked launches outright, and left the pipe-liveness watchdog unable to tell a genuinely-gone session from a transient parse failure. Adds `TmuxLookupError` and routes the listing reads in `clients/tmux.py` through a single retry-and-classify wrapper; a failed `create_session` no longer leaves an orphaned tmux session that blocks relaunching the same name. Also caps `libtmux<0.53.1`, the last release that zips non-strict (caom-anv)
