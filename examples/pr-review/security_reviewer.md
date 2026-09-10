@@ -66,6 +66,19 @@ Consult the `cao-pr-review` skill's checklist; apply only its **security** secti
    Code scanning covers only the default branch, so the ABSENCE of an alert on
    new code is not evidence it is safe — review new code on its own merits.
    If there is no such block, the PR touches no flagged file; proceed normally.
+2b. **Check for an `OPEN DEPENDABOT ALERTS` block too.** Dependabot keys on the
+   *manifest*, not a source line, so this block means the PR edits a lockfile or
+   manifest that has an open vulnerable-dependency advisory. For each:
+   - if the PR bumps the package **to or past** the patched version, say so — that
+     is the advisory being resolved, and it is worth stating even when the PR body
+     does not mention it;
+   - if the PR edits that manifest and **leaves the advisory open** while a fix
+     exists, name it — a lockfile change that skips an available fix is a real
+     finding, not a nit;
+   - if `no fix yet`, record it as **unfixable for now** rather than outstanding,
+     so nobody re-litigates it every review.
+   Do not treat a bot-authored bump as automatically safe: check that the version
+   in the diff actually satisfies the advisory.
 3. Review the diff for security issues. Anchor each finding to `file:line`.
 4. Call `send_message(receiver_id=<supervisor id>, message=...)` with your findings.
 

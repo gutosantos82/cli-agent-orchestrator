@@ -109,34 +109,77 @@ ME="$(gh api user --jq .login 2>/dev/null || echo "")"
 # surface totals + severity breakdown + the worst offenders, with a link to the
 # Security tab. Best-effort: needs the security_events scope; on failure we write an
 # empty summary so the dashboard degrades gracefully.
+#
+# Dependabot alerts land under a SEPARATE top-level "dependabot" key rather than being
+# merged into the code-scanning fields: the two feeds key on different things (a source
+# file:line vs a manifest + package), have their own severity vocabulary, and the
+# dashboard banner already reads total_open/by_severity/top_alerts as code-scanning.
+# Merging them would silently change what that banner means.
 write_security_summary() {
   local out="$DATA_DIR/security.json"
   local url="https://github.com/${REPO}/security/code-scanning"
-  local alerts
+  local dep_url="https://github.com/${REPO}/security/dependabot"
+  local alerts dep dep_json
   if ! alerts="$(gh api "repos/${REPO}/code-scanning/alerts?state=open&per_page=100" 2>/dev/null)"; then
-    jq -n --arg url "$url" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '{generated_at:$t, url:$url, available:false, total_open:0, by_severity:{}, top_alerts:[]}' > "$out"
-    echo "  ⚠ code-scanning alerts unavailable (need security_events scope?) — wrote empty security.json"
-    return
+    alerts=""
   fi
-  jq --arg url "$url" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-    def sev: (.rule.security_severity_level // .rule.severity // "unknown");
-    {
-      generated_at: $t,
-      url: $url,
-      available: true,
-      total_open: length,
-      by_severity: (group_by(sev) | map({key: (.[0]|sev), value: length}) | from_entries),
-      top_alerts: ( sort_by(
-                      ({critical:0,high:1,medium:2,low:3,warning:4,note:5,unknown:6}[(.|sev)] // 9)
-                    )
-                    | .[:8]
-                    | map({number, severity: (.|sev), rule: .rule.id,
-                           path: .most_recent_instance.location.path,
-                           line: .most_recent_instance.location.start_line,
-                           url: .html_url}) )
-    }' <<<"$alerts" > "$out"
-  echo "  🔒 security summary: $(jq -r '.total_open' "$out") open code-scanning alert(s) → security.json"
+
+  # Dependabot: independent availability. Needs its own scope, so one feed being
+  # unreachable must not blank the other.
+  if dep="$(gh api "repos/${REPO}/dependabot/alerts?state=open&per_page=100" 2>/dev/null)"; then
+    dep_json="$(jq --arg url "$dep_url" '
+      def dsev: (.security_advisory.severity // "unknown");
+      {
+        url: $url,
+        available: true,
+        total_open: length,
+        by_severity: (group_by(dsev) | map({key: (.[0]|dsev), value: length}) | from_entries),
+        top_alerts: ( sort_by(({critical:0,high:1,moderate:2,medium:2,low:3,unknown:9}[(.|dsev)] // 9))
+                      | .[:8]
+                      | map({number,
+                             severity: (.|dsev),
+                             ecosystem: .dependency.package.ecosystem,
+                             package: .dependency.package.name,
+                             manifest: .dependency.manifest_path,
+                             ghsa: .security_advisory.ghsa_id,
+                             patched: (.security_vulnerability.first_patched_version.identifier // null),
+                             url: .html_url}) )
+      }' <<<"$dep" 2>/dev/null)"
+  fi
+  [[ -n "${dep_json:-}" ]] || dep_json="$(jq -n --arg url "$dep_url" \
+    '{url:$url, available:false, total_open:0, by_severity:{}, top_alerts:[]}')"
+
+  if [[ -z "$alerts" ]]; then
+    jq -n --arg url "$url" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson dep "$dep_json" \
+      '{generated_at:$t, url:$url, available:false, total_open:0, by_severity:{}, top_alerts:[],
+        dependabot:$dep}' > "$out"
+    echo "  ⚠ code-scanning alerts unavailable (need security_events scope?) — wrote empty security.json"
+  else
+    jq --arg url "$url" --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson dep "$dep_json" '
+      def sev: (.rule.security_severity_level // .rule.severity // "unknown");
+      {
+        generated_at: $t,
+        url: $url,
+        available: true,
+        total_open: length,
+        by_severity: (group_by(sev) | map({key: (.[0]|sev), value: length}) | from_entries),
+        top_alerts: ( sort_by(
+                        ({critical:0,high:1,medium:2,low:3,warning:4,note:5,unknown:6}[(.|sev)] // 9)
+                      )
+                      | .[:8]
+                      | map({number, severity: (.|sev), rule: .rule.id,
+                             path: .most_recent_instance.location.path,
+                             line: .most_recent_instance.location.start_line,
+                             url: .html_url}) ),
+        dependabot: $dep
+      }' <<<"$alerts" > "$out"
+    echo "  🔒 security summary: $(jq -r '.total_open' "$out") open code-scanning alert(s) → security.json"
+  fi
+  if [[ "$(jq -r '.dependabot.available' "$out")" == "true" ]]; then
+    echo "  📦 dependabot: $(jq -r '.dependabot.total_open' "$out") open alert(s)"
+  else
+    echo "  ⚠ dependabot alerts unavailable (need security_events / dependabot scope?)"
+  fi
 }
 
 # Build the code-scanning fragment for ONE PR's review task, printed to stdout.
@@ -179,9 +222,32 @@ security_fragment_for_pr() {
             + "\(.rule.id) at \($p):\(.most_recent_instance.location.start_line) — \(.html_url)"
         ] | .[]' 2>/dev/null)" || return 0
 
-  [[ -n "$hits" ]] || return 0
-  printf '\n\nOPEN CODE-SCANNING ALERTS on files this PR changes (from GitHub, default-branch scan):\n%s\n' "$hits"
-  printf 'For each: confirm whether this PR fixes it, worsens it, or leaves it — and say which in the security section. Code scanning covers only the default branch, so the ABSENCE of an alert on new code is not evidence it is safe.\n'
+  # Dependabot keys on the MANIFEST, not a source line — so the match is "this PR
+  # touches a manifest that has an open vulnerable-dependency alert". That is the
+  # case worth flagging: a lockfile edit either bumps past the advisory or does not,
+  # and a reviewer cannot tell from the diff alone which advisories are outstanding.
+  local dep_hits
+  dep_hits="$(gh api "repos/${REPO}/dependabot/alerts?state=open&per_page=100" 2>/dev/null \
+    | jq -r --argjson paths "$(printf '%s\n' "$changed" | jq -R . | jq -s .)" '
+        [ .[]
+          | (.dependency.manifest_path) as $m
+          | select($paths | index($m))
+          | "  - alert #\(.number) [\(.security_advisory.severity)] "
+            + "\(.dependency.package.ecosystem)/\(.dependency.package.name) "
+            + "in \($m) — patched in \(.security_vulnerability.first_patched_version.identifier // "no fix yet") "
+            + "(\(.security_advisory.ghsa_id)) \(.html_url)"
+        ] | .[]' 2>/dev/null)" || true
+
+  [[ -n "$hits" || -n "${dep_hits:-}" ]] || return 0
+
+  if [[ -n "$hits" ]]; then
+    printf '\n\nOPEN CODE-SCANNING ALERTS on files this PR changes (from GitHub, default-branch scan):\n%s\n' "$hits"
+    printf 'For each: confirm whether this PR fixes it, worsens it, or leaves it — and say which in the security section. Code scanning covers only the default branch, so the ABSENCE of an alert on new code is not evidence it is safe.\n'
+  fi
+  if [[ -n "${dep_hits:-}" ]]; then
+    printf '\n\nOPEN DEPENDABOT ALERTS on manifests this PR changes:\n%s\n' "$dep_hits"
+    printf 'For each: does this PR bump the package to or past the patched version? If it edits the manifest but leaves the advisory open, say so — a lockfile change that skips an available fix is worth naming. If there is no fix yet, note it as unfixable rather than outstanding.\n'
+  fi
 }
 
 # Reap finished review sessions: a session cao-prr-<n> whose report file for the SHA it
