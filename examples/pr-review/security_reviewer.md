@@ -53,8 +53,21 @@ Consult the `cao-pr-review` skill's checklist; apply only its **security** secti
 ## Workflow
 
 1. Parse the task message: PR number/title, the DIFF, the worktree path, and the supervisor's terminal id.
-2. Review the diff for security issues. Anchor each finding to `file:line`.
-3. Call `send_message(receiver_id=<supervisor id>, message=...)` with your findings.
+2. **Check for an `OPEN CODE-SCANNING ALERTS` block in the task message.** When
+   present, it lists GitHub's own open code-scanning alerts on files this PR
+   changes — findings a diff-only read will not surface. For each one, decide
+   from the diff which of three happened and say so explicitly in your findings:
+   - the PR **fixes** it (the flagged line/pattern is gone or corrected) — call
+     that out as a positive; a silent fix should still be noted;
+   - the PR **worsens or re-introduces** it (edits the flagged code and leaves
+     the pattern, or spreads it) — that is a blocking-tier finding;
+   - the PR **leaves it untouched** (changed the file but not the flagged line) —
+     note it as pre-existing so it is not mistaken for something this PR added.
+   Code scanning covers only the default branch, so the ABSENCE of an alert on
+   new code is not evidence it is safe — review new code on its own merits.
+   If there is no such block, the PR touches no flagged file; proceed normally.
+3. Review the diff for security issues. Anchor each finding to `file:line`.
+4. Call `send_message(receiver_id=<supervisor id>, message=...)` with your findings.
 
 ## Findings format (send this back)
 

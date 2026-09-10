@@ -118,7 +118,10 @@ assign(agent_profile="correctness_reviewer",
 
 Repeat for `security_reviewer`, `tests_reviewer`, `conventions_reviewer`, and
 `consistency_reviewer` — same diff, same worktree path, same callback id, each with its own
-angle. (The `consistency_reviewer` covers doc/comment↔code drift, PR-description↔impl
+angle. **If your task message contains an `OPEN CODE-SCANNING ALERTS` block, copy it verbatim
+into the `security_reviewer`'s message** (only that reviewer needs it): it lists GitHub's open
+code-scanning alerts on files this PR changes, which a diff-only read cannot surface, and the
+security reviewer is instructed to confirm whether the PR fixes, worsens, or leaves each one. (The `consistency_reviewer` covers doc/comment↔code drift, PR-description↔impl
 mismatch, cross-provider inconsistency, dead code, out-of-scope changes, and committed
 generated files — this is the highest-volume category of real feedback on the CAO repo.)
 

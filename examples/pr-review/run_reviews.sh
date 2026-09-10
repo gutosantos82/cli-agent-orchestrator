@@ -139,6 +139,51 @@ write_security_summary() {
   echo "  🔒 security summary: $(jq -r '.total_open' "$out") open code-scanning alert(s) → security.json"
 }
 
+# Build the code-scanning fragment for ONE PR's review task, printed to stdout.
+#
+# Code scanning on this repo analyzes only the default branch, so there is no
+# per-PR alert set to fetch (a ?ref=refs/pull/<n>/head query returns nothing —
+# verified). The useful, answerable question is instead: does this PR touch a
+# file that ALREADY has an open alert? That catches both directions — a PR
+# editing known-vulnerable code, and a PR that silently fixes an alert without
+# saying so — and it is a plain path intersection against security.json, which
+# write_security_summary already produced.
+#
+# Emits nothing when the summary is unavailable or the PR touches no flagged
+# file, so a clean PR's task message is unchanged. The scope caveat travels WITH
+# the alerts (not as standing prose the model may ignore): default-branch-only,
+# so no alert on a touched line is NOT evidence that new code is safe.
+security_fragment_for_pr() {
+  local pr="$1"
+  local secjson="$DATA_DIR/security.json"
+  [[ -f "$secjson" ]] || return 0
+  [[ "$(jq -r '.available' "$secjson" 2>/dev/null)" == "true" ]] || return 0
+
+  # Changed-file paths for this PR. Best-effort: on failure, emit nothing rather
+  # than blocking the review.
+  local changed
+  changed="$(gh pr view "$pr" --repo "$REPO" --json files \
+             --jq '.files[].path' 2>/dev/null)" || return 0
+  [[ -n "$changed" ]] || return 0
+
+  # Re-query the full open-alert set (security.json keeps only the top 8; a PR
+  # can touch a file whose alert ranked lower). Path-match, then format.
+  local hits
+  hits="$(gh api "repos/${REPO}/code-scanning/alerts?state=open&per_page=100" 2>/dev/null \
+    | jq -r --argjson paths "$(printf '%s\n' "$changed" | jq -R . | jq -s .)" '
+        [ .[]
+          | . as $a
+          | (.most_recent_instance.location.path) as $p
+          | select($paths | index($p))
+          | "  - alert #\(.number) [\(.rule.security_severity_level // .rule.severity)] "
+            + "\(.rule.id) at \($p):\(.most_recent_instance.location.start_line) — \(.html_url)"
+        ] | .[]' 2>/dev/null)" || return 0
+
+  [[ -n "$hits" ]] || return 0
+  printf '\n\nOPEN CODE-SCANNING ALERTS on files this PR changes (from GitHub, default-branch scan):\n%s\n' "$hits"
+  printf 'For each: confirm whether this PR fixes it, worsens it, or leaves it — and say which in the security section. Code scanning covers only the default branch, so the ABSENCE of an alert on new code is not evidence it is safe.\n'
+}
+
 # Reap finished review sessions: a session cao-prr-<n> whose report file for the SHA it
 # was launched on now exists has done its job — shut it down so it frees a parallelism slot.
 # (Without this, idle-but-completed sessions hold slots and stall the queue.)
@@ -424,6 +469,9 @@ for i in "${!PRS[@]}"; do
   # The supervisor runs in dashboard mode: checks out the PR in an isolated worktree,
   # fans out to the five reviewers, writes the report, then goes idle.
   msg="Review PR #$pr. MODE: dashboard, write report to ${DATA_DIR}/reviews/${pr}-${sha}.md"
+  # Append any open code-scanning alerts on files this PR touches (empty for a
+  # clean PR, so the message is unchanged when there is nothing to flag).
+  msg+="$(security_fragment_for_pr "$pr")"
   # Capture the launch output instead of discarding it. Swallowing stderr here cost
   # real debugging time: on 2026-08-28..31, 8 of 12 runs failed every launch and the
   # log said only "(launch for #N failed — check 'tmux ls')" — by which time the
