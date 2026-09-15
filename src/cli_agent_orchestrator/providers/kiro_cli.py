@@ -426,7 +426,19 @@ class KiroCliProvider(BaseProvider):
         pane = strip_terminal_escapes(
             re.sub(ANSI_CODE_PATTERN, "", backend.get_history(self.session_name, self.window_name))
         )
-        bottom = "\n".join(pane.splitlines()[-STARTUP_PROMPT_BOTTOM_LINES:])
+        # Drop trailing blank lines before slicing the window. kiro-cli 2.21
+        # renders the consent dialog well above the pane bottom and pads the
+        # rest of the screen with blanks (~18 on a 50-row pane), so a raw
+        # bottom-N slice sees only whitespace and this check fails closed —
+        # the dialog is never answered and startup times out. The generic
+        # footer classifier in get_status() scans 20 lines and still latches
+        # WAITING_USER_ANSWER, so CAO detects the dialog and then cannot
+        # confirm it. Anchoring to the last non-blank line makes the window
+        # independent of how much padding a given kiro build emits.
+        pane_lines = pane.splitlines()
+        while pane_lines and not pane_lines[-1].strip():
+            pane_lines.pop()
+        bottom = "\n".join(pane_lines[-STARTUP_PROMPT_BOTTOM_LINES:])
         if not (
             re.search(TUI_TRUST_ALL_TOOLS_BODY, bottom)
             and re.search(TUI_TRUST_ALL_TOOLS_CURSOR, bottom)
@@ -555,7 +567,17 @@ class KiroCliProvider(BaseProvider):
         # the dialog has no idle prompt but should classify WAITING_USER_ANSWER.
         # Anchored to bottom 20 lines to avoid false positives when the warning text
         # appears in scrollback with an idle prompt below (same class as issue #405).
+        # Trailing blank lines are dropped first: kiro-cli 2.21 pads the screen
+        # below the dialog, and with enough padding a raw bottom-20 slice misses
+        # the footer entirely — the dialog would then never classify as
+        # WAITING_USER_ANSWER and the accept path in _wait_ready_accepting_trust_dialog
+        # would never run. Anchoring to the last non-blank line keeps this
+        # independent of the padding a given kiro build emits. Widening upward is
+        # safe for the issue #405 case because a stale footer in scrollback is
+        # followed by an idle prompt, which has_idle_after still rejects.
         lines = clean_output.split("\n")
+        while lines and not lines[-1].strip():
+            lines.pop()
         bottom_region = "\n".join(lines[-20:]) if len(lines) > 20 else clean_output
         footer_match = re.search(TUI_TRUST_ALL_TOOLS_FOOTER, bottom_region)
         if footer_match:
