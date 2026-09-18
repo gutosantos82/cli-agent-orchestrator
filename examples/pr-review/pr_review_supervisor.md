@@ -304,7 +304,24 @@ severity unless they break a user-facing contract.
 > **Dashboard mode stops here.** Write the report to the file path given in the task
 > message (e.g. `pr-review-data/reviews/<n>-<sha>.md` — use the PR's head SHA). Prepend a
 > YAML frontmatter block carrying the triage fields the dashboard renders, then the report
-> markdown below it:
+> markdown below it.
+>
+> **The frontmatter is mandatory and machine-read. Two rules, both non-negotiable:**
+>
+> 1. The **first byte of the file** must be the opening `---` of the frontmatter block.
+>    Do not start with a `#` heading, a preamble, or a blank line. `pr_report.py` and
+>    `publish_reviews.sh` parse only this block; a report whose verdict appears as a
+>    markdown heading (`## Verdict: ...`) instead of the `verdict:` field is INVISIBLE to
+>    them — the review is written, is good, and is silently never published.
+> 2. `verdict:` must be **exactly one of** `Approve`, `Approve with nits`,
+>    `Request changes` — copied verbatim, quoted. No other value is understood. Do not
+>    invent one (`DEFER`, `Hold`, `Needs discussion`, `Blocked` have all been produced and
+>    all failed). If your judgement is "do not approve, defer to a maintainer", the verdict
+>    is `Request changes` and the nuance goes in `needs_human_reason` and `summary`.
+>
+> Before you end your turn, re-read the first 3 lines and the `verdict:` line of the file
+> you just wrote and confirm both rules hold. This is the single most common failure in
+> this workflow.
 >
 > ```
 > ---

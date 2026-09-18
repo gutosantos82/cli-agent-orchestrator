@@ -260,6 +260,16 @@ declare -A PANE_FP       # pr  -> last content fingerprint of the supervisor pan
 WATCHDOG_SECS=420        # must be idle+reportless this long before we nudge
 MAX_NUDGES=2             # give up (leave for manual/next run) after this many nudges
 
+# Live REVIEW sessions only. The retrospector runs as cao-prr-retro and so matches
+# the same prefix, but it is not a review and must never occupy a parallel slot: it
+# is dispatched after the last review and is frequently not reaped, so a leftover
+# one from a previous run counts toward MAX_PARALLEL forever. At --max-parallel 1
+# that deadlocks the launch loop outright (1 >= 1, nothing ever launches) and the
+# run reports "no report" for every PR as though the reviews had failed.
+review_sessions() {
+  tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-' | grep -vx 'cao-prr-retro' || true
+}
+
 reap_finished() {
   for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-'); do
     local pr="${s#cao-prr-}"
@@ -523,7 +533,7 @@ for i in "${!PRS[@]}"; do
   fi
 
   # throttle: reap finished sessions + nudge any stalled ones, then wait while full
-  while reap_finished; watchdog_nudge; [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -ge "$MAX_PARALLEL" ]]; do
+  while reap_finished; watchdog_nudge; [[ "$(review_sessions | grep -c .)" -ge "$MAX_PARALLEL" ]]; do
     sleep 15
   done
 
@@ -591,7 +601,7 @@ echo "Launched $launched review session(s). Waiting for in-flight reviews to fin
 for _ in $(seq 1 80); do
   reap_finished
   watchdog_nudge
-  [[ "$(tmux ls -F '#{session_name}' 2>/dev/null | grep -c '^cao-prr-')" -eq 0 ]] && break
+  [[ "$(review_sessions | grep -c .)" -eq 0 ]] && break
   sleep 30
 done
 # Settle pass. The wait loop above can expire in the seconds between a supervisor
@@ -619,13 +629,37 @@ if [[ "$(missing_reports)" -gt 0 ]]; then
   reap_finished
 fi
 
-remaining="$(tmux ls -F '#{session_name}' 2>/dev/null | grep '^cao-prr-' || true)"
+remaining="$(review_sessions)"
 if [[ -n "$remaining" ]]; then
   echo "Still running (no report yet) — may be stalled; inspect with: tmux attach -t <name>"
   echo "$remaining" | sed 's/^/  /'
 else
   echo "All reviews complete. Open the dashboard to triage."
 fi
+
+# Validate this batch's frontmatter. A report whose verdict is prose instead of the
+# `verdict:` field, or which invents a verdict value, is INVISIBLE to pr_report.py and
+# publish_reviews.sh: the review exists, is good, and is silently never published. That
+# has happened twice (#493, #600 — both wrote "## Verdict: DEFER"). The supervisor
+# prompt forbids it, but prompt adherence is not a guarantee, so fail loudly here
+# rather than discovering it days later while triaging. Advisory only — never exits
+# non-zero, because a malformed report is still a written review worth keeping.
+for pr in "${!LAUNCH_SHA[@]}"; do
+  rf="$DATA_DIR/reviews/${pr}-${LAUNCH_SHA[$pr]}.md"
+  [[ -f "$rf" ]] || continue
+  if [[ "$(head -1 "$rf")" != "---" ]]; then
+    echo "  ⚠ #$pr report has NO frontmatter block (first line is not '---')"
+    echo "     → invisible to pr_report.py / publish_reviews.sh; fix the header by hand: $rf"
+  elif ! v="$(awk '/^---[[:space:]]*$/{n++;next} n==1' "$rf" | grep -m1 '^verdict:')"; then
+    echo "  ⚠ #$pr report frontmatter has no 'verdict:' field — $rf"
+  else
+    v="$(printf '%s' "$v" | sed 's/^verdict:[[:space:]]*//; s/^"//; s/"$//')"
+    case "$v" in
+      Approve|"Approve with nits"|"Request changes") ;;
+      *) echo "  ⚠ #$pr unrecognized verdict '$v' (expected Approve|Approve with nits|Request changes) — $rf" ;;
+    esac
+  fi
+done
 
 # --- self-learning: distill this batch's outcomes into lessons -------------------
 # Each supervisor reports one outcome per PR (Step 7 of its profile). Retrospection
