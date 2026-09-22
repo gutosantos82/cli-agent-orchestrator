@@ -513,6 +513,36 @@ echo "Will review ${#PRS[@]} PRs (limit $LIMIT, up to $MAX_PARALLEL at a time):"
 printf '  #%s\n' "${PRS[@]%% *}"
 write_security_summary
 
+# Pre-flight: an expired Midway certificate makes EVERY launch fail, and it fails in the
+# most misleading way available. kiro-cli cannot reach its model, never prints its prompt,
+# and the provider reports "Kiro CLI initialization timed out waiting for the agent prompt"
+# after burning the full provider_init_timeout (150s) per PR — so a run takes ~11 minutes to
+# report a problem that is knowable in one second, and the message points at the provider
+# rather than at the credential. That misdirection cost a week here: three coincident
+# kiro-cli nightly updates were blamed first, and the "self-clearing" failure streaks were
+# actually just someone running mwinit.
+#
+# The cert lasts ~20h and the cron fires every 4h, so this recurs daily by construction.
+# Advisory only, and a hard no-op off Amazon hardware (no ~/.ssh/id_rsa-cert.pub and/or no
+# mwinit on PATH): this must never block a run for anyone whose provider doesn't need it.
+if command -v mwinit >/dev/null 2>&1 && [[ -f "$HOME/.ssh/id_rsa-cert.pub" ]]; then
+  cert_until="$(ssh-keygen -L -f "$HOME/.ssh/id_rsa-cert.pub" 2>/dev/null \
+                | grep -oE 'to [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+' | head -1 | cut -d' ' -f2)"
+  if ! mwinit --list >/dev/null 2>&1; then
+    echo "  ⛔ Midway certificate is EXPIRED or missing${cert_until:+ (valid until $cert_until)}."
+    echo "     Every kiro_cli launch below will fail with a misleading"
+    echo "     'initialization timed out' after ${CAO_PRR_INIT_TIMEOUT_HINT:-150}s each."
+    echo "     Fix first:  mwinit    then re-run this script."
+  elif [[ -n "$cert_until" ]]; then
+    # Warn when the cert will lapse before a 4-hourly cadence comes round again.
+    cert_epoch="$(date -d "$cert_until" +%s 2>/dev/null || echo 0)"
+    now_epoch="$(date +%s)"
+    if [[ "$cert_epoch" -gt 0 && $((cert_epoch - now_epoch)) -lt 14400 ]]; then
+      echo "  ⚠ Midway cert expires $cert_until (<4h) — the next scheduled run will likely fail."
+    fi
+  fi
+fi
+
 launched=0
 launch_failures=0
 for i in "${!PRS[@]}"; do
