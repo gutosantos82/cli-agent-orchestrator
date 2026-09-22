@@ -678,8 +678,16 @@ for pr in "${!LAUNCH_SHA[@]}"; do
   rf="$DATA_DIR/reviews/${pr}-${LAUNCH_SHA[$pr]}.md"
   [[ -f "$rf" ]] || continue
   if [[ "$(head -1 "$rf")" != "---" ]]; then
-    echo "  ⚠ #$pr report has NO frontmatter block (first line is not '---')"
-    echo "     → invisible to pr_report.py / publish_reviews.sh; fix the header by hand: $rf"
+    # Warning alone was not enough: the tightened prompt produced 3/3 well-formed
+    # reports one night and 0/4 the next, so adherence cannot be relied on. Repair
+    # instead — the body already states the verdict in prose, and the repairer only
+    # ever PREPENDS a block (never edits an existing one, never rewrites the body)
+    # and refuses when the verdict is unreadable. Every repaired report carries
+    # needs_human: true so the approve guard holds it for a human read.
+    echo "  ⚠ #$pr report has NO frontmatter block — attempting repair"
+    if python3 "$SCRIPT_DIR/repair_frontmatter.py" "$rf" 2>&1 | sed 's/^/    /'; then :; else
+      echo "     → still unpublishable; fix the header by hand: $rf"
+    fi
   elif ! v="$(awk '/^---[[:space:]]*$/{n++;next} n==1' "$rf" | grep -m1 '^verdict:')"; then
     echo "  ⚠ #$pr report frontmatter has no 'verdict:' field — $rf"
   else
