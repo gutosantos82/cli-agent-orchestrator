@@ -173,7 +173,14 @@ if [[ "$DRY_RUN" -eq 0 && "$acted_any" -eq 1 ]]; then
   me="$(gh api user --jq .login 2>/dev/null)"
   echo "--- verify (latest review state by $me) ---"
   for pr in "${args[@]}"; do
-    gh api "repos/$REPO/pulls/$pr/reviews" \
+    # per_page/--paginate are REQUIRED, not tidiness: the reviews endpoint defaults
+    # to 30 per page, and a PR with a chatty bot reviewer blows past that easily
+    # (#802 had 60, almost all copilot-pull-request-reviewer). Without paging, a
+    # review that posted FINE reports as empty, which reads as "nothing posted" and
+    # invites a re-post. That happened: #802 was published three times, and the two
+    # manual re-posts bypassed strip_human_notes/scrub_operator and leaked the
+    # dashboard-only operator notes onto a public PR.
+    gh api "repos/$REPO/pulls/$pr/reviews?per_page=100" --paginate \
       --jq '[.[]|select(.user.login=="'"$me"'")]|last|"#'"$pr"' -> \(.state)"' 2>/dev/null || true
   done
 fi
