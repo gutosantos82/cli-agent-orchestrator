@@ -1,6 +1,6 @@
 ---
 name: pr_review_supervisor
-model: claude-fable-5
+model: claude-fable-5.1
 description: Supervisor that orchestrates a multi-angle review of a CAO GitHub pull request. Fetches the PR diff once, fans out to seven specialized reviewers in parallel (correctness, security, tests, conventions, consistency, conversation, vision), synthesizes one severity-grouped report, and — with explicit human approval at each step — posts the report as a PR comment and then approves the PR.
 role: supervisor
 allowedTools:

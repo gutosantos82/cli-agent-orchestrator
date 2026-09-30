@@ -257,8 +257,9 @@ declare -A LAUNCH_SHA    # pr  -> sha it was launched to review
 declare -A IDLE_SINCE    # pr  -> epoch when we first saw it idle w/o a report (0 = not idle)
 declare -A NUDGES        # pr  -> how many watchdog nudges sent so far
 declare -A PANE_FP       # pr  -> last content fingerprint of the supervisor pane
+declare -A ABANDONED     # pr  -> 1 once we have killed its session for making no progress
 WATCHDOG_SECS=420        # must be idle+reportless this long before we nudge
-MAX_NUDGES=2             # give up (leave for manual/next run) after this many nudges
+MAX_NUDGES=2             # give up (kill the session, leave the PR for the next run) after this many
 
 # Live REVIEW sessions only. The retrospector runs as cao-prr-retro and so matches
 # the same prefix, but it is not a review and must never occupy a parallel slot: it
@@ -324,7 +325,29 @@ watchdog_nudge() {
     if [[ "$since" -eq 0 ]]; then IDLE_SINCE[$pr]="$now"; continue; fi
     (( now - since < WATCHDOG_SECS )) && continue                    # idle, but not long enough yet
     local n="${NUDGES[$pr]:-0}"
-    [[ "$n" -ge "$MAX_NUDGES" ]] && continue
+    # Out of nudges: ABANDON the session, don't just stop nudging it.
+    #
+    # `continue` here used to leave a permanently-idle session alive. reap_finished only
+    # reclaims sessions that produced a report, so such a session holds its parallel slot
+    # forever and the launch throttle can never fall below MAX_PARALLEL — the whole run
+    # wedges after MAX_PARALLEL PRs and every remaining PR is silently never launched.
+    # Observed 2026-09-29 23:00: `--model claude-fable-5` had been retired upstream, so
+    # all three supervisors answered every prompt with "The model 'claude-fable-5' is not
+    # available" and never moved. The driver sat in the throttle for 2h26m, wrote zero
+    # reports, and never launched PRs 4..20 of a 20-PR queue. Same slot-leak class as the
+    # cao-prr-retro deadlock, but for a review session, so review_sessions() can't filter it.
+    #
+    # Killing it converts an unrecoverable review into ONE failed PR: the slot frees, the
+    # queue drains, and the PR is reported as "no report" for the next run to retry.
+    if [[ "$n" -ge "$MAX_NUDGES" ]]; then
+      if [[ "${ABANDONED[$pr]:-0}" -eq 0 ]]; then
+        ABANDONED[$pr]=1
+        echo "  ✗ #$pr abandoned after $MAX_NUDGES nudges with no report — killing $s to free the slot"
+        echo "     inspect the last pane output above/in the report dir; the PR will be retried next run"
+        cao shutdown --session "$s" >/dev/null 2>&1 || tmux kill-session -t "$s" 2>/dev/null || true
+      fi
+      continue
+    fi
     NUDGES[$pr]=$((n+1)); IDLE_SINCE[$pr]="$now"                      # reset timer after nudging
     echo "  ⏰ watchdog: #$pr idle ${WATCHDOG_SECS}s w/o report — nudge $((n+1))/$MAX_NUDGES"
     deliver_task "$s" \
@@ -540,6 +563,47 @@ if command -v mwinit >/dev/null 2>&1 && [[ -f "$HOME/.ssh/id_rsa-cert.pub" ]]; t
     if [[ "$cert_epoch" -gt 0 && $((cert_epoch - now_epoch)) -lt 14400 ]]; then
       echo "  ⚠ Midway cert expires $cert_until (<4h) — the next scheduled run will likely fail."
     fi
+  fi
+fi
+
+# Pre-flight: every model named in an agent profile must still exist upstream.
+#
+# Retired model IDs fail in the second-most-misleading way available (after the Midway
+# cert). The launch SUCCEEDS — trust dialog handled, CAO memory injected, task delivered —
+# and then every single turn answers "The model 'X' is not available. Please use '/model'
+# to select a different model", leaving the supervisor parked at an idle prompt. To the
+# watchdog that is indistinguishable from the race-stall it was written for, so it nudges
+# (twice, 7 min apart) and each nudge hits the same wall.
+#
+# On 2026-09-29 23:00 `claude-fable-5` had been retired in favour of `claude-fable-5.1`.
+# Three supervisors came up on it, none could execute a turn, and with the slot-leak bug
+# above the run wedged for 2h26m and produced nothing for a 20-PR queue. One second of
+# `--list-models` would have named it. Models get retired on someone else's schedule, so
+# this will recur; check it rather than trusting the profiles to stay current.
+#
+# Advisory, not fatal: --list-models needs a working provider+cert, and a transient
+# failure there must not block a run that would otherwise be fine. Empty list == skip.
+# Match only real model rows. Every one carries a "<N.NN>x credits" column; requiring it
+# drops the "Available models (* = default):" header, which otherwise parses as a model
+# named "Available" and pollutes the list printed back to the operator.
+prr_models="$(timeout 60 kiro-cli chat --list-models -f plain 2>/dev/null \
+              | grep -E '[0-9]+\.[0-9]+x[[:space:]]+credits' \
+              | sed 's/^[* ]*//' | awk 'NF{print $1}' || true)"
+if [[ -n "$prr_models" ]]; then
+  bad_models=""
+  for prof in "$SCRIPT_DIR"/*.md; do
+    m="$(awk -F': ' '/^model:/{gsub(/[ "]/,"",$2); print $2; exit}' "$prof" 2>/dev/null)"
+    [[ -n "$m" ]] || continue
+    grep -qxF "$m" <<<"$prr_models" || bad_models+="    $(basename "$prof"): $m"$'\n'
+  done
+  if [[ -n "$bad_models" ]]; then
+    echo "  ⛔ RETIRED MODEL(S) in agent profiles — these sessions will launch but never"
+    echo "     complete a turn ('model is not available'), and each burns 2 watchdog nudges:"
+    printf '%s' "$bad_models"
+    echo "     Available now:"
+    sed 's/^/       /' <<<"$prr_models" | head -8
+    echo "     Fix the 'model:' line in each profile, re-run 'cao install <profile>', then re-run this."
+    echo "     Continuing anyway — abort with Ctrl-C if you would rather fix it first."
   fi
 fi
 
