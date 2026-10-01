@@ -546,23 +546,41 @@ write_security_summary
 # actually just someone running mwinit.
 #
 # The cert lasts ~20h and the cron fires every 4h, so this recurs daily by construction.
-# Advisory only, and a hard no-op off Amazon hardware (no ~/.ssh/id_rsa-cert.pub and/or no
-# mwinit on PATH): this must never block a run for anyone whose provider doesn't need it.
-if command -v mwinit >/dev/null 2>&1 && [[ -f "$HOME/.ssh/id_rsa-cert.pub" ]]; then
-  cert_until="$(ssh-keygen -L -f "$HOME/.ssh/id_rsa-cert.pub" 2>/dev/null \
-                | grep -oE 'to [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+' | head -1 | cut -d' ' -f2)"
-  if ! mwinit --list >/dev/null 2>&1; then
+# Advisory only, and a hard no-op off Amazon hardware (no midway cert and/or no mwinit on
+# PATH): this must never block a run for anyone whose provider doesn't need it.
+#
+# Pick the LATEST-expiring midway cert rather than a hardcoded filename. mwinit writes a
+# cert whose name follows the host's key type, and a host can carry more than one: on
+# 2026-10-01 this box had BOTH id_rsa-cert.pub (from an 04:09 mwinit, expiring 00:09) and
+# id_ecdsa-cert.pub (from a 22:51 mwinit, expiring 18:51 the next day). Reading only
+# id_rsa-cert.pub reported "expires in 27 minutes" while the credential the agents were
+# actually using had 19 hours left — a false alarm that would train the operator to ignore
+# this warning, which is the one warning that must stay trustworthy. `mwinit --list` is not
+# a fix: it printed only the stale id_rsa path. The live credential is whichever is newest,
+# so compare expiries and keep the max. Key ID "midway" filters out unrelated SSH certs.
+cert_until=""; cert_epoch=0
+if command -v mwinit >/dev/null 2>&1; then
+  for cf in "$HOME"/.ssh/*-cert.pub; do
+    [[ -f "$cf" ]] || continue
+    cinfo="$(ssh-keygen -L -f "$cf" 2>/dev/null)" || continue
+    grep -q 'Key ID: "midway"' <<<"$cinfo" || continue
+    cu="$(grep -oE 'to [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+' <<<"$cinfo" | head -1 | cut -d' ' -f2)"
+    [[ -n "$cu" ]] || continue
+    ce="$(date -d "$cu" +%s 2>/dev/null || echo 0)"
+    if [[ "$ce" -gt "$cert_epoch" ]]; then cert_epoch="$ce"; cert_until="$cu"; fi
+  done
+fi
+if command -v mwinit >/dev/null 2>&1 && [[ -n "$cert_until" ]]; then
+  now_epoch="$(date +%s)"
+  # Trust the cert's own window over `mwinit --list`, which can name a superseded file.
+  if [[ "$cert_epoch" -le "$now_epoch" ]] || ! mwinit --list >/dev/null 2>&1; then
     echo "  ⛔ Midway certificate is EXPIRED or missing${cert_until:+ (valid until $cert_until)}."
     echo "     Every kiro_cli launch below will fail with a misleading"
     echo "     'initialization timed out' after ${CAO_PRR_INIT_TIMEOUT_HINT:-150}s each."
     echo "     Fix first:  mwinit    then re-run this script."
-  elif [[ -n "$cert_until" ]]; then
+  elif (( cert_epoch - now_epoch < 14400 )); then
     # Warn when the cert will lapse before a 4-hourly cadence comes round again.
-    cert_epoch="$(date -d "$cert_until" +%s 2>/dev/null || echo 0)"
-    now_epoch="$(date +%s)"
-    if [[ "$cert_epoch" -gt 0 && $((cert_epoch - now_epoch)) -lt 14400 ]]; then
-      echo "  ⚠ Midway cert expires $cert_until (<4h) — the next scheduled run will likely fail."
-    fi
+    echo "  ⚠ Midway cert expires $cert_until (<4h) — the next scheduled run will likely fail."
   fi
 fi
 
