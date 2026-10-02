@@ -572,9 +572,16 @@ if command -v mwinit >/dev/null 2>&1; then
 fi
 if command -v mwinit >/dev/null 2>&1 && [[ -n "$cert_until" ]]; then
   now_epoch="$(date +%s)"
-  # Trust the cert's own window over `mwinit --list`, which can name a superseded file.
-  if [[ "$cert_epoch" -le "$now_epoch" ]] || ! mwinit --list >/dev/null 2>&1; then
-    echo "  ⛔ Midway certificate is EXPIRED or missing${cert_until:+ (valid until $cert_until)}."
+  # The live cert's own validity window is the ONLY expiry signal. `mwinit --list` must
+  # not get a vote: it tracks one specific file and exits 12 ("Public RSA certificate
+  # expired or not found") when THAT file lapses, even while a newer cert of a different
+  # key type is valid. Observed 2026-10-02 05:06 — id_rsa lapsed at 00:09, id_ecdsa was
+  # good until 18:51, `mwinit --list` exited 12, and the preflight printed the
+  # self-contradicting "⛔ EXPIRED ... (valid until 2026-10-02T18:51:37)" while both
+  # review sessions ran happily with 13h42m of Midway left. f434f403 fixed which file we
+  # read but left this clause able to override it, so the false alarm came straight back.
+  if [[ "$cert_epoch" -le "$now_epoch" ]]; then
+    echo "  ⛔ Midway certificate is EXPIRED${cert_until:+ (newest cert expired $cert_until)}."
     echo "     Every kiro_cli launch below will fail with a misleading"
     echo "     'initialization timed out' after ${CAO_PRR_INIT_TIMEOUT_HINT:-150}s each."
     echo "     Fix first:  mwinit    then re-run this script."
