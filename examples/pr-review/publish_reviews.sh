@@ -76,6 +76,24 @@ strip_human_notes(){ awk '
 # into the body instead of the (stripped) Notes section. High-precision tokens
 # only — these never legitimately belong in a code review comment.
 scrub_operator(){ grep -viE 'needs_human|--ack|publish[ _-]?guard|publish_reviews\.sh|dashboard will hold|for the ack|re-review before posting|a human should (skim|decide|look|read|review)'; }
+# Remove in-body pointers to the sections strip_human_notes just dropped. Without this
+# the posted comment says "(see Prior feedback)" or "— see Roadmap / vision fit" and the
+# reader goes looking for a section that isn't there (hit #834, #603, #863). Survey of
+# 500+ reports: the pointer is almost always a parenthetical or a trailing "— see X"
+# clause, so those are deleted outright; any leftover bare mention is reworded to
+# something that still reads correctly. "Roadmap" is matched case-sensitively so prose
+# about the project's actual roadmap is left alone.
+drop_section_refs(){ perl -pe '
+  my $S = qr/(?:Prior feedback|Roadmap \/ vision fit|Roadmap|Notes for the human publisher)(?: section| below| above)?/;
+  my $s = qr/(?:[Pp]rior feedback|Roadmap \/ vision fit|Roadmap|[Nn]otes for the human publisher)(?: section| below| above)?/;
+  s/\s*\((?:[Ss]ee|per) (?:the )?$s\)//g;                 # "(see Prior feedback)"
+  s/\s*[;,]\s*(?:[Ss]ee|per) (?:the )?$s(?=\))//g;          # "(foo; see Prior feedback)"
+  s/\((?:[Ss]ee|per) (?:the )?$s[;,]\s*/(/g;                # "(see Prior feedback; foo)"
+  s/\s*[\x{2014}\x{2013}-]+\s*(?:[Ss]ee|per) (?:the )?$s//g; # "... — see Prior feedback"
+  s/\b[Ss]ee (?:the )?[Pp]rior feedback(?: section| below| above)?/see our earlier review/g;
+  s/\bin (?:the )?[Pp]rior feedback(?: section| below| above)?/in our earlier review/g;
+  s/\(?(?:[Ss]ee|per) (?:the )?(?:Roadmap \/ vision fit|Roadmap section)\)?//g;
+' -CSD; }
 verdict_of(){ awk -F': ' '/^verdict:/{gsub(/"/,"",$2); print $2; exit}' "$1"; }
 
 acted_any=0
@@ -137,7 +155,7 @@ for pr in "${args[@]}"; do
     continue
   fi
 
-  strip_fm "$f" | strip_human_notes | scrub_operator > "/tmp/rev_${pr}.md"
+  strip_fm "$f" | strip_human_notes | drop_section_refs | scrub_operator > "/tmp/rev_${pr}.md"
   # Branch on gh's EXIT STATUS, never on captured output.
   #
   # This used to be `posted=$(gh ... && echo ok || echo fail)`, which conflates
