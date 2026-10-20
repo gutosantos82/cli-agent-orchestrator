@@ -10080,6 +10080,52 @@ async def list_outcomes_endpoint(
     return {"outcomes": outcomes, "count": len(outcomes)}
 
 
+@app.get("/fleet/status")
+async def fleet_status_endpoint(
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict:
+    """Read-only fleet summary for the web UI (chapter 4 cluster lab).
+
+    Mirrors ``cao fleet status``: reaches the worker broker through
+    ``FleetClient`` (``CAO_ELASTIC_BROKER_URL`` / ``CAO_ELASTIC_BROKER_TOKEN`` —
+    one port-forward away on EKS) and returns the broker url, the live and
+    cleanup-pending worker counts, and a lease-state histogram. This is the only
+    fleet route cao-server exposes: ``fleet shutdown`` is destructive and stays a
+    CLI/explicit action, so there is no write path here.
+
+    ``FleetClient`` raises ``click.ClickException`` both when no broker is
+    configured (``from_env``) and when the broker is unreachable or errors; both
+    surface here as 503 carrying the broker's own message, so the UI can show
+    "fleet not reachable" rather than a generic 500. The blocking ``requests``
+    calls run off the event loop via ``asyncio.to_thread``.
+    """
+    import asyncio
+    from collections import Counter
+
+    import click
+
+    from cli_agent_orchestrator.utils.fleet import FleetClient
+
+    def _collect() -> tuple[str, list]:
+        client = FleetClient.from_env()
+        return client.url, client.workers()
+
+    try:
+        broker_url, workers = await asyncio.to_thread(_collect)
+    except click.ClickException as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=e.format_message()
+        )
+
+    counts = Counter(w.get("state", "unknown") for w in workers)
+    return {
+        "broker": broker_url,
+        "live": sum(1 for w in workers if w.get("workload_present") is True),
+        "cleanup_pending": sum(1 for w in workers if w.get("cleanup_pending") is True),
+        "states": dict(counts),
+    }
+
+
 # Static file serving for built web UI.
 # Anchored to the package via importlib.resources so it works for both
 # editable installs (uv sync) and wheel installs (uv tool install, pip install).

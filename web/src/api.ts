@@ -673,6 +673,14 @@ export interface WorkflowRunAck {
   links?: Record<string, string>
 }
 
+/** Read-only fleet summary from `GET /fleet/status` (chapter 4 cluster lab). */
+export interface FleetStatus {
+  broker: string
+  live: number
+  cleanup_pending: number
+  states: Record<string, number>
+}
+
 /** Result of `POST /agents/profiles/install` (server InstallResult). */
 export interface InstallResult {
   success: boolean
@@ -1064,6 +1072,10 @@ export const api = {
       body: JSON.stringify(provider ? { source, provider } : { source }),
       timeoutMs: 30000,
     }),
+
+  // Read-only fleet summary (chapter 4). 503 when no broker is configured or it
+  // is unreachable — the caller renders that as "fleet not reachable".
+  getFleetStatus: () => fetchJSON<FleetStatus>('/fleet/status'),
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null

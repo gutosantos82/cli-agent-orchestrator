@@ -65,6 +65,21 @@ describe('Workshop run-control + install API methods', () => {
     expect(mockFetch.mock.calls[1][0]).toBe('/agents/profiles/install')
   })
 
+  it('getFleetStatus reads /fleet/status', async () => {
+    mockResponse({ broker: 'http://127.0.0.1:9890', live: 2, cleanup_pending: 0, states: { leased: 2 } })
+    const s = await api.getFleetStatus()
+    expect(s.live).toBe(2)
+    expect(mockFetch).toHaveBeenCalledWith('/fleet/status', expect.any(Object))
+  })
+
+  it('surfaces 503 when the fleet broker is not reachable', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 503, statusText: 'Service Unavailable',
+      json: () => Promise.resolve({ detail: 'No fleet configured. Set CAO_ELASTIC_BROKER_URL ...' }),
+    })
+    await expect(api.getFleetStatus()).rejects.toMatchObject({ status: 503 })
+  })
+
   it('surfaces ApiError detail on a bad-inputs 400 from submit', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false, status: 400, statusText: 'Bad Request',
