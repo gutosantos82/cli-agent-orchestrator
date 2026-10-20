@@ -74,6 +74,12 @@ interface Store {
   // poll cannot produce an unhandled rejection.
   fetchWorkflowRuns: () => Promise<string | null>
   selectWorkflowRun: (runId: string | null) => Promise<void>
+  // Workshop run controls (button-driven workshop). Each surfaces a snackbar,
+  // refreshes the run list, and (re)selects the affected run so the detail pane
+  // follows it live. startWorkflowRun resolves to the new run id (null on error).
+  startWorkflowRun: (nameOrPath: string, inputs: Record<string, unknown>, runId?: string) => Promise<string | null>
+  cancelWorkflowRun: (runId: string) => Promise<void>
+  resumeWorkflowRun: (runId: string) => Promise<void>
   setWorkflowEvents: (events: WorkflowEvent[], gaps: GapMarker[]) => void
   appendWorkflowEvent: (event: WorkflowEvent) => void
   addWorkflowGap: (gap: GapMarker) => void
@@ -255,6 +261,45 @@ export const useStore = create<Store>((set, get) => ({
       if (get().selectedRunId !== runId) return
       set({ selectedRun: null })
       get().showSnackbar({ type: 'error', message: e?.message || 'Failed to load run' })
+    }
+  },
+
+  startWorkflowRun: async (nameOrPath, inputs, runId) => {
+    try {
+      const ack = await api.submitWorkflowRun({
+        name_or_path: nameOrPath,
+        inputs,
+        run_id: runId || undefined,
+      })
+      get().showSnackbar({ type: 'success', message: `Started run ${ack.run_id}` })
+      await get().fetchWorkflowRuns()
+      await get().selectWorkflowRun(ack.run_id)
+      return ack.run_id
+    } catch (e: any) {
+      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to start workflow run' })
+      return null
+    }
+  },
+
+  cancelWorkflowRun: async (runId) => {
+    try {
+      await api.cancelWorkflowRun(runId)
+      get().showSnackbar({ type: 'success', message: `Cancelling ${runId}` })
+      await get().fetchWorkflowRuns()
+      if (get().selectedRunId === runId) await get().selectWorkflowRun(runId)
+    } catch (e: any) {
+      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to cancel run' })
+    }
+  },
+
+  resumeWorkflowRun: async (runId) => {
+    try {
+      await api.resumeWorkflowRun(runId)
+      get().showSnackbar({ type: 'success', message: `Resuming ${runId}` })
+      await get().fetchWorkflowRuns()
+      if (get().selectedRunId === runId) await get().selectWorkflowRun(runId)
+    } catch (e: any) {
+      get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to resume run' })
     }
   },
 

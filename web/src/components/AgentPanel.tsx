@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useStore } from '../store'
 import { api, AgentProfileInfo, ProviderInfo } from '../api'
 import { Bot, Play, Trash2, ChevronRight, Terminal as TermIcon, Monitor, Package, FolderOpen, Tag, Search, Mail, Plus, LogOut, Send, FileText, X } from 'lucide-react'
+import { PromptPresets } from './PromptPresets'
 import { TerminalView } from './TerminalView'
 import { ConfirmModal } from './ConfirmModal'
 import { InboxPanel } from './InboxPanel'
@@ -451,6 +452,10 @@ export function AgentPanel() {
                       placeholder="Type a message..."
                       className="flex-1 bg-gray-900 border border-gray-700 text-gray-200 text-sm font-mono rounded-lg px-3 py-1.5 focus:border-emerald-500 focus:outline-none"
                       autoFocus
+                    />
+                    <PromptPresets
+                      current={sendInputValues[t.id] || ''}
+                      onInsert={text => setSendInputValues(prev => ({ ...prev, [t.id]: text }))}
                     />
                     <button
                       onClick={() => handleSendInput(t.id)}

@@ -6,7 +6,7 @@
 // stream while the run is non-terminal.
 
 import { useEffect, useState } from 'react'
-import { Loader2, Radio } from 'lucide-react'
+import { Loader2, Radio, Ban, RotateCcw } from 'lucide-react'
 import type { RunInspection, RunSummaryRow } from '../../api'
 import { useStore } from '../../store'
 import { useEventFollow } from './useEventFollow'
@@ -42,6 +42,11 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
   const addWorkflowGap = useStore(s => s.addWorkflowGap)
   const followConnected = useStore(s => s.followConnected)
   const setFollowConnected = useStore(s => s.setFollowConnected)
+  const cancelWorkflowRun = useStore(s => s.cancelWorkflowRun)
+  const resumeWorkflowRun = useStore(s => s.resumeWorkflowRun)
+  // Guards the cancel/resume buttons against double-submit while the request is
+  // in flight (both actions re-fetch + re-select the run when they settle).
+  const [acting, setActing] = useState(false)
 
   // Live-follow only while the run has not gone terminal (a finished run has a
   // complete durable timeline already loaded; no stream to open).
@@ -103,6 +108,26 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">
+          {!isTerminal && (
+            <button
+              type="button"
+              disabled={acting}
+              onClick={async () => { setActing(true); try { await cancelWorkflowRun(run.run_id) } finally { setActing(false) } }}
+              className="inline-flex items-center gap-1 rounded-lg border border-amber-700/60 px-2 py-1 text-xs text-amber-300 hover:bg-amber-900/30 disabled:opacity-50"
+            >
+              <Ban size={13} aria-hidden="true" /> Cancel
+            </button>
+          )}
+          {(effectiveState === 'failed' || effectiveState === 'cancelled') && (
+            <button
+              type="button"
+              disabled={acting}
+              onClick={async () => { setActing(true); try { await resumeWorkflowRun(run.run_id) } finally { setActing(false) } }}
+              className="inline-flex items-center gap-1 rounded-lg border border-emerald-700/60 px-2 py-1 text-xs text-emerald-300 hover:bg-emerald-900/30 disabled:opacity-50"
+            >
+              <RotateCcw size={13} aria-hidden="true" /> Resume
+            </button>
+          )}
           <DiagnosticsExportButton runId={run.run_id} />
           <DeleteRunButton runId={run.run_id} workflowName={run.workflow_name} />
         </div>

@@ -648,6 +648,43 @@ export interface RunSummaryRow {
   current_step_id: string | null
 }
 
+/**
+ * One indexed workflow DEFINITION from `GET /workflows` (server WorkflowIndexRow,
+ * models/workflow_runtime.py). Distinct from a run (RunSummaryRow). Consumed by
+ * the workshop run launcher so a participant can pick a stored workflow and run
+ * it from the UI instead of the `cao workflow run` CLI.
+ */
+export interface WorkflowDefRow {
+  name: string
+  source_path: string
+  mode: string
+  step_count: number | null
+  description: string
+  indexed_at: string
+}
+
+/**
+ * The 202 ack from `POST /workflows/runs:submit` — the run is durably journaled
+ * and driven in the background; poll the run list / inspect for progress.
+ */
+export interface WorkflowRunAck {
+  run_id: string
+  state: string
+  links?: Record<string, string>
+}
+
+/** Result of `POST /agents/profiles/install` (server InstallResult). */
+export interface InstallResult {
+  success: boolean
+  message: string
+  agent_name?: string | null
+  context_file?: string | null
+  agent_file?: string | null
+  unresolved_vars?: string[] | null
+  source_kind?: 'url' | 'file' | 'name' | null
+  provider?: string | null
+}
+
 // ── Agent Plugins (Agent Plugins 1.0.0) ──────────────────────────────────────
 // Distinct from CAO's event-plugin system, which has no web surface.
 
@@ -982,6 +1019,51 @@ export const api = {
   // (fetchJSON returns undefined). Idempotent server-side (unknown id -> 204).
   deleteWorkflowRun: (runId: string) =>
     fetchJSON<void>(`/workflows/runs/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+
+  // ── Workshop run controls (button-driven workshop) — write side over the
+  // already-built run-control endpoints, so a participant never needs the
+  // `cao workflow run/cancel/resume` CLI or the WORKFLOW_NAME/REPORT_PATH vars.
+
+  // Indexed workflow definitions, for the launcher's workflow picker.
+  listWorkflows: () => fetchJSON<WorkflowDefRow[]>('/workflows'),
+
+  // Async start (202) — durably journaled, then driven in the background. We use
+  // the :submit twin (not the blocking POST /workflows/runs) because a workshop
+  // run launches three real agents and takes minutes; the run list/detail poll
+  // shows progress. `inputs` is the resolved topic/report map the lab supplies.
+  submitWorkflowRun: (body: { name_or_path: string; inputs?: Record<string, unknown>; run_id?: string }) =>
+    fetchJSON<WorkflowRunAck>('/workflows/runs:submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+
+  // Cooperative cancel of a running run (no body). Returns {success, run_id}.
+  cancelWorkflowRun: (runId: string) =>
+    fetchJSON<{ success: boolean; run_id: string }>(
+      `/workflows/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: 'POST' },
+    ),
+
+  // Resume a crashed/failed/cancelled run from its durable journal (optional
+  // body omitted — default resume-from-last-completed). Drives in the background.
+  resumeWorkflowRun: (runId: string) =>
+    fetchJSON<WorkflowRunAck>(
+      `/workflows/runs/${encodeURIComponent(runId)}/resume`,
+      { method: 'POST', timeoutMs: 30000 },
+    ),
+
+  // One-click install of a stock agent profile (POST /agents/profiles/install),
+  // for the workshop's "install reviewer / handoff trio / transport_*" steps.
+  // `source` is the bare profile name; `provider` defaults to the profile's
+  // frontmatter when omitted (same flag > frontmatter > default order as the CLI).
+  installProfile: (source: string, provider?: string) =>
+    fetchJSON<InstallResult>('/agents/profiles/install', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(provider ? { source, provider } : { source }),
+      timeoutMs: 30000,
+    }),
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null
