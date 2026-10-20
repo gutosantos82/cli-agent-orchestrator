@@ -485,9 +485,45 @@ echo "Discovering open PRs on $REPO …"
 # put needs-review FIRST, and cap after. Newest-first is preserved within each group, so
 # fresh PRs still get fast feedback; the cap now only ever drops work that is already done.
 # In refresh-meta mode, cover ALL open PRs (ignore LIMIT).
-mapfile -t ALL_PR_JSON < <(gh pr list --repo "$REPO" --state open --limit 1000 \
-  --json number,isDraft,headRefOid,title,additions,deletions,changedFiles,createdAt,author,labels,statusCheckRollup \
-  --jq '[.[] | select(.isDraft|not)] | .[] | @json')
+#
+# Discovery is retried and validated, and a failure is FATAL. GitHub sometimes returns
+# a truncated GraphQL response for this query ("unexpected end of JSON input"); it is
+# more likely as the open-PR count grows, because statusCheckRollup makes the payload
+# large. Before this, the mapfile got nothing, the script died on `ALL_PR_JSON[@]:
+# unbound variable`, and pr-review-run.sh still sent "✅ complete" with every PR listed
+# as "no report". That happened at 2026-10-13 10:4x (manual run) and again on the
+# 2026-10-20 07:00 cron run, which silently skipped 22 PRs opened that morning.
+_discover_open_prs() {
+  local out="$1"
+  gh pr list --repo "$REPO" --state open --limit 1000 \
+    --json number,isDraft,headRefOid,title,additions,deletions,changedFiles,createdAt,author,labels,statusCheckRollup \
+    --jq '[.[] | select(.isDraft|not)] | .[] | @json' > "$out" 2>"$out.err" || return 1
+  # Every line must be a JSON object; a truncated response fails this. An empty list
+  # (no open non-draft PRs) is valid as long as gh itself succeeded.
+  jq -e -s 'all(.[]; type=="string" and (fromjson|type=="object"))' \
+    < <(jq -R . < "$out") >/dev/null 2>&1
+}
+_disc_tmp="$(mktemp)"
+_disc_ok=0
+for _attempt in 1 2 3; do
+  if _discover_open_prs "$_disc_tmp"; then _disc_ok=1; break; fi
+  echo "  ⚠ PR discovery attempt $_attempt/3 failed: $(head -c 200 "$_disc_tmp.err" 2>/dev/null | tr '\n' ' ')" >&2
+  [[ "$_attempt" -lt 3 ]] && sleep $(( _attempt * 15 ))
+done
+if [[ "$_disc_ok" -ne 1 ]]; then
+  echo "  ⛔ PR discovery FAILED after 3 attempts — GitHub returned no usable PR list."
+  echo "     Nothing was reviewed. This is a discovery failure, not a review failure."
+  rm -f "$_disc_tmp" "$_disc_tmp.err"
+  exit 3
+fi
+mapfile -t ALL_PR_JSON < "$_disc_tmp"
+rm -f "$_disc_tmp" "$_disc_tmp.err"
+# bash 4.2 (this host) treats "${arr[@]}" of an EMPTY array as unbound under `set -u`,
+# so a genuinely empty list must exit here rather than crash below.
+if [[ "${#ALL_PR_JSON[@]}" -eq 0 ]]; then
+  echo "No open non-draft PRs on $REPO — nothing to review."
+  exit 0
+fi
 
 _needs_review=()
 _already=()
@@ -580,14 +616,15 @@ if command -v mwinit >/dev/null 2>&1 && [[ -n "$cert_until" ]]; then
   # self-contradicting "⛔ EXPIRED ... (valid until 2026-10-02T18:51:37)" while both
   # review sessions ran happily with 13h42m of Midway left. f434f403 fixed which file we
   # read but left this clause able to override it, so the false alarm came straight back.
+  #
+  # DOWNGRADED to informational on 2026-10-20. From 10-16 to 10-20 both midway certs on
+  # this host were expired, every run printed "⛔ EXPIRED", and those runs still produced
+  # 42 reviews (19 in one run). kiro_cli no longer needs this cert to reach its model, so
+  # an alarm here is now false on every run, which is worse than no alarm. It stays as a
+  # one-line note, and launch failures are left to speak for themselves: the watchdog
+  # and abandon path already report a session that never completes a turn.
   if [[ "$cert_epoch" -le "$now_epoch" ]]; then
-    echo "  ⛔ Midway certificate is EXPIRED${cert_until:+ (newest cert expired $cert_until)}."
-    echo "     Every kiro_cli launch below will fail with a misleading"
-    echo "     'initialization timed out' after ${CAO_PRR_INIT_TIMEOUT_HINT:-150}s each."
-    echo "     Fix first:  mwinit    then re-run this script."
-  elif (( cert_epoch - now_epoch < 14400 )); then
-    # Warn when the cert will lapse before a 4-hourly cadence comes round again.
-    echo "  ⚠ Midway cert expires $cert_until (<4h) — the next scheduled run will likely fail."
+    echo "  ℹ Midway cert expired $cert_until (informational: kiro_cli has run fine without it since 2026-10-16)."
   fi
 fi
 

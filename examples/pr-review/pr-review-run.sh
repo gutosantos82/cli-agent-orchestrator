@@ -34,13 +34,17 @@ Reviewing: ${pretty_list:-<none>}
 Repo: $REPO" || true
 
 # --- run the driver (overridable for tests) ---------------------------------
+# Capture the driver's exit status instead of discarding it: a driver that died before
+# launching anything (e.g. PR discovery failed) used to produce the same "✅ complete"
+# summary as a good run, with every PR listed as "no report".
+driver_rc=0
 if [ -n "${CAO_PRR_DRIVER_CMD:-}" ]; then
-  bash -c "$CAO_PRR_DRIVER_CMD" || true
+  bash -c "$CAO_PRR_DRIVER_CMD" || driver_rc=$?
 else
-  examples/pr-review/run_reviews.sh --limit "$LIMIT" --repo "$REPO" || true
+  examples/pr-review/run_reviews.sh --limit "$LIMIT" --repo "$REPO" || driver_rc=$?
 fi
 
-echo "=== driver run finished $(date -u +%FT%TZ) ==="
+echo "=== driver run finished $(date -u +%FT%TZ) (exit $driver_rc) ==="
 
 # --- build the outcomes summary from the just-reviewed PRs' reports ----------
 # Extract a frontmatter scalar by key, handling inline values ("x" / x) AND
@@ -65,7 +69,12 @@ fm_scalar() {  # $1=file  $2=key
   ' "$1"
 }
 
-summary="✅ CAO PR-review complete — $(date -u +%FT%TZ)"
+if [ "$driver_rc" -eq 0 ]; then
+  summary="✅ CAO PR-review complete — $(date -u +%FT%TZ)"
+else
+  summary="❌ CAO PR-review FAILED (driver exit $driver_rc) — $(date -u +%FT%TZ)
+The driver stopped early; PRs below were NOT reviewed by this run. See pr-review-data/driver.log."
+fi
 for pr in $needed; do
   head="$(gh pr view "$pr" --repo "$REPO" --json headRefOid --jq .headRefOid 2>/dev/null)"
   f="$DATA_DIR/reviews/${pr}-${head}.md"
