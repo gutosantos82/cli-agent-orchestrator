@@ -99,6 +99,31 @@ done
 mkdir -p "$DATA_DIR/reviews" "$DATA_DIR/meta"
 [[ -f "$DATA_DIR/state.json" ]] || echo '{}' > "$DATA_DIR/state.json"
 
+# Single-driver lock, shared with pr-review-gate.sh (pr-review-data/.driver.lock, an
+# atomic mkdir holding owner.pid). The gate already took it for cron runs, but a MANUAL
+# `run_reviews.sh` never did, so on 2026-10-20 the 23:00 gate saw no lock and fired a
+# second driver beside a manual one. Eight PRs were launched by both, and the gate also
+# runs `cao shutdown` on every cao-prr-* session before it fires, so the manual run's
+# in-flight sessions were at risk too.
+#
+# pr-review-run.sh (the cron path) exports CAO_PRR_LOCK_HELD=1 because it already owns
+# the lock; any other invocation must take it here, or refuse while a live driver holds it.
+if [[ "${CAO_PRR_LOCK_HELD:-0}" != "1" && "${REFRESH_META_ONLY:-0}" -ne 1 ]]; then
+  _lock="$REPO_ROOT/$DATA_DIR/.driver.lock"
+  if ! mkdir "$_lock" 2>/dev/null; then
+    _owner="$(cat "$_lock/owner.pid" 2>/dev/null || true)"
+    if [[ -n "$_owner" ]] && kill -0 "$_owner" 2>/dev/null; then
+      echo "⛔ Another PR-review driver is running (lock held by pid $_owner: $(ps -o args= -p "$_owner" 2>/dev/null | cut -c1-80))."
+      echo "   Not starting a second one. Wait for it, or stop it first."
+      exit 4
+    fi
+    echo "  reclaiming dead driver lock (owner pid ${_owner:-unrecorded} is gone)"
+    rm -rf "$_lock"; mkdir "$_lock"
+  fi
+  echo $$ > "$_lock/owner.pid"
+  trap 'rm -rf "$_lock" 2>/dev/null || true' EXIT
+fi
+
 # The dashboard user's own GitHub login — excluded from "discussion since review" so your
 # own comments don't flag as activity worth re-reading (you already know what you said).
 ME="$(gh api user --jq .login 2>/dev/null || echo "")"
@@ -488,15 +513,16 @@ echo "Discovering open PRs on $REPO …"
 #
 # Discovery is retried and validated, and a failure is FATAL. GitHub sometimes returns
 # a truncated GraphQL response for this query ("unexpected end of JSON input"); it is
-# more likely as the open-PR count grows, because statusCheckRollup makes the payload
-# large. Before this, the mapfile got nothing, the script died on `ALL_PR_JSON[@]:
+# more likely as the open-PR count grows. statusCheckRollup was the heavy field, so it is
+# no longer fetched here at all; it is fetched per PR, only for the PRs this run will
+# actually touch (see _with_ci below). Before this, the mapfile got nothing, the script died on `ALL_PR_JSON[@]:
 # unbound variable`, and pr-review-run.sh still sent "✅ complete" with every PR listed
 # as "no report". That happened at 2026-10-13 10:4x (manual run) and again on the
 # 2026-10-20 07:00 cron run, which silently skipped 22 PRs opened that morning.
 _discover_open_prs() {
   local out="$1"
   gh pr list --repo "$REPO" --state open --limit 1000 \
-    --json number,isDraft,headRefOid,title,additions,deletions,changedFiles,createdAt,author,labels,statusCheckRollup \
+    --json number,isDraft,headRefOid,title,additions,deletions,changedFiles,createdAt,author,labels \
     --jq '[.[] | select(.isDraft|not)] | .[] | @json' > "$out" 2>"$out.err" || return 1
   # Every line must be a JSON object; a truncated response fails this. An empty list
   # (no open non-draft PRs) is valid as long as gh itself succeeded.
@@ -540,7 +566,7 @@ if [[ "$REFRESH_META_ONLY" -eq 1 ]]; then
   PR_JSON=("${ALL_PR_JSON[@]}")
 else
   PR_JSON=()
-  for j in "${_needs_review[@]}" "${_already[@]}"; do
+  for j in ${_needs_review[@]+"${_needs_review[@]}"} ${_already[@]+"${_already[@]}"}; do
     [[ "${#PR_JSON[@]}" -lt "$LIMIT" ]] || break
     PR_JSON+=("$j")
   done
@@ -549,6 +575,18 @@ else
          "$(( ${#_needs_review[@]} - LIMIT )) deferred to the next run (none starved: they sort first)."
   fi
 fi
+# CI status per PR, for the PRs this run uses only: one small query each, instead of
+# asking for every open PR's full check rollup in the bulk list (which is what GitHub
+# was timing out on). Best-effort: a failed lookup leaves CI unknown on the dashboard
+# rather than failing the run.
+_with_ci() {
+  local j="$1" n ci
+  n="$(jq -r '.number' <<<"$j")"
+  ci="$(gh pr view "$n" --repo "$REPO" --json statusCheckRollup 2>/dev/null || echo '{"statusCheckRollup":[]}')"
+  jq -c --argjson ci "$ci" '. + $ci' <<<"$j" 2>/dev/null || echo "$j"
+}
+for i in ${PR_JSON[@]+"${!PR_JSON[@]}"}; do PR_JSON[$i]="$(_with_ci "${PR_JSON[$i]}")"; done
+
 PRS=()
 for j in "${PR_JSON[@]}"; do
   PRS+=("$(jq -r '"\(.number) \(.headRefOid)"' <<<"$j")")

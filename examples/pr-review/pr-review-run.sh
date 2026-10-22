@@ -38,6 +38,9 @@ Repo: $REPO" || true
 # launching anything (e.g. PR discovery failed) used to produce the same "✅ complete"
 # summary as a good run, with every PR listed as "no report".
 driver_rc=0
+# We already own .driver.lock (the gate handed it to us). Tell run_reviews.sh so it
+# doesn't try to take the lock again and refuse to run because we hold it.
+export CAO_PRR_LOCK_HELD=1
 if [ -n "${CAO_PRR_DRIVER_CMD:-}" ]; then
   bash -c "$CAO_PRR_DRIVER_CMD" || driver_rc=$?
 else
