@@ -542,7 +542,7 @@ export function AgentPanel() {
               <div>
                 <h3 className="text-base font-semibold text-gray-200">Spawn Agent</h3>
                 <p className="text-xs text-gray-500 mt-1">
-                  Launch a new AI agent in its own isolated tmux session.
+                  Launch a new AI agent in its own isolated terminal session.
                 </p>
               </div>
               <button

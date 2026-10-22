@@ -3,6 +3,7 @@
 // generic prompt-preset persistence helpers.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { api } from '../api'
+import { useStore } from '../store'
 import { loadPromptPresets, savePromptPresets, PROMPT_PRESETS_KEY } from '../components/PromptPresets'
 
 describe('Workshop run-control + install API methods', () => {
@@ -78,6 +79,34 @@ describe('Workshop run-control + install API methods', () => {
       json: () => Promise.resolve({ detail: 'No fleet configured. Set CAO_ELASTIC_BROKER_URL ...' }),
     })
     await expect(api.getFleetStatus()).rejects.toMatchObject({ status: 503 })
+  })
+
+  it('approveWorkflowPlan POSTs the plan id verbatim in the body', async () => {
+    const planId = 'plan-v1:75048c5db632'
+    mockResponse({ plan_id: planId, approved: true, changed: true })
+    const r = await api.approveWorkflowPlan(planId)
+    expect(r.approved).toBe(true)
+    const [url, opts] = mockFetch.mock.calls[0]
+    expect(url).toBe('/workflows/plans/approve')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body)).toEqual({ plan_id: planId })
+  })
+
+  it('startWorkflowRun hands back the plan id on an approval_required 403', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 403, statusText: 'Forbidden',
+      json: () => Promise.resolve({ detail: { kind: 'approval_required', plan_id: 'plan-v1:abc', message: 'needs approval' } }),
+    })
+    const outcome = await useStore.getState().startWorkflowRun('wf', { topic: 't' }, 'gng-1')
+    expect(outcome).toEqual({ approvalPlanId: 'plan-v1:abc', message: 'needs approval' })
+  })
+
+  it('startWorkflowRun returns null (not a plan) on other refusals', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 503, statusText: 'Service Unavailable',
+      json: () => Promise.resolve({ detail: { kind: 'plan_identity_unavailable', plan_id: null, message: 'freeze failed' } }),
+    })
+    expect(await useStore.getState().startWorkflowRun('wf', {})).toBeNull()
   })
 
   it('surfaces ApiError detail on a bad-inputs 400 from submit', async () => {

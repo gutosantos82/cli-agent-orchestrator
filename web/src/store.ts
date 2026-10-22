@@ -23,6 +23,13 @@ interface Snackbar {
   message: string
 }
 
+// What starting a workflow run produced: the new run id, the plan id a human
+// must approve first (issue #583 approval gate), or null on any other error.
+export type StartRunOutcome =
+  | { runId: string }
+  | { approvalPlanId: string; message?: string }
+  | null
+
 interface Store {
   sessions: Session[]
   activeSession: string | null
@@ -76,8 +83,8 @@ interface Store {
   selectWorkflowRun: (runId: string | null) => Promise<void>
   // Workshop run controls (button-driven workshop). Each surfaces a snackbar,
   // refreshes the run list, and (re)selects the affected run so the detail pane
-  // follows it live. startWorkflowRun resolves to the new run id (null on error).
-  startWorkflowRun: (nameOrPath: string, inputs: Record<string, unknown>, runId?: string) => Promise<string | null>
+  // follows it live. startWorkflowRun resolves to a StartRunOutcome.
+  startWorkflowRun: (nameOrPath: string, inputs: Record<string, unknown>, runId?: string) => Promise<StartRunOutcome>
   cancelWorkflowRun: (runId: string) => Promise<void>
   resumeWorkflowRun: (runId: string) => Promise<void>
   setWorkflowEvents: (events: WorkflowEvent[], gaps: GapMarker[]) => void
@@ -274,8 +281,14 @@ export const useStore = create<Store>((set, get) => ({
       get().showSnackbar({ type: 'success', message: `Started run ${ack.run_id}` })
       await get().fetchWorkflowRuns()
       await get().selectWorkflowRun(ack.run_id)
-      return ack.run_id
+      return { runId: ack.run_id }
     } catch (e: any) {
+      // A first run of a new plan is refused until a human approves it. That is
+      // an expected step, not a failure, so hand the plan id back to the caller.
+      const planId = e?.detailMeta?.plan_id
+      if (e?.kind === 'approval_required' && typeof planId === 'string' && planId) {
+        return { approvalPlanId: planId, message: e?.detail }
+      }
       get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to start workflow run' })
       return null
     }

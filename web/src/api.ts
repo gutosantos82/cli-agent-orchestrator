@@ -673,6 +673,18 @@ export interface WorkflowRunAck {
   links?: Record<string, string>
 }
 
+/**
+ * Result of `POST /workflows/plans/approve` (issue #583). Idempotent: `changed`
+ * is false when the plan was already approved, with the ORIGINAL approval time.
+ */
+export interface PlanApproval {
+  plan_id: string
+  approved: boolean
+  changed: boolean
+  approved_at?: string
+  approved_by?: string
+}
+
 /** Read-only fleet summary from `GET /fleet/status` (chapter 4 cluster lab). */
 export interface FleetStatus {
   broker: string
@@ -1044,6 +1056,17 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    }),
+
+  // Approve a script-workflow plan so its runs may start (issue #583). A first
+  // run of a new plan is refused 403 with detail {kind: 'approval_required',
+  // plan_id, message}; this is the human act that clears it. plan_id travels in
+  // the body verbatim (it contains a ':'), never as a path segment.
+  approveWorkflowPlan: (planId: string) =>
+    fetchJSON<PlanApproval>('/workflows/plans/approve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ plan_id: planId }),
     }),
 
   // Cooperative cancel of a running run (no body). Returns {success, run_id}.

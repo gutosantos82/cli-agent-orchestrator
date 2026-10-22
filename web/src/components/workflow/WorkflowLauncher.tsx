@@ -6,9 +6,15 @@
 // submits async via the store's startWorkflowRun (POST /workflows/runs:submit),
 // which refreshes the run list and selects the new run so the detail pane follows
 // it live. Purely additive over existing endpoints.
+//
+// Approval gate (issue #583): the first run of a new plan is refused with
+// approval_required + a plan id. The launcher shows that plan id and an
+// "Approve & run" button (POST /workflows/plans/approve, then resubmit) — the
+// human act the MCP surface deliberately withholds from agents. The approval
+// binds the script AND these inputs, so editing anything clears the prompt.
 
 import { useEffect, useState } from 'react'
-import { Play, Plus, X, Loader2, ChevronDown, ChevronRight } from 'lucide-react'
+import { Play, Plus, X, Loader2, ChevronDown, ChevronRight, ShieldCheck } from 'lucide-react'
 import { api, WorkflowDefRow } from '../../api'
 import { useStore } from '../../store'
 
@@ -26,6 +32,7 @@ const DEFAULT_INPUTS: InputRow[] = [
 
 export function WorkflowLauncher() {
   const startWorkflowRun = useStore(s => s.startWorkflowRun)
+  const showSnackbar = useStore(s => s.showSnackbar)
 
   const [open, setOpen] = useState(false)
   const [workflows, setWorkflows] = useState<WorkflowDefRow[]>([])
@@ -34,6 +41,10 @@ export function WorkflowLauncher() {
   const [runId, setRunId] = useState('')
   const [inputs, setInputs] = useState<InputRow[]>(DEFAULT_INPUTS)
   const [submitting, setSubmitting] = useState(false)
+  const [pendingApproval, setPendingApproval] = useState<{ planId: string; message?: string } | null>(null)
+
+  // Any change to what would run invalidates a shown plan id.
+  useEffect(() => { setPendingApproval(null) }, [selected, inputs, runId])
 
   // Load the stored workflow definitions when the launcher is first opened.
   useEffect(() => {
@@ -58,18 +69,42 @@ export function WorkflowLauncher() {
   const addRow = () => setInputs(rows => [...rows, { key: '', value: '' }])
   const removeRow = (i: number) => setInputs(rows => rows.filter((_, j) => j !== i))
 
-  const submit = async () => {
-    if (!selected || submitting) return
-    // Only send rows with a non-empty key; the server validates against the
-    // workflow's declared inputs and returns a 400 the store surfaces as a snackbar.
+  // Only send rows with a non-empty key; the server validates against the
+  // workflow's declared inputs and returns a 400 the store surfaces as a snackbar.
+  const buildPayload = () => {
     const payload: Record<string, unknown> = {}
     for (const { key, value } of inputs) {
       const k = key.trim()
       if (k) payload[k] = value
     }
+    return payload
+  }
+
+  const run = async () => {
+    const outcome = await startWorkflowRun(selected, buildPayload(), runId.trim() || undefined)
+    setPendingApproval(outcome && 'approvalPlanId' in outcome
+      ? { planId: outcome.approvalPlanId, message: outcome.message }
+      : null)
+  }
+
+  const submit = async () => {
+    if (!selected || submitting) return
     setSubmitting(true)
     try {
-      await startWorkflowRun(selected, payload, runId.trim() || undefined)
+      await run()
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const approveAndRun = async () => {
+    if (!pendingApproval || submitting) return
+    setSubmitting(true)
+    try {
+      await api.approveWorkflowPlan(pendingApproval.planId)
+      await run()
+    } catch (e: any) {
+      showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to approve plan' })
     } finally {
       setSubmitting(false)
     }
@@ -170,6 +205,37 @@ export function WorkflowLauncher() {
                 {submitting ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
                 Run workflow
               </button>
+
+              {pendingApproval && (
+                <div role="alert" className="rounded-lg border border-amber-700/60 bg-amber-950/30 p-3 space-y-2">
+                  <p className="text-sm text-amber-200">
+                    This workflow plan needs your approval before it can run. Approving covers this
+                    script with exactly these inputs; changing either needs a new approval.
+                  </p>
+                  <p className="text-xs text-gray-400">
+                    Plan id: <code className="break-all font-mono text-gray-300">{pendingApproval.planId}</code>
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={approveAndRun}
+                      disabled={submitting}
+                      className="inline-flex items-center gap-2 rounded-lg bg-amber-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {submitting ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <ShieldCheck size={14} aria-hidden="true" />}
+                      Approve &amp; run
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPendingApproval(null)}
+                      disabled={submitting}
+                      className="rounded-lg px-3 py-1.5 text-sm text-gray-400 hover:text-gray-200"
+                    >
+                      Not now
+                    </button>
+                  </div>
+                </div>
+              )}
             </>
           )}
         </div>
