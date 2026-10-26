@@ -109,6 +109,39 @@ describe('Workshop run-control + install API methods', () => {
     expect(await useStore.getState().startWorkflowRun('wf', {})).toBeNull()
   })
 
+  it('resumeWorkflowRun also hands back the plan id on approval_required', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: false, status: 403, statusText: 'Forbidden',
+      json: () => Promise.resolve({ detail: { kind: 'approval_required', plan_id: 'plan-v1:def', message: 'changed' } }),
+    })
+    expect(await useStore.getState().resumeWorkflowRun('gng-1')).toEqual({ approvalPlanId: 'plan-v1:def', message: 'changed' })
+  })
+
+  it('validateWorkflow POSTs {path}', async () => {
+    mockResponse({ status: 'pass', errors: [], findings: [] })
+    const v = await api.validateWorkflow('/home/p/.aws/cli-agent-orchestrator/workflows/wf.py')
+    expect(v.status).toBe('pass')
+    const [url, opts] = mockFetch.mock.calls[0]
+    expect(url).toBe('/workflows/validate')
+    expect(JSON.parse(opts.body)).toEqual({ path: '/home/p/.aws/cli-agent-orchestrator/workflows/wf.py' })
+  })
+
+  it('getUiPresets keeps well-formed entries and drops the rest', async () => {
+    mockResponse({
+      prompts: [{ label: 'Ch3 author', text: 'Use the cao-workflow skill' }, { label: 1 }],
+      installs: [{ label: 'analysis_supervisor', source: 'https://x/a.md', provider: 'claude_code' }, { source: 'no label' }],
+    })
+    const p = await api.getUiPresets()
+    expect(mockFetch.mock.calls[0][0]).toBe('/ui-presets.json')
+    expect(p.prompts).toEqual([{ label: 'Ch3 author', text: 'Use the cao-workflow skill' }])
+    expect(p.installs).toEqual([{ label: 'analysis_supervisor', source: 'https://x/a.md', provider: 'claude_code' }])
+  })
+
+  it('getUiPresets resolves to {} when the file is absent', async () => {
+    mockFetch.mockResolvedValueOnce({ ok: false, status: 404, statusText: 'Not Found', json: () => Promise.reject(new Error('x')) })
+    expect(await api.getUiPresets()).toEqual({})
+  })
+
   it('surfaces ApiError detail on a bad-inputs 400 from submit', async () => {
     mockFetch.mockResolvedValueOnce({
       ok: false, status: 400, statusText: 'Bad Request',

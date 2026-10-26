@@ -14,8 +14,8 @@
 // binds the script AND these inputs, so editing anything clears the prompt.
 
 import { useEffect, useState } from 'react'
-import { Play, Plus, X, Loader2, ChevronDown, ChevronRight, ShieldCheck } from 'lucide-react'
-import { api, WorkflowDefRow } from '../../api'
+import { Play, Plus, X, Loader2, ChevronDown, ChevronRight, ShieldCheck, ListChecks } from 'lucide-react'
+import { api, WorkflowDefRow, WorkflowValidation } from '../../api'
 import { useStore } from '../../store'
 
 interface InputRow {
@@ -45,6 +45,23 @@ export function WorkflowLauncher() {
 
   // Any change to what would run invalidates a shown plan id.
   useEffect(() => { setPendingApproval(null) }, [selected, inputs, runId])
+
+  // Validate (the `cao workflow validate` equivalent) lints the stored file.
+  const [validation, setValidation] = useState<WorkflowValidation | null>(null)
+  const [validating, setValidating] = useState(false)
+  useEffect(() => { setValidation(null) }, [selected])
+  const validate = async () => {
+    const def = workflows.find(w => w.name === selected)
+    if (!def || validating) return
+    setValidating(true)
+    try {
+      setValidation(await api.validateWorkflow(def.source_path))
+    } catch (e: any) {
+      setValidation({ status: 'fail', errors: [e?.detail || e?.message || 'Validation request failed'] })
+    } finally {
+      setValidating(false)
+    }
+  }
 
   // Load the stored workflow definitions when the launcher is first opened.
   useEffect(() => {
@@ -196,15 +213,41 @@ export function WorkflowLauncher() {
                 />
               </label>
 
-              <button
-                type="button"
-                onClick={submit}
-                disabled={!selected || submitting}
-                className="inline-flex items-center gap-2 rounded-lg bg-emerald-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {submitting ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
-                Run workflow
-              </button>
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={submit}
+                  disabled={!selected || submitting}
+                  className="inline-flex items-center gap-2 rounded-lg bg-emerald-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {submitting ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <Play size={14} aria-hidden="true" />}
+                  Run workflow
+                </button>
+                <button
+                  type="button"
+                  onClick={validate}
+                  disabled={!selected || validating}
+                  className="inline-flex items-center gap-2 rounded-lg border border-gray-700 px-3 py-1.5 text-sm text-gray-200 hover:bg-gray-800 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {validating ? <Loader2 size={14} className="animate-spin" aria-hidden="true" /> : <ListChecks size={14} aria-hidden="true" />}
+                  Validate
+                </button>
+              </div>
+
+              {validation && (
+                <div
+                  role="status"
+                  className={`rounded-lg border p-2 text-xs ${validation.status === 'fail' ? 'border-red-800/60 text-red-300' : 'border-emerald-800/60 text-emerald-300'}`}
+                >
+                  <p className="font-medium">
+                    {validation.status === 'fail' ? 'Validation failed' : 'Valid'}
+                    {validation.findings?.length ? ` — ${validation.findings.length} finding${validation.findings.length > 1 ? 's' : ''}` : ''}
+                  </p>
+                  {[...validation.errors.map(e => ({ key: `e:${e}`, text: e })),
+                    ...(validation.findings ?? []).map((f, i) => ({ key: `f:${i}`, text: `line ${f.line} [${f.severity}] ${f.rule_id}: ${f.message}` })),
+                  ].map(row => <p key={row.key} className="mt-1 font-mono text-gray-300">{row.text}</p>)}
+                </div>
+              )}
 
               {pendingApproval && (
                 <div role="alert" className="rounded-lg border border-amber-700/60 bg-amber-950/30 p-3 space-y-2">

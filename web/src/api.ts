@@ -685,6 +685,33 @@ export interface PlanApproval {
   approved_by?: string
 }
 
+/** One script-lint finding (server LintFinding). `line` is 1-based. */
+export interface WorkflowLintFinding {
+  rule_id: string
+  severity: 'error' | 'warning'
+  line: number
+  message: string
+}
+
+/** `POST /workflows/validate` result (server ValidationResult / ScriptValidationResult). */
+export interface WorkflowValidation {
+  status: 'pass' | 'pass_reserved' | 'fail'
+  errors: string[]
+  reserved_notes?: string[]
+  findings?: WorkflowLintFinding[]
+}
+
+/**
+ * Optional, deployment-supplied UI presets, read from `ui-presets.json` next to
+ * the built UI (a provisioning step drops it into web/public before the build).
+ * Absent on a plain install, which is the common case: every field is optional
+ * and a missing or malformed file means "no presets".
+ */
+export interface UiPresets {
+  prompts?: { label: string; text: string }[]
+  installs?: { label: string; source: string; provider?: string }[]
+}
+
 /** Read-only fleet summary from `GET /fleet/status` (chapter 4 cluster lab). */
 export interface FleetStatus {
   broker: string
@@ -1068,6 +1095,33 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ plan_id: planId }),
     }),
+
+  // Lint a stored workflow file without running it (the `cao workflow validate`
+  // equivalent). `path` is the definition's source_path from GET /workflows.
+  validateWorkflow: (path: string) =>
+    fetchJSON<WorkflowValidation>('/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    }),
+
+  // Deployment presets (see UiPresets). Never rejects: any failure is "none".
+  getUiPresets: async (): Promise<UiPresets> => {
+    try {
+      const data = await fetchJSON<unknown>('/ui-presets.json')
+      if (!data || typeof data !== 'object') return {}
+      const d = data as Record<string, unknown>
+      const prompts = Array.isArray(d.prompts)
+        ? d.prompts.filter((p: any) => p && typeof p.label === 'string' && typeof p.text === 'string')
+        : undefined
+      const installs = Array.isArray(d.installs)
+        ? d.installs.filter((p: any) => p && typeof p.label === 'string' && typeof p.source === 'string')
+        : undefined
+      return { prompts, installs }
+    } catch {
+      return {}
+    }
+  },
 
   // Cooperative cancel of a running run (no body). Returns {success, run_id}.
   cancelWorkflowRun: (runId: string) =>

@@ -86,7 +86,7 @@ interface Store {
   // follows it live. startWorkflowRun resolves to a StartRunOutcome.
   startWorkflowRun: (nameOrPath: string, inputs: Record<string, unknown>, runId?: string) => Promise<StartRunOutcome>
   cancelWorkflowRun: (runId: string) => Promise<void>
-  resumeWorkflowRun: (runId: string) => Promise<void>
+  resumeWorkflowRun: (runId: string) => Promise<StartRunOutcome>
   setWorkflowEvents: (events: WorkflowEvent[], gaps: GapMarker[]) => void
   appendWorkflowEvent: (event: WorkflowEvent) => void
   addWorkflowGap: (gap: GapMarker) => void
@@ -311,8 +311,15 @@ export const useStore = create<Store>((set, get) => ({
       get().showSnackbar({ type: 'success', message: `Resuming ${runId}` })
       await get().fetchWorkflowRuns()
       if (get().selectedRunId === runId) await get().selectWorkflowRun(runId)
+      return { runId }
     } catch (e: any) {
+      // Resume re-checks the plan, so an edited script comes back approval_required.
+      const planId = e?.detailMeta?.plan_id
+      if (e?.kind === 'approval_required' && typeof planId === 'string' && planId) {
+        return { approvalPlanId: planId, message: e?.detail }
+      }
       get().showSnackbar({ type: 'error', message: e?.detail || e?.message || 'Failed to resume run' })
+      return null
     }
   },
 

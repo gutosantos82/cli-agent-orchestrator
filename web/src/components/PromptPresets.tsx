@@ -1,13 +1,14 @@
 // PromptPresets — a small, generic prompt-preset picker for the agent message
 // box. Lets a user save reusable prompts and insert one with a click instead of
-// retyping or pasting. Deliberately content-agnostic: presets live in
-// localStorage and are seeded/edited by the user (the OPN310 workshop seeds its
-// lab prompts via a provisioning script), so no workshop-specific text ships in
-// CAO. Inserting fills the message input (it does not auto-send) so the user can
-// review before sending.
+// retyping or pasting. Deliberately content-agnostic: user presets live in
+// localStorage, and a deployment may ship read-only ones in ui-presets.json
+// (api.getUiPresets — e.g. a workshop's lab prompts), so no workshop-specific
+// text ships in CAO. Inserting fills the message input (it does not auto-send)
+// so the user can review before sending.
 
 import { useEffect, useState } from 'react'
 import { BookMarked, Plus, X } from 'lucide-react'
+import { api } from '../api'
 
 export interface PromptPreset {
   label: string
@@ -50,10 +51,15 @@ interface PromptPresetsProps {
 export function PromptPresets({ current, onInsert }: PromptPresetsProps) {
   const [open, setOpen] = useState(false)
   const [presets, setPresets] = useState<PromptPreset[]>([])
+  const [sitePresets, setSitePresets] = useState<PromptPreset[]>([])
 
   // Re-read on open so presets seeded by another tab/script show up.
   useEffect(() => {
-    if (open) setPresets(loadPromptPresets())
+    if (!open) return
+    setPresets(loadPromptPresets())
+    let cancelled = false
+    api.getUiPresets().then(p => { if (!cancelled) setSitePresets(p.prompts ?? []) })
+    return () => { cancelled = true }
   }, [open])
 
   const saveCurrent = () => {
@@ -94,7 +100,20 @@ export function PromptPresets({ current, onInsert }: PromptPresetsProps) {
             <Plus size={13} aria-hidden="true" /> Save current as preset
           </button>
           <div className="mt-1 max-h-56 overflow-auto">
+            {sitePresets.map(p => (
+              <button
+                key={`site:${p.label}`}
+                type="button"
+                onClick={() => { onInsert(p.text); setOpen(false) }}
+                className="block w-full truncate text-left px-2 py-1 text-xs text-sky-200 hover:bg-gray-800 rounded"
+                title={p.text}
+              >
+                {p.label}
+              </button>
+            ))}
+            {sitePresets.length > 0 && presets.length > 0 && <hr className="my-1 border-gray-800" />}
             {presets.length === 0 ? (
+              sitePresets.length > 0 ? null :
               <p className="px-2 py-2 text-xs text-gray-500">No presets yet.</p>
             ) : (
               presets.map(p => (

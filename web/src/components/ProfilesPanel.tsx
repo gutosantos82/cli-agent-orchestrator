@@ -275,16 +275,30 @@ export function ProfilesPanel() {
     setSearching(false)
   }
 
-  const handleInstall = async () => {
-    const source = installName.trim()
+  // Deployment-supplied one-click installs (ui-presets.json), shown as chips in
+  // the Install row — e.g. a workshop's example profiles by https:// URL, since
+  // the server installs names and URLs but not local file paths.
+  const [quickInstalls, setQuickInstalls] = useState<{ label: string; source: string; provider?: string }[]>([])
+  useEffect(() => {
+    if (!installOpen) return
+    let cancelled = false
+    api.getUiPresets().then(p => { if (!cancelled) setQuickInstalls(p.installs ?? []) })
+    return () => { cancelled = true }
+  }, [installOpen])
+
+  const handleInstall = async (preset?: { source: string; provider?: string }) => {
+    const source = preset ? preset.source : installName.trim()
     if (!source || installing) return
     setInstalling(true)
     try {
-      const res = await api.installProfile(source)
+      const res = await api.installProfile(source, preset?.provider)
       if (res.success) {
         showSnackbar({ type: 'success', message: res.message || `Installed '${source}'` })
-        setInstallOpen(false)
-        setInstallName('')
+        // Keep the row open after a chip so a set (e.g. three profiles) is three clicks.
+        if (!preset) {
+          setInstallOpen(false)
+          setInstallName('')
+        }
         await refreshCatalog()
       } else {
         showSnackbar({ type: 'error', message: res.message || `Failed to install '${source}'` })
@@ -447,6 +461,23 @@ export function ProfilesPanel() {
         </div>
       </div>
 
+      {installOpen && quickInstalls.length > 0 && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          {quickInstalls.map(q => (
+            <button
+              key={q.label}
+              type="button"
+              onClick={() => handleInstall(q)}
+              disabled={installing}
+              title={q.source}
+              className="flex items-center gap-1.5 rounded-lg border border-emerald-800/60 px-2.5 py-1 text-xs text-emerald-200 hover:bg-emerald-900/30 disabled:opacity-40"
+            >
+              <Download size={12} aria-hidden="true" /> {q.label}
+            </button>
+          ))}
+        </div>
+      )}
+
       {installOpen && (
         <div className="mb-4 flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-900/40 p-3">
           <input
@@ -460,7 +491,7 @@ export function ProfilesPanel() {
             autoFocus
           />
           <button
-            onClick={handleInstall}
+            onClick={() => handleInstall()}
             disabled={installing || !installName.trim()}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-colors"
           >
