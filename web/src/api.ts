@@ -110,6 +110,8 @@ export interface HealthInfo {
   /** The init budget the SERVER applies, in seconds (#1002 P3-1). Absent on an older server. */
   provider_init_timeout?: number
   components?: Record<string, string>
+  /** The server's installed package version. Absent on an older server. */
+  version?: string
 }
 
 // ── Create budgets, sized from the server's provider_init_timeout ───────────
@@ -712,6 +714,44 @@ export interface UiPresets {
   installs?: { label: string; source: string; provider?: string }[]
 }
 
+/** One step of a run's retained result (server StepResult). */
+export interface WorkflowStepResult {
+  id: string
+  state: string
+  attempts: number
+  output?: Record<string, unknown> | null
+  error?: string | null
+  error_kind?: string | null
+}
+
+/**
+ * `GET /workflows/runs/{id}/result` (server WorkflowRunResult). Journal-built, so
+ * there is no run-level output; per-step outputs carry what a run emitted. A
+ * failed/cancelled run adds `failure_envelope`.
+ */
+export interface WorkflowRunResult {
+  run_id: string
+  workflow_name: string
+  state: string
+  steps: WorkflowStepResult[]
+  started_at: string
+  finished_at?: string | null
+  kind?: string | null
+  warnings?: string[]
+  failure_envelope?: Record<string, unknown>
+}
+
+/** `GET /workflows/{name}` for a script workflow (server ScriptSpec). YAML specs carry other fields. */
+export interface WorkflowSpec {
+  name: string
+  path?: string
+  source?: string
+  content_hash?: string
+  findings?: WorkflowLintFinding[]
+  inputs?: Record<string, unknown>
+  [key: string]: unknown
+}
+
 /** Read-only fleet summary from `GET /fleet/status` (chapter 4 cluster lab). */
 export interface FleetStatus {
   broker: string
@@ -1153,6 +1193,38 @@ export const api = {
   // Read-only fleet summary (chapter 4). 503 when no broker is configured or it
   // is unreachable — the caller renders that as "fleet not reachable".
   getFleetStatus: () => fetchJSON<FleetStatus>('/fleet/status'),
+
+  // GET /health, for the Home tab's server card (backend, components, version).
+  getHealth: () => fetchJSON<HealthInfo>('/health'),
+
+  // A run's retained result (the `cao workflow result` equivalent).
+  getWorkflowRunResult: (runId: string) =>
+    fetchJSON<WorkflowRunResult>(`/workflows/runs/${encodeURIComponent(runId)}/result`),
+
+  // A stored workflow's spec (the `cao workflow get` equivalent): source, hash, findings.
+  getWorkflowSpec: (name: string) =>
+    fetchJSON<WorkflowSpec>(`/workflows/${encodeURIComponent(name)}`),
+
+  // Download one memory scope as an OKF tarball (GET /memory/export). The server
+  // refuses private scopes and needs scope_id for project. Returns the blob and
+  // a filename so the caller can hand it to the browser; errors surface as
+  // ApiError like fetchJSON's.
+  exportMemory: async (opts: { scope: string; scopeId?: string; redact?: boolean }) => {
+    const q = new URLSearchParams({ scope: opts.scope })
+    if (opts.scopeId) q.set('scope_id', opts.scopeId)
+    if (opts.redact) q.set('redact', 'true')
+    const res = await fetch(`${BASE}/memory/export?${q}`, { headers: withAuth() })
+    if (!res.ok) {
+      const err: ApiError = new Error(`${res.status} ${res.statusText}`)
+      err.status = res.status
+      try {
+        const body = await res.json()
+        if (body && typeof body.detail === 'string') err.detail = body.detail
+      } catch { /* non-JSON error body */ }
+      throw err
+    }
+    return { blob: await res.blob(), filename: `cao-memory-${opts.scope}.tar.gz` }
+  },
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null
