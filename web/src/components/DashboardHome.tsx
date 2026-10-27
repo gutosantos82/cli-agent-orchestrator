@@ -8,6 +8,7 @@ import { InboxPanel } from './InboxPanel'
 import { StatusBadge, STATUS_CONFIG } from './StatusBadge'
 import { OutputViewer } from './OutputViewer'
 import { AgentDescription } from './AgentDescription'
+import { FleetWorkers } from './FleetWorkers'
 import { parseServerTime } from '../time'
 
 const STATUS_ORDER = ['PROCESSING', 'IDLE', 'WAITING_USER_ANSWER', 'ERROR', 'COMPLETED', 'UNKNOWN']
@@ -511,6 +512,9 @@ export function DashboardHome({ onNavigate }: { onNavigate: (tab: string) => voi
           })}
         </div>
       )}
+
+      {/* CAO cluster workers (read-only); collapsed, fetches only when opened. */}
+      <FleetWorkers />
 
       {/* Modals */}
       {inboxTerminalId && <InboxPanel terminalId={inboxTerminalId} onClose={() => setInboxTerminalId(null)} />}
