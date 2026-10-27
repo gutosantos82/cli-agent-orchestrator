@@ -12,6 +12,10 @@
 // "Approve & run" button (POST /workflows/plans/approve, then resubmit) — the
 // human act the MCP surface deliberately withholds from agents. The approval
 // binds the script AND these inputs, so editing anything clears the prompt.
+//
+// The draft (workflow, inputs, run id) and any pending approval persist in
+// localStorage, so reloading the tab or opening the UI in a new tab still shows
+// the plan id waiting for approval instead of silently dropping it.
 
 import { useEffect, useState } from 'react'
 import { Play, Plus, X, Loader2, ChevronDown, ChevronRight, ShieldCheck, ListChecks, FileCode } from 'lucide-react'
@@ -30,21 +34,71 @@ const DEFAULT_INPUTS: InputRow[] = [
   { key: 'report', value: '/tmp/go-no-go.md' },
 ]
 
+export const LAUNCHER_DRAFT_KEY = 'cao.workflowLauncher'
+
+interface PendingApproval {
+  planId: string
+  message?: string
+  /** draftKey() of the selection the plan was refused for. */
+  forDraft: string
+}
+
+interface LauncherDraft {
+  selected: string
+  runId: string
+  inputs: InputRow[]
+  pendingApproval: PendingApproval | null
+}
+
+const draftKey = (selected: string, inputs: InputRow[], runId: string) =>
+  JSON.stringify([selected, inputs, runId])
+
+export function loadLauncherDraft(): LauncherDraft | null {
+  try {
+    const raw = localStorage.getItem(LAUNCHER_DRAFT_KEY)
+    if (!raw) return null
+    const d = JSON.parse(raw)
+    if (!d || typeof d.selected !== 'string' || typeof d.runId !== 'string' || !Array.isArray(d.inputs)) return null
+    const inputs = d.inputs.filter((r: any) => r && typeof r.key === 'string' && typeof r.value === 'string')
+    const p = d.pendingApproval
+    const pendingApproval = p && typeof p.planId === 'string' && typeof p.forDraft === 'string' ? p : null
+    return { selected: d.selected, runId: d.runId, inputs, pendingApproval }
+  } catch {
+    return null
+  }
+}
+
+function saveLauncherDraft(d: LauncherDraft) {
+  try {
+    localStorage.setItem(LAUNCHER_DRAFT_KEY, JSON.stringify(d))
+  } catch { /* storage denied or full — the draft is a convenience */ }
+}
+
 export function WorkflowLauncher() {
   const startWorkflowRun = useStore(s => s.startWorkflowRun)
   const showSnackbar = useStore(s => s.showSnackbar)
 
-  const [open, setOpen] = useState(false)
+  const [draft] = useState(loadLauncherDraft)
+  // Open straight away when a plan is still waiting, so a reload doesn't hide it.
+  const [open, setOpen] = useState(!!draft?.pendingApproval)
   const [workflows, setWorkflows] = useState<WorkflowDefRow[]>([])
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [selected, setSelected] = useState('')
-  const [runId, setRunId] = useState('')
-  const [inputs, setInputs] = useState<InputRow[]>(DEFAULT_INPUTS)
+  const [selected, setSelected] = useState(draft?.selected ?? '')
+  const [runId, setRunId] = useState(draft?.runId ?? '')
+  const [inputs, setInputs] = useState<InputRow[]>(draft?.inputs.length ? draft.inputs : DEFAULT_INPUTS)
   const [submitting, setSubmitting] = useState(false)
-  const [pendingApproval, setPendingApproval] = useState<{ planId: string; message?: string } | null>(null)
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(draft?.pendingApproval ?? null)
 
-  // Any change to what would run invalidates a shown plan id.
-  useEffect(() => { setPendingApproval(null) }, [selected, inputs, runId])
+  // Any change to what would run invalidates a shown plan id. Compared against
+  // the selection it was refused for, so restoring a draft doesn't clear it.
+  const currentDraft = draftKey(selected, inputs, runId)
+  useEffect(() => {
+    setPendingApproval(p => (p && p.forDraft !== currentDraft ? null : p))
+  }, [currentDraft])
+
+  useEffect(() => {
+    saveLauncherDraft({ selected, runId, inputs, pendingApproval })
+  }, [selected, runId, inputs, pendingApproval])
 
   // Validate (the `cao workflow validate` equivalent) lints the stored file.
   const [validation, setValidation] = useState<WorkflowValidation | null>(null)
@@ -119,7 +173,7 @@ export function WorkflowLauncher() {
   const run = async () => {
     const outcome = await startWorkflowRun(selected, buildPayload(), runId.trim() || undefined)
     setPendingApproval(outcome && 'approvalPlanId' in outcome
-      ? { planId: outcome.approvalPlanId, message: outcome.message }
+      ? { planId: outcome.approvalPlanId, message: outcome.message, forDraft: currentDraft }
       : null)
   }
 

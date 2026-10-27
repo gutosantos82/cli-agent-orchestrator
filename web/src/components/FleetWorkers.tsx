@@ -10,6 +10,15 @@ import { api, FleetWorker, FleetWorkerDetail } from '../api'
 
 const POLL_MS = 10000
 
+// A worker's last output is a raw terminal capture: colour codes, cursor moves
+// and title sequences (OSC). Strip them so the <pre> shows the text, not escapes.
+export function stripAnsi(text: string): string {
+  return text
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[@-_]/g, '')
+}
+
 export function FleetWorkers() {
   const [open, setOpen] = useState(false)
   const [showAll, setShowAll] = useState(false)
@@ -133,7 +142,7 @@ export function FleetWorkers() {
               {detail.terminal_error && <p className="text-amber-300">{detail.terminal_error}</p>}
               {detail.last_output && (
                 <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded bg-gray-900 p-2 text-gray-200">
-                  {detail.last_output}
+                  {stripAnsi(detail.last_output)}
                 </pre>
               )}
             </div>
