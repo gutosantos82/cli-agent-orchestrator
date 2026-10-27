@@ -760,6 +760,62 @@ export interface FleetStatus {
   states: Record<string, number>
 }
 
+/** One broker inventory row from `GET /fleet/workers` (server-side allowlisted). */
+export interface FleetWorker {
+  worker_id: string
+  state: string
+  reason: string | null
+  agent_profile: string | null
+  provider: string | null
+  age_seconds: number | null
+  workload_present: boolean
+  cleanup_pending: boolean
+  lease_tracked: boolean
+}
+
+export interface FleetWorkerList {
+  broker: string
+  workers: FleetWorker[]
+}
+
+/** `GET /fleet/workers/{id}`: the `cao worker status` view. */
+export interface FleetWorkerDetail {
+  worker_id: string
+  lease: FleetWorker | null
+  terminal: {
+    id: string
+    name: string | null
+    session_name: string | null
+    agent_profile: string | null
+    provider: string | null
+    status: string | null
+  } | null
+  terminal_error: string | null
+  last_output: string | null
+}
+
+/** A run input that names a report file (`GET /workflows/runs/{id}/artifacts`). */
+export interface WorkflowArtifactRef {
+  input: string
+  path: string
+  available: boolean
+  size: number | null
+}
+
+export interface WorkflowArtifactList {
+  run_id: string
+  artifacts: WorkflowArtifactRef[]
+}
+
+/** `GET /workflows/runs/{id}/artifacts/{input}`: the report text. */
+export interface WorkflowArtifact {
+  run_id: string
+  input: string
+  path: string
+  size: number
+  content: string
+}
+
 /** Result of `POST /agents/profiles/install` (server InstallResult). */
 export interface InstallResult {
   success: boolean
@@ -1225,6 +1281,21 @@ export const api = {
     }
     return { blob: await res.blob(), filename: `cao-memory-${opts.scope}.tar.gz` }
   },
+  // Worker inventory (`cao worker list`; `all` = include settled leases) and one
+  // worker's lease + terminal + last output (`cao worker status`). Read-only.
+  listFleetWorkers: (all = false) =>
+    fetchJSON<FleetWorkerList>(`/fleet/workers${all ? '?all=true' : ''}`),
+  getFleetWorker: (workerId: string) =>
+    fetchJSON<FleetWorkerDetail>(`/fleet/workers/${encodeURIComponent(workerId)}`),
+
+  // Report files a run was given as inputs (e.g. report=/tmp/go-no-go.md). The
+  // server only lists/reads a .md directly in its temp dir; see docs/api.md.
+  listWorkflowArtifacts: (runId: string) =>
+    fetchJSON<WorkflowArtifactList>(`/workflows/runs/${encodeURIComponent(runId)}/artifacts`),
+  getWorkflowArtifact: (runId: string, input: string) =>
+    fetchJSON<WorkflowArtifact>(
+      `/workflows/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(input)}`,
+    ),
 
   // U5 terminal offset-range read — the bytes produced around a selected event
   // (FR-7.3). Called by SyncedTerminalPane only when an event carries non-null

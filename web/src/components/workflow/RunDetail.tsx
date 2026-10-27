@@ -15,6 +15,7 @@ import { StepSummary } from './StepSummary'
 import { WorkflowTimeline } from './WorkflowTimeline'
 import { SyncedTerminalPane } from './SyncedTerminalPane'
 import { FailureDetail } from './FailureDetail'
+import { RunArtifacts } from './RunArtifacts'
 import { RunComparison } from './RunComparison'
 import { DiagnosticsExportButton } from './DiagnosticsExportButton'
 import { DeleteRunButton } from './DeleteRunButton'
@@ -176,6 +177,7 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
       <FailureDetail run={run} />
 
       <RunResultPanel runId={run.run_id} terminal={isTerminal} state={effectiveState} />
+      <RunArtifacts runId={run.run_id} terminal={isTerminal} />
 
       {/* Steps */}
       <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">
