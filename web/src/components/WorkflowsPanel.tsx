@@ -8,6 +8,7 @@ import { useStore } from '../store'
 import { RunList } from './workflow/RunList'
 import { RunDetail } from './workflow/RunDetail'
 import { WorkflowLauncher } from './workflow/WorkflowLauncher'
+import { PlanApprovalForm } from './workflow/PlanApprovalForm'
 import { ErrorBoundary } from './ErrorBoundary'
 
 export function WorkflowsPanel() {
@@ -46,6 +47,7 @@ export function WorkflowsPanel() {
       {/* Run list */}
       <aside className="h-fit">
         <WorkflowLauncher />
+        <PlanApprovalForm />
         <div className="rounded-xl border border-gray-800 bg-gray-900/40 p-3">
         <h2 className="text-sm font-semibold text-gray-300 mb-2">Workflow Runs</h2>
         <RunList

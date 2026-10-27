@@ -18,6 +18,7 @@ import { FailureDetail } from './FailureDetail'
 import { RunComparison } from './RunComparison'
 import { DiagnosticsExportButton } from './DiagnosticsExportButton'
 import { DeleteRunButton } from './DeleteRunButton'
+import { RunResultPanel } from './RunResultPanel'
 import { runCue } from './stateCues'
 
 interface RunDetailProps {
@@ -173,6 +174,8 @@ export function RunDetail({ run, allRuns }: RunDetailProps) {
       )}
 
       <FailureDetail run={run} />
+
+      <RunResultPanel runId={run.run_id} terminal={isTerminal} state={effectiveState} />
 
       {/* Steps */}
       <div className="rounded-lg border border-gray-700/50 bg-gray-900/40 p-3">
