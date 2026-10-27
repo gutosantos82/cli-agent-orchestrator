@@ -347,6 +347,14 @@ The spec-route scope checks apply when authentication is enabled.
   assembled from the journal, so it answers for a **detached, in-flight, or post-restart**
   run — not only a finished one. No run-level `output` field is returned (run-level output
   is not journaled); per-step outputs are on `steps[].output`.
+- `GET /workflows/runs/{run_id}/artifacts` lists the run's string inputs that name a report
+  file the web UI can show: `{run_id, artifacts: [{input, path, available, size}]}`.
+  `GET /workflows/runs/{run_id}/artifacts/{input_name}` returns that file as
+  `{run_id, input, path, size, content}`. The caller names an **input**, never a path:
+  the recorded value must resolve (symlinks followed) to a regular `.md` file directly in
+  the system temp dir and be at most 256 KiB. Unknown run 404; undeclared or non-string
+  input 400; a path outside that directory or not `.md` 403; no such file 404; too large
+  413 (refused, never truncated).
 - `POST /workflows/runs/{run_id}/cancel` cooperatively cancels a run;
   `POST /workflows/runs/{run_id}/resume` re-drives a crashed/failed one.
 - `POST /workflows/runs/{run_id}/steps/{step_id}:replay` re-executes **one** recorded step
@@ -391,6 +399,23 @@ enabled**. With no IdP and no `CAO_AUTH_LOCAL_TOKEN` configured — the default 
 that check is inert.
 
 See [Workflows](workflows.md).
+
+### Fleet
+
+Read-only views of a CAO cluster's workers, reached through the fleet's worker broker
+(`CAO_ELASTIC_BROKER_URL` / `CAO_ELASTIC_BROKER_TOKEN` in cao-server's environment). No
+broker configured, unreachable, or erroring is a `503` carrying the broker's message.
+Releasing workers and shutting the fleet down stay CLI actions (`cao worker release`,
+`cao fleet shutdown`).
+
+- `GET /fleet/status` mirrors `cao fleet status`: `{broker, live, cleanup_pending, states}`.
+- `GET /fleet/workers` mirrors `cao worker list` (`?all=true` for `--all`):
+  `{broker, workers: [{worker_id, state, reason, agent_profile, provider, age_seconds,
+  workload_present, cleanup_pending, lease_tracked}]}`. Only those fields are returned.
+- `GET /fleet/workers/{worker_id}` mirrors `cao worker status`:
+  `{worker_id, lease, terminal, terminal_error, last_output}`. `terminal` carries
+  `{id, name, session_name, agent_profile, provider, status}`; `last_output` is capped at
+  4000 characters. A malformed id is `400`; no lease and no answering worker is `404`.
 
 ### Memory and graph
 
