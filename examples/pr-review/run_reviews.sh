@@ -908,16 +908,29 @@ if [[ "$launched" -gt 0 ]] && [[ "${CAO_PRR_RETROSPECT:-1}" = "1" ]]; then
       deliver_task "cao-prr-retro" \
         "Retrospect on workflow pr-review — the review batch that just finished. Agents involved: pr_review_supervisor, correctness_reviewer, security_reviewer, tests_reviewer, conventions_reviewer, consistency_reviewer, conversation_reviewer, vision_reviewer, verifier. Read the recorded outcomes, store only lessons that would change what an agent does next time, then reply with your one-line summary." \
         || echo "  (retrospector delivery failed — inspect: tmux attach -t cao-prr-retro)"
-      # Give it room to read outcomes and store lessons, then leave the session for
-      # inspection if it hasn't exited on its own.
-      for _ in $(seq 1 20); do
+      # Give it room to read outcomes and store lessons. kiro never exits on its own, so
+      # the session used to sit idle until the next gate killed it: reap it once it is
+      # idle again after its turn (seen processing, or idle a minute after delivery).
+      # Still busy after 5 min -> leave it for inspection; the next gate reaps it.
+      _seen_busy=0
+      for _i in $(seq 1 20); do
         tmux has-session -t cao-prr-retro 2>/dev/null || break
         sleep 15
+        _st="$(cao session status cao-prr-retro --json 2>/dev/null | jq -r '.conductor.status // empty' 2>/dev/null || true)"
+        case "$_st" in
+          processing) _seen_busy=1 ;;
+          idle|completed)
+            if [[ $_seen_busy -eq 1 || $_i -ge 4 ]]; then
+              cao shutdown --session cao-prr-retro >/dev/null 2>&1 \
+                || tmux kill-session -t cao-prr-retro 2>/dev/null || true
+              break
+            fi ;;
+        esac
       done
       if tmux has-session -t cao-prr-retro 2>/dev/null; then
         echo "  (retrospector still running — inspect: tmux attach -t cao-prr-retro)"
       else
-        echo "  retrospection complete — review lessons with: cao memory list"
+        echo "  retrospection complete — reclaimed cao-prr-retro; review lessons with: cao memory list"
       fi
     else
       echo "  (retrospector launch failed — skipping retrospection; see $retro_log)"
