@@ -89,6 +89,16 @@ for required in "$SCRIPT_DIR/run_reviews.sh" "$SCRIPT_DIR/pr-review-run.sh" \
   [ -f "$required" ] || logboth "WARNING: missing $required — the driver will fail or run degraded."
 done
 
+# --- Clear a non-directory squatting on the lock path -------------------------
+# The lock is a DIRECTORY (atomic mkdir + owner.pid). On 2026-10-29 a `flock` health
+# probe left an empty FILE at this path: every mkdir below then failed, each tick took
+# the "lost lock race" exit, and the 23:00 run silently did nothing. Nothing legitimate
+# ever creates a file here, so remove it -- loudly, in the log an operator reads.
+if [ -e "$LOCKDIR" ] && [ ! -d "$LOCKDIR" ]; then
+  logboth "removing non-directory at $LOCKDIR (a stray file there blocks every run)"
+  rm -f "$LOCKDIR"
+fi
+
 # --- Reclaim a stale lock (previous driver crashed without releasing) --------
 if [ -d "$LOCKDIR" ]; then
   # Liveness check FIRST, age second. The lock records the driver pid that owns it
@@ -121,10 +131,34 @@ fi
 open="$(gh pr list --repo "$REPO" --state open --json number,headRefOid,isDraft \
         --jq '.[]|select(.isDraft|not)|"\(.number) \(.headRefOid)"' 2>/dev/null || true)"
 
+# A report the supervisor wrote after its reviewer fan-out failed still sits at the
+# head, so it used to count as done and the PR was never reviewed again (#773 and
+# #1200 on 2026-11-03). Such a report is re-queued: once we hold the lock it is
+# renamed to <report>.incomplete-N, which the driver and dashboard ignore. Capped at
+# MAX_INCOMPLETE_RETRIES per head so a persistent failure can't re-review every tick.
+MAX_INCOMPLETE_RETRIES="${CAO_PRR_MAX_INCOMPLETE_RETRIES:-2}"
+# Retries already spent on a report = its .incomplete-N siblings. A glob, not `ls`:
+# under `set -o pipefail` a no-match `ls` would abort the whole gate.
+retries_used() { local n=0 f; for f in "$1".incomplete-*; do [ -e "$f" ] && n=$((n+1)); done; echo "$n"; }
+is_incomplete() {
+  awk '/^---$/{c++; if (c==2) exit; next} c==1' "$1" 2>/dev/null \
+    | grep -qiE '^incomplete:[[:space:]]*true|review incomplete|fan-out failed'
+}
+
 needed=""
+incomplete=""
 while read -r pr sha; do
   [ -z "${pr:-}" ] && continue
-  [ -f "$DATA_DIR/reviews/${pr}-${sha}.md" ] || needed="$needed $pr"
+  report="$DATA_DIR/reviews/${pr}-${sha}.md"
+  if [ ! -f "$report" ]; then
+    needed="$needed $pr"
+  elif is_incomplete "$report"; then
+    tries="$(retries_used "$report")"
+    if [ "$tries" -lt "$MAX_INCOMPLETE_RETRIES" ]; then
+      needed="$needed $pr"
+      incomplete="$incomplete $report"
+    fi
+  fi
 done <<< "$open"
 needed="${needed# }"
 
@@ -137,7 +171,7 @@ log "PRs needing review:$([ -n "$needed" ] && echo " $needed")"
 
 # --- Acquire lock (atomic mkdir) --------------------------------------------
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
-  log "lost lock race — another gate is firing; skipping"
+  logboth "lost lock race — another gate is firing; skipping"
   emit
 fi
 # If we die between here and handing the lock to the driver (e.g. the flow kills
@@ -150,6 +184,14 @@ trap 'rm -rf "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
 # sees a pid that no longer exists and reclaims the lock in seconds instead of
 # waiting out STALE_LOCK_MIN. Replaced with the driver's pid once it is spawned.
 echo $$ > "$LOCKDIR/owner.pid" 2>/dev/null || true
+
+# --- Move incomplete reports aside so the driver reviews those PRs again -----
+# Only now, under the lock: a driver mid-run must never see its reports vanish.
+for report in $incomplete; do
+  n=$(( $(retries_used "$report") + 1 ))
+  mv "$report" "$report.incomplete-$n"
+  logboth "re-queueing $(basename "$report" .md) — report was incomplete (retry $n/$MAX_INCOMPLETE_RETRIES)"
+done
 
 # --- Clean stale review sessions, then fire the detached runner --------------
 # pr-review-run.sh does: notify start -> run driver -> notify outcomes -> release lock.

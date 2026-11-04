@@ -185,7 +185,8 @@ Let **N** = the number you dispatched (7 static, or 8 when you also sent the ver
   synthesize with what you have, naming the missing angles. Most angles on the record beats
   an indefinite wait.
 - **≤ N-3 in** after several wakes → the fan-out likely failed; write a short report saying
-  reviews did not return and set verdict to "Review incomplete" so the dashboard flags it.
+  reviews did not return, set verdict to "Review incomplete" so the dashboard flags it, and add
+  `incomplete: true` to the frontmatter. The gate re-queues reports carrying that flag.
 
 The **verifier is never the one you block on** — if the static angles are in but the
 verifier hasn't returned, synthesize and note "_dynamic verification did not return._" Its
