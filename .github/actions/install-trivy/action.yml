@@ -1,0 +1,36 @@
+name: Install Trivy
+description: >-
+  Install a pinned Trivy release from GitHub Releases, verified against the
+  release's checksums file. Replaces aquasecurity/setup-trivy, whose install
+  script downloads from get.trivy.dev; that host stopped resolving on
+  2026-11-03 (aquasecurity/setup-trivy#42), so every cache miss failed.
+inputs:
+  version:
+    description: Trivy release tag, e.g. v0.70.0
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Download, verify and install Trivy
+      shell: bash
+      env:
+        TRIVY_TAG: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        if [[ ! "$TRIVY_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::version must look like v1.2.3, got '$TRIVY_TAG'" >&2
+          exit 1
+        fi
+        version="${TRIVY_TAG#v}"
+        tarball="trivy_${version}_Linux-64bit.tar.gz"
+        checksums="trivy_${version}_checksums.txt"
+        base="https://github.com/aquasecurity/trivy/releases/download/${TRIVY_TAG}"
+        work="$(mktemp -d)"
+        curl -fsSL --retry 3 -o "$work/$tarball" "$base/$tarball"
+        curl -fsSL --retry 3 -o "$work/$checksums" "$base/$checksums"
+        (cd "$work" && grep -E "  ${tarball}\$" "$checksums" | sha256sum -c -)
+        tar -xzf "$work/$tarball" -C "$work" trivy
+        # /usr/local/bin is already on PATH, so no $GITHUB_PATH write is needed.
+        sudo install -m 0755 "$work/trivy" /usr/local/bin/trivy
+        rm -rf "$work"
+        trivy --version

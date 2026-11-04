@@ -369,7 +369,7 @@ def test_real_inventory_regression_has_a_required_scanner_in_ci():
     setup = next(
         step
         for step in job["steps"]
-        if step.get("uses", "").startswith("aquasecurity/setup-trivy@")
+        if step.get("uses", "").startswith("./.github/actions/install-trivy")
     )
     action = yaml.safe_load(
         (ROOT / ".github" / "actions" / "dependency-security" / "action.yml").read_text()

@@ -1173,7 +1173,7 @@ def _dependency_section_paths() -> set[str]:
     return paths
 
 
-TRIVY_SETUP_ACTION = "aquasecurity/setup-trivy@"
+TRIVY_SETUP_ACTION = "./.github/actions/install-trivy"
 
 
 def _pinned_trivy_version(action_text: str) -> str | None:
@@ -1256,12 +1256,14 @@ class TestDependencySectionMatchesTheRepo:
             "      with:\n"
             "        version: v9.9.9\n"
             "    - name: Install Trivy\n"
-            "      uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567\n"
+            "      uses: ./.github/actions/install-trivy\n"
             "      with:\n"
             "        version: v0.70.0\n"
         )
         assert _pinned_trivy_version(action) == "0.70.0"
-        assert _pinned_trivy_version(action.replace("aquasecurity/setup-trivy", "x/y")) is None
+        assert (
+            _pinned_trivy_version(action.replace("./.github/actions/install-trivy", "x/y")) is None
+        )
 
 
 # --- Absolute self-links, which CI's link checker does not see ----------------
