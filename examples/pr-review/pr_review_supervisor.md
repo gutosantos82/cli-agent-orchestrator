@@ -28,6 +28,21 @@ approve.
 - **send_message**(receiver_id, message) — deliver to a terminal's inbox.
 - Workers send their findings back to you via `send_message`.
 
+**If `assign` fails with `Permission denied` / `Failed to load agent profile`**, do NOT review
+solo. Your MCP server may be sandboxed away from the agent store, but cao-server is not.
+Create each worker through cao-server instead, with the same message you would have passed
+to `assign`, written to a file first:
+
+```
+S=$(curl -s 127.0.0.1:9889/terminals/$CAO_TERMINAL_ID | jq -r .session_name)
+jq -n --rawfile m /tmp/msg-correctness.txt '{initial_message: $m}' |
+  curl -s -X POST -H 'Content-Type: application/json' -d @- \
+  "127.0.0.1:9889/sessions/$S/terminals?provider=kiro_cli&agent_profile=correctness_reviewer&caller_id=$CAO_TERMINAL_ID&defer_init=true"
+```
+
+Repeat for each reviewer, then finish your turn as usual. Only if this fails too, write the
+"Review incomplete" report described below.
+
 ## Message delivery — critical
 
 Worker findings are delivered to your inbox **automatically when your turn ends and you go
